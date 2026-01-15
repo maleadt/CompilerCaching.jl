@@ -99,8 +99,8 @@ end
     result = cached_compilation(my_compile, cache, missing_node, (Int,))
     @test result === nothing
 
-    # Also test methodinstance directly
-    mi = methodinstance(cache, missing_node, (Int,))
+    # Also test method_instance directly
+    mi = method_instance(missing_node, (Int,); method_table=cache.mt)
     @test mi === nothing
 end
 
@@ -191,7 +191,7 @@ end
     parent_compile(ctx) = begin
         parent_compile_count[] += 1
         # Register dependency on child
-        child_mi = methodinstance(cache, child_node, (Int,))
+        child_mi = method_instance(child_node, (Int,); method_table=cache.mt)
         register_dependency!(ctx, child_mi)
         :parent_compiled
     end

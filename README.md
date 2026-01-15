@@ -152,7 +152,8 @@ Since inference isn't used, Julia doesn't know which functions are called, so we
 - `CompilerCache{K}(tag::Symbol)` - Create cache with sharding keys and global MT
 - `add_method(cache, f, arg_types, source)` - Register method with custom source
 - `cached_compilation(cache, f, tt, [keys,] compile_fn)` - Look up or compile
-- `methodinstance(cache, f, tt)` - Get MethodInstance for function
+- `method_instance(sig; world, method_table)` - Get MethodInstance by signature type
+- `method_instance(f, tt; world, method_table)` - Get MethodInstance for function + arg types
 - `register_dependency!(ctx, mi)` - Register transitive dependency
 
 ## How It Works
