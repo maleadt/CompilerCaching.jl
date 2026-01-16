@@ -30,7 +30,13 @@ function run_inference(cache::CompilerCache, interp::CC.AbstractInterpreter,
                        mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
         # Modern API: returns CodeInstance, use SOURCE_MODE to control caching
-        ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
+        # (SOURCE_MODE_FORCE_SOURCE was renamed to SOURCE_MODE_GET_SOURCE)
+        source_mode = @static if isdefined(CC, :SOURCE_MODE_GET_SOURCE)
+            CC.SOURCE_MODE_GET_SOURCE
+        else
+            CC.SOURCE_MODE_FORCE_SOURCE
+        end
+        ci = CC.typeinf_ext(interp, mi, source_mode)
         @assert ci !== nothing "Inference of $mi failed"
 
         # Collect all code that needs compilation (including callees)
@@ -87,7 +93,12 @@ function run_inference(cache::CompilerCache, interp::CC.AbstractInterpreter,
         return codeinfos
     elseif VERSION >= v"1.12.0-DEV.15"
         # Julia 1.12 early API
-        ci = CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
+        source_mode = @static if isdefined(CC, :SOURCE_MODE_GET_SOURCE)
+            CC.SOURCE_MODE_GET_SOURCE
+        else
+            CC.SOURCE_MODE_FORCE_SOURCE
+        end
+        ci = CC.typeinf_ext_toplevel(interp, mi, source_mode)
         @assert ci !== nothing "Inference of $mi failed"
         return Pair{Core.CodeInstance, Core.CodeInfo}[]
     else
