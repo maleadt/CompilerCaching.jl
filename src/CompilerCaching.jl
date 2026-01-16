@@ -15,7 +15,7 @@ const CC = Core.Compiler
 
 export CompilerCache, CacheOwner, CompilationContext
 export add_method, cached_compilation, method_instance, register_dependency!
-export cache_owner, ci_cache_lookup
+export cache_owner, cache!
 
 #==============================================================================#
 # CacheOwner - identifies a cache partition
@@ -86,23 +86,12 @@ CompilerCache(tag::Symbol) = CompilerCache{Nothing}(tag, nothing)
 CompilerCache{K}(tag::Symbol) where K = CompilerCache{K}(tag, nothing)  # Global MT with sharding keys
 
 """
-    cache_owner(cache::CompilerCache{Nothing}) -> CacheOwner{Nothing}
-    cache_owner(cache::CompilerCache{K}, keys::K) -> CacheOwner{K}
+    cache_owner(cache::CompilerCache, keys=nothing) -> CacheOwner
 
 Get the CacheOwner for a cache. Use this as your interpreter's cache token
 with `CC.cache_owner(interp)`.
-
-# Examples
-```julia
-cache = CompilerCache(:MyCompiler)
-owner = cache_owner(cache)
-
-# In your AbstractInterpreter:
-CC.cache_owner(interp::MyInterpreter) = interp.owner
-```
 """
-cache_owner(cache::CompilerCache{Nothing}) = CacheOwner{Nothing}(cache.tag, nothing)
-cache_owner(cache::CompilerCache{K}, keys::K) where K = CacheOwner{K}(cache.tag, keys)
+cache_owner(cache::CompilerCache{K}, keys::K=nothing) where K = CacheOwner{K}(cache.tag, keys)
 
 #==============================================================================#
 # CompilationContext - passed to compiler
@@ -113,15 +102,13 @@ cache_owner(cache::CompilerCache{K}, keys::K) where K = CacheOwner{K}(cache.tag,
 
 Context passed to the compile function on cache miss.
 
-- `mi::Core.MethodInstance` - The method instance being compiled
 - Use `register_dependency!(ctx, other_mi)` to track dependencies
 """
 mutable struct CompilationContext
-    mi::Core.MethodInstance
     deps::Vector{Core.MethodInstance}
-end
 
-CompilationContext(mi) = CompilationContext(mi, Core.MethodInstance[])
+    CompilationContext() = new(Core.MethodInstance[])
+end
 
 """
     register_dependency!(ctx, mi)
@@ -179,25 +166,27 @@ end
 # Method lookup
 #==============================================================================#
 
-# version of Base.method_instance that works with overlay method tables (JuliaLang/julia#60702)
-function method_instance(@nospecialize(sig::Type{<:Tuple});
-                         world::Integer=Base.get_world_counter(),
-                         method_table::Union{Core.MethodTable, Nothing}=nothing)
-    results = Base._methods_by_ftype(sig, method_table, -1, world)
-    isempty(results) && return nothing
-    match = results[1]::Core.MethodMatch
-    return CC.specialize_method(match)::Core.MethodInstance
-end
+"""
+    method_instance(f, tt; world, method_table) -> Union{MethodInstance, Nothing}
 
+Look up the MethodInstance for function `f` with argument types `tt`.
+
+Uses Julia's cached method lookup (`jl_method_lookup_by_tt`) for fast lookups.
+Returns `nothing` if no matching method is found.
+"""
 function method_instance(@nospecialize(f), @nospecialize(tt);
-                         world::Integer=Base.get_world_counter(),
+                         world::UInt=Base.get_world_counter(),
                          method_table::Union{Core.MethodTable, Nothing}=nothing)
     sig = Base.signature_type(f, tt)
-    return method_instance(sig; world, method_table)
+    mi = ccall(:jl_method_lookup_by_tt, Any,
+               (Any, Csize_t, Any), sig, world, method_table)
+    mi === nothing && return nothing
+    return mi::Core.MethodInstance
 end
 
+
 #==============================================================================#
-# Cache access
+# Internal cache helpers
 #==============================================================================#
 
 @static if VERSION >= v"1.14-"
@@ -212,38 +201,26 @@ else
     end
 end
 
-#==============================================================================#
-# Cache lookup
-#==============================================================================#
-
-"""
-    ci_cache_lookup(cache::CompilerCache{Nothing}, mi; world) -> Union{CodeInstance, Nothing}
-    ci_cache_lookup(cache::CompilerCache{K}, mi, keys::K; world) -> Union{CodeInstance, Nothing}
-
-Look up a CodeInstance in the cache for the given MethodInstance.
-
-# Arguments
-- `cache` - CompilerCache instance
-- `mi` - MethodInstance to look up
-- `keys` - Sharding keys (for CompilerCache{K})
-- `world` - World age for lookup (default: current world)
-
-# Returns
-- `CodeInstance` if found and valid for the given world
-- `nothing` if not found or invalid
-"""
-function ci_cache_lookup(cache::CompilerCache{Nothing}, mi::Core.MethodInstance;
-                         world::UInt=Base.get_world_counter())
-    owner = cache_owner(cache)
+function lookup(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothing;
+                world::UInt=Base.get_world_counter()) where K
+    owner = cache_owner(cache, keys)
     cc = code_cache(owner, world)
     return CC.get(cc, mi, nothing)
 end
 
-function ci_cache_lookup(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K;
-                         world::UInt=Base.get_world_counter()) where K
+function cache!(cache::CompilerCache{K}, mi::Core.MethodInstance, result, keys::K=nothing;
+                world::UInt=Base.get_world_counter(), edges::Core.SimpleVector=Core.svec()) where K
     owner = cache_owner(cache, keys)
     cc = code_cache(owner, world)
-    return CC.get(cc, mi, nothing)
+    @static if VERSION >= v"1.12-"
+        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, result,
+            Int32(0), UInt(world), typemax(UInt), UInt32(0), nothing, nothing, edges)
+    else
+        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, result,
+            Int32(0), UInt(world), typemax(UInt), UInt32(0), UInt32(0), nothing, UInt8(0))
+    end
+    CC.setindex!(cc, ci, mi)
+    return ci
 end
 
 #==============================================================================#
@@ -251,81 +228,47 @@ end
 #==============================================================================#
 
 """
-    cached_compilation(cache::CompilerCache{Nothing}, f, tt, compiler) -> Union{Some, Nothing}
+    cached_compilation(compiler, cache, mi, world, keys=nothing) -> result
 
-Look up or compile code for function `f` with argument types `tt`.
-For CompilerCache with no sharding keys.
-
-# Arguments
-- `cache` - CompilerCache instance
-- `f` - Function to compile
-- `tt` - Argument types tuple
-- `compiler(ctx) -> result` - Called on cache miss. Access source via `ctx.mi.def.source`.
-
-# Returns
-- `Some(result)` - Compilation result wrapped in `Some` (use `something(result)` to unwrap)
-- `nothing` - No matching method found for the given function and argument types
-"""
-function cached_compilation(compiler, cache::CompilerCache{Nothing}, f::Function,
-                            @nospecialize(tt))
-    owner = CacheOwner{Nothing}(cache.tag, nothing)
-    _cached_compilation(cache, owner, f, tt, compiler)
-end
-
-"""
-    cached_compilation(cache::CompilerCache{K}, f, tt, keys::K, compiler) -> Union{Some, Nothing}
-
-Look up or compile code for function `f` with argument types `tt` and sharding keys.
+Look up or compile code for MethodInstance `mi`.
 
 # Arguments
-- `cache` - CompilerCache instance with key type K
-- `f` - Function to compile
-- `tt` - Argument types tuple
-- `keys` - Sharding keys (must match K type)
 - `compiler(ctx) -> result` - Called on cache miss. Access source via `ctx.mi.def.source`.
+- `cache::CompilerCache{K}` - Cache instance
+- `mi::MethodInstance` - The method instance to compile
+- `world::UInt` - World age for cache lookup
+- `keys::K` - Sharding keys (default: nothing)
 
 # Returns
-- `Some(result)` - Compilation result wrapped in `Some` (use `something(result)` to unwrap)
-- `nothing` - No matching method found for the given function and argument types
-"""
-function cached_compilation(compiler, cache::CompilerCache{K}, f::Function,
-                            @nospecialize(tt), keys::K) where K
-    owner = CacheOwner{K}(cache.tag, keys)
-    _cached_compilation(cache, owner, f, tt, compiler)
+The compilation result (from cache or freshly compiled).
+
+# Example
+```julia
+world = Base.get_world_counter()
+mi = method_instance(f, tt; world, method_table=cache.mt)
+mi === nothing && throw(MethodError(f, tt))
+
+result = cached_compilation(cache, mi, world) do ctx
+    # compile ctx.mi
 end
-
-# Internal implementation
-function _cached_compilation(cache::CompilerCache, owner::CacheOwner,
-                            f::Function, @nospecialize(tt), compiler)
-    world = Base.get_world_counter()
-    mi = method_instance(f, tt; world, method_table=cache.mt)
-
-    # No matching method found
-    mi === nothing && return nothing
-
-    # Fast path: check cache
-    cc = code_cache(owner, world)
-    ci = CC.get(cc, mi, nothing)
+```
+"""
+function cached_compilation(compiler, cache::CompilerCache{K},
+                            mi::Core.MethodInstance, world::UInt,
+                            keys::K=nothing) where K
+    # Fast path: cache hit
+    ci = lookup(cache, mi, keys; world)
     if ci !== nothing
-        return Some(ci.inferred)
+        return ci.inferred
     end
 
-    # Slow path: compile
-    ctx = CompilationContext(mi)
+    # Slow path: compile and cache
+    ctx = CompilationContext()
     result = compiler(ctx)
-
-    # Create CodeInstance with dependencies as edges
     edges = isempty(ctx.deps) ? Core.svec() : Core.svec(ctx.deps...)
-    @static if VERSION >= v"1.12-"
-        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, result,
-            Int32(0), world, typemax(UInt), UInt32(0), nothing, nothing, edges)
-    else
-        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, result,
-            Int32(0), world, typemax(UInt), UInt32(0), UInt32(0), nothing, UInt8(0))
-    end
-    CC.setindex!(cc, ci, mi)
+    cache!(cache, mi, result, keys; world, edges)
 
-    return Some(result)
+    return result
 end
 
 end # module CompilerCaching

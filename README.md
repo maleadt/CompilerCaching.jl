@@ -1,6 +1,8 @@
 # CompilerCaching.jl
 
-A reusable package for caching compilation results using Julia's `Method`/`MethodInstance`/`CodeInstance` infrastructure.
+A package for interfacing with Julia's compiler caching infrastructure for the purpose
+of building custom compilers.
+
 
 ## Features
 

@@ -1,0 +1,144 @@
+# example re-using most of Julia's native compiler functionality:
+# - methods use Julia source and IR
+# - inference is used to track dependencies
+# - LLVM IR is generated and plugged back into Julia's JIT
+# - overlay method tables are used to demonstrate method overrides
+
+include("helpers.jl")
+
+using Base: get_world_counter
+
+using Base.Experimental: @MethodTable, @overlay
+@MethodTable CUSTOM_MT
+
+const CUSTOM_CACHE = CompilerCache(:CustomExample, CUSTOM_MT)
+
+
+## abstract interpreter
+
+struct CustomInterpreter <: CC.AbstractInterpreter
+    world::UInt
+    cache::CompilerCache
+    method_table::CC.OverlayMethodTable
+    inf_cache::Vector{CC.InferenceResult}
+    inf_params::CC.InferenceParams
+    opt_params::CC.OptimizationParams
+
+    function CustomInterpreter(cache::CompilerCache, world::UInt)
+        @assert world <= get_world_counter()
+        new(world, cache,
+            CC.OverlayMethodTable(world, CUSTOM_MT),
+            Vector{CC.InferenceResult}(),
+            CC.InferenceParams(),
+            CC.OptimizationParams()
+        )
+    end
+end
+
+# required AbstractInterpreter interface implementation
+CC.InferenceParams(interp::CustomInterpreter) = interp.inf_params
+CC.OptimizationParams(interp::CustomInterpreter) = interp.opt_params
+CC.get_inference_cache(interp::CustomInterpreter) = interp.inf_cache
+@static if isdefined(CC, :get_inference_world)
+    CC.get_inference_world(interp::CustomInterpreter) = interp.world
+else
+    CC.get_world_counter(interp::CustomInterpreter) = interp.world
+end
+CC.lock_mi_inference(::CustomInterpreter, ::Core.MethodInstance) = nothing
+CC.unlock_mi_inference(::CustomInterpreter, ::Core.MethodInstance) = nothing
+
+# Use overlay method table for method lookup during inference
+CC.method_table(interp::CustomInterpreter) = interp.method_table
+
+# integration with CompilerCaching.jl
+CC.cache_owner(interp::CustomInterpreter) = cache_owner(interp.cache)
+
+
+## high-level API
+
+const compilations = Ref(0) # for testing
+function compile(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
+    compilations[] += 1
+    interp = CustomInterpreter(cache, world)
+    codeinfos = run_inference(cache, interp, mi)
+    emit_native(cache, interp, mi, codeinfos)
+end
+
+"""
+    call(f, args...) -> result
+
+Compile (if needed) and call function `f` with the given arguments.
+"""
+@inline function call(f, args...)
+    argtypes = Tuple{map(Core.Typeof, args)...}
+    rettyp = Base.infer_return_type(f, argtypes)
+    _call_impl(rettyp, f, args...)
+end
+@generated function _call_impl(::Type{R}, f, args::Vararg{Any,N}) where {R,N}
+    argtypes = Tuple{args...}
+
+    # Build tuple expression for ccall: (T1, T2, ...)
+    ccall_types = Expr(:tuple)
+    for i in 1:N
+        push!(ccall_types.args, args[i])
+    end
+
+    # Build argument expressions
+    argexprs = Expr[]
+    for i in 1:N
+        push!(argexprs, :(args[$i]))
+    end
+
+    quote
+        world = get_world_counter()
+        mi = method_instance(f, $argtypes; world) # mt=nothing, see JuliaLang/julia#60712
+        mi === nothing && throw(MethodError(f, $argtypes))
+
+        ptr = _call_compile(CUSTOM_CACHE, mi, world)
+        ccall(ptr, R, $ccall_types, $(argexprs...))
+    end
+end
+function _call_compile(cache, mi, world)
+    cached_compilation(cache, mi, world) do ctx
+        compile(cache, mi, world)
+    end
+end
+
+
+## demo
+
+# Define `op` with different implementations
+op(x, y) = x + y
+@overlay CUSTOM_MT op(x, y) = x * y
+
+parent(x) = child(x) + 1
+child(x) = op(x, 2)
+
+# Test whether overlay is working
+@assert parent(10) == 10 + 2 + 1
+@assert call(parent, 10) == 10 * 2 + 1
+
+# Ensure we don't needlessly recompile on repeated or and unrelated definitions
+@assert compilations[] == 1
+call(parent, 10)
+unrelated(x) = 10
+call(parent, 10)
+@assert compilations[] == 1
+
+# Redefine parent function
+parent(x) = child(x) + 3
+@assert parent(10) == 10 + 2 + 3
+@assert call(parent, 10) == 10 * 2 + 3
+@assert compilations[] == 2
+
+# Redefine child function
+child(x) = op(x, 3)
+@assert parent(10) == 10 + 3 + 3
+@assert call(parent, 10) == 10 * 3 + 3
+@assert compilations[] == 3
+
+# Redefine overlay operator
+@eval @overlay CUSTOM_MT op(x, y) = x ^ y
+@assert parent(10) == 10 + 3 + 3
+@assert call(parent, 10) == 10 ^ 3 + 3
+@assert compilations[] == 4
