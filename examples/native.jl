@@ -91,8 +91,9 @@ end
 
     quote
         world = get_world_counter()
-        mi = method_instance(f, $argtypes; world) # mt=nothing, see JuliaLang/julia#60712
-        mi === nothing && throw(MethodError(f, $argtypes))
+        mi = @something(method_instance(f, $argtypes; world, method_table=CUSTOM_MT),
+                        method_instance(f, $argtypes; world),
+                        throw(MethodError(f, $argtypes)))
 
         ptr = _call_compile(CUSTOM_CACHE, mi, world)
         ccall(ptr, R, $ccall_types, $(argexprs...))

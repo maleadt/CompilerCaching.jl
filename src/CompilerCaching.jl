@@ -166,6 +166,21 @@ end
 # Method lookup
 #==============================================================================#
 
+# Before JuliaLang/julia#60718, `jl_method_lookup_by_tt` did not correctly cache overlay
+# methods, causing lookups to fail or return stale global entries, so don't use the cache.
+@static if false
+    using Base: method_instance
+else
+    function method_instance(@nospecialize(f), @nospecialize(tt);
+                             world::UInt=Base.get_world_counter(),
+                             method_table::Union{Core.MethodTable,Nothing}=nothing)
+        sig = Base.signature_type(f, tt)
+        match, _ = CC._findsup(sig, method_table, world)
+        match === nothing && return nothing
+        CC.specialize_method(match)::Core.MethodInstance
+    end
+end
+
 """
     method_instance(f, tt; world, method_table) -> Union{MethodInstance, Nothing}
 
@@ -174,15 +189,7 @@ Look up the MethodInstance for function `f` with argument types `tt`.
 Uses Julia's cached method lookup (`jl_method_lookup_by_tt`) for fast lookups.
 Returns `nothing` if no matching method is found.
 """
-function method_instance(@nospecialize(f), @nospecialize(tt);
-                         world::UInt=Base.get_world_counter(),
-                         method_table::Union{Core.MethodTable, Nothing}=nothing)
-    sig = Base.signature_type(f, tt)
-    mi = ccall(:jl_method_lookup_by_tt, Any,
-               (Any, Csize_t, Any), sig, world, method_table)
-    mi === nothing && return nothing
-    return mi::Core.MethodInstance
-end
+method_instance
 
 
 #==============================================================================#
