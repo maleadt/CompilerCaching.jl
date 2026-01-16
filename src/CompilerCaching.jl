@@ -77,11 +77,16 @@ const gpu = CompilerCache{@NamedTuple{cap::VersionNumber}}(:GPUCompiler)
 """
 struct CompilerCache{K}
     tag::Symbol
-    mt::Union{Core.MethodTable, Nothing}
+    method_table::Union{Core.MethodTable, Nothing}
+    external_cache::Dict{Tuple{Core.CodeInstance, K}, Any}
+    lock::ReentrantLock
 end
 
 # Constructors
-CompilerCache(tag::Symbol, mt) = CompilerCache{Nothing}(tag, mt)
+function CompilerCache{K}(tag::Symbol, method_table) where K
+    CompilerCache{K}(tag, method_table, Dict{Tuple{Core.CodeInstance, K}, Any}(), ReentrantLock())
+end
+CompilerCache(tag::Symbol, method_table) = CompilerCache{Nothing}(tag, method_table)
 CompilerCache(tag::Symbol) = CompilerCache{Nothing}(tag, nothing)
 CompilerCache{K}(tag::Symbol) where K = CompilerCache{K}(tag, nothing)  # Global MT with sharding keys
 
@@ -139,7 +144,7 @@ Register a method with custom source IR in the cache's method table.
 The created `Method` object.
 """
 function add_method(cache::CompilerCache, f::Function, arg_types::Tuple, source)
-    mt = cache.mt
+    mt = cache.method_table
     sig = Tuple{typeof(f), arg_types...}
 
     m = ccall(:jl_new_method_uninit, Any, (Any,), parentmodule(f))
@@ -215,15 +220,23 @@ function lookup(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothin
     return CC.get(cc, mi, nothing)
 end
 
-function cache!(cache::CompilerCache{K}, mi::Core.MethodInstance, result, keys::K=nothing;
+"""
+    cache!(cache, mi, keys=nothing; world, edges) -> CodeInstance
+
+Create and store a CodeInstance for `mi` in the cache.
+
+Used for foreign mode where inference doesn't run. The CI participates in
+Julia's invalidation mechanism via its edges.
+"""
+function cache!(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothing;
                 world::UInt=Base.get_world_counter(), edges::Core.SimpleVector=Core.svec()) where K
     owner = cache_owner(cache, keys)
     cc = code_cache(owner, world)
     @static if VERSION >= v"1.12-"
-        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, result,
+        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
             Int32(0), UInt(world), typemax(UInt), UInt32(0), nothing, nothing, edges)
     else
-        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, result,
+        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
             Int32(0), UInt(world), typemax(UInt), UInt32(0), UInt32(0), nothing, UInt8(0))
     end
     CC.setindex!(cc, ci, mi)
@@ -252,7 +265,7 @@ The compilation result (from cache or freshly compiled).
 # Example
 ```julia
 world = Base.get_world_counter()
-mi = method_instance(f, tt; world, method_table=cache.mt)
+mi = method_instance(f, tt; world, method_table=cache.method_table)
 mi === nothing && throw(MethodError(f, tt))
 
 result = cached_compilation(cache, mi, world) do ctx
@@ -263,17 +276,37 @@ end
 function cached_compilation(compiler, cache::CompilerCache{K},
                             mi::Core.MethodInstance, world::UInt,
                             keys::K=nothing) where K
-    # Fast path: cache hit
+    result = nothing
+
+    # Fast path: find CI and check cache
     ci = lookup(cache, mi, keys; world)
     if ci !== nothing
-        return ci.inferred
+        key = (ci, keys)
+        lock(cache.lock) do
+            result = get(cache.external_cache, key, nothing)
+        end
     end
 
-    # Slow path: compile and cache
-    ctx = CompilationContext()
-    result = compiler(ctx)
-    edges = isempty(ctx.deps) ? Core.svec() : Core.svec(ctx.deps...)
-    cache!(cache, mi, result, keys; world, edges)
+    # Slow path: compile
+    if result === nothing
+        ctx = CompilationContext()
+        result = compiler(ctx)
+
+        # Look up CI (inference may have created it)
+        if ci === nothing
+            ci = lookup(cache, mi, keys; world)
+        end
+
+        # For foreign mode (no inference), create CI ourselves
+        if ci === nothing
+            ci = cache!(cache, mi, keys; world)
+        end
+        key = (ci, keys)
+
+        lock(cache.lock) do
+            cache.external_cache[key] = result
+        end
+    end
 
     return result
 end

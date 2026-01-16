@@ -247,6 +247,7 @@ function emit_native(cache::CompilerCache, interp::CC.AbstractInterpreter,
         @assert native_code != C_NULL "Code generation failed"
 
         # Get the ThreadSafeModule for JIT
+        # XXX: this is the same module as `ts_mod` above
         llvm_mod_ref = @ccall jl_get_llvm_module(
                 native_code::Ptr{Cvoid}
             )::LLVM.API.LLVMOrcThreadSafeModuleRef
