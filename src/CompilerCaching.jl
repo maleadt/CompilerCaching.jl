@@ -16,6 +16,7 @@ const CC = Core.Compiler
 export CompilerCache, CacheOwner, CompilationContext
 export add_method, cached_compilation, method_instance, register_dependency!
 export cache_owner, cache!
+export StackedMethodTable, populate!
 
 #==============================================================================#
 # CacheOwner - identifies a cache partition
@@ -198,6 +199,212 @@ Returns `nothing` if no matching method is found.
 """
 method_instance
 
+#==============================================================================#
+# StackedMethodTable - composite method table view
+#==============================================================================#
+
+"""
+    StackedMethodTable{MTV<:CC.MethodTableView} <: CC.MethodTableView
+
+A composite method table view that stacks a custom method table with a parent view.
+Lookups check the custom MT first, falling back to the parent if no fully-covering
+match is found.
+
+# Constructors
+- `StackedMethodTable(world, mt::MethodTable)` - Stack `mt` over global MT
+- `StackedMethodTable(world, mt::MethodTable, parent::MethodTableView)` - Stack `mt` over `parent`
+
+# Usage
+Return from `CC.method_table(interp::YourInterpreter)` in your AbstractInterpreter.
+
+# Example
+```julia
+struct MyInterpreter <: CC.AbstractInterpreter
+    world::UInt
+    method_table::StackedMethodTable
+    # ...
+end
+
+CC.method_table(interp::MyInterpreter) = interp.method_table
+
+# Create interpreter with stacked method table
+interp = MyInterpreter(world, StackedMethodTable(world, MY_MT), ...)
+```
+"""
+struct StackedMethodTable{MTV<:CC.MethodTableView} <: CC.MethodTableView
+    world::UInt
+    mt::Core.MethodTable
+    parent::MTV
+end
+
+# Convenience constructors
+StackedMethodTable(world::UInt, mt::Core.MethodTable) =
+    StackedMethodTable(world, mt, CC.InternalMethodTable(world))
+StackedMethodTable(world::UInt, mt::Core.MethodTable, parent::Core.MethodTable) =
+    StackedMethodTable(world, mt, StackedMethodTable(world, parent))
+
+CC.isoverlayed(::StackedMethodTable) = true
+
+# CC.findall - find all matching methods
+function CC.findall(@nospecialize(sig::Type), table::StackedMethodTable; limit::Int=-1)
+    result = CC._findall(sig, table.mt, table.world, limit)
+    result === nothing && return nothing  # too many matches
+    nr = CC.length(result)
+    if nr >= 1 && CC.getindex(result, nr).fully_covers
+        # no need to fall back to parent
+        return result
+    end
+
+    parent_result = CC.findall(sig, table.parent; limit)::Union{Nothing, CC.MethodLookupResult}
+    parent_result === nothing && return nothing  # too many matches
+
+    # merge results
+    return CC.MethodLookupResult(
+        CC.vcat(result.matches, parent_result.matches),
+        CC.WorldRange(
+            CC.max(result.valid_worlds.min_world, parent_result.valid_worlds.min_world),
+            CC.min(result.valid_worlds.max_world, parent_result.valid_worlds.max_world)),
+        result.ambig | parent_result.ambig)
+end
+
+# CC.findsup - find most specific matching method
+function CC.findsup(@nospecialize(sig::Type), table::StackedMethodTable)
+    match, valid_worlds = CC._findsup(sig, table.mt, table.world)
+    match !== nothing && return match, valid_worlds
+    parent_match, parent_valid_worlds = CC.findsup(sig, table.parent)
+    return (
+        parent_match,
+        CC.WorldRange(
+            max(valid_worlds.min_world, parent_valid_worlds.min_world),
+            min(valid_worlds.max_world, parent_valid_worlds.max_world)))
+end
+
+#==============================================================================#
+# Inference helpers
+#==============================================================================#
+
+"""
+    populate!(cache, interp, mi) -> Union{Vector{Pair{CodeInstance, CodeInfo}}, Nothing}
+
+Populate the code cache with CodeInstances for `mi` and its callees.
+
+Runs type inference on `mi` using the provided interpreter, which must implement
+the `CC.AbstractInterpreter` interface. The resulting CodeInstances are stored
+in the cache for later retrieval.
+
+On Julia 1.12+, returns a vector of (CodeInstance, CodeInfo) pairs for codegen.
+On Julia 1.11, returns `nothing` (cache is populated implicitly by typeinf_ext_toplevel).
+
+# Arguments
+- `cache::CompilerCache` - The compiler cache instance to populate
+- `interp` - Your AbstractInterpreter implementation
+- `mi` - The MethodInstance to infer
+
+# Example
+```julia
+struct MyInterpreter <: CC.AbstractInterpreter
+    # ...
+end
+
+mi = method_instance(f, (Int,); world, method_table=cache.method_table)
+interp = MyInterpreter(...)
+result = populate!(cache, interp, mi)
+# result is Vector{Pair{CodeInstance, CodeInfo}} on 1.12+, nothing on 1.11
+```
+"""
+function populate!(cache::CompilerCache, interp::CC.AbstractInterpreter,
+                   mi::Core.MethodInstance)
+    @static if VERSION >= v"1.12.0-DEV.1434"
+        # Modern API: returns CodeInstance, use SOURCE_MODE to control caching
+        # (SOURCE_MODE_FORCE_SOURCE was renamed to SOURCE_MODE_GET_SOURCE)
+        source_mode = @static if isdefined(CC, :SOURCE_MODE_GET_SOURCE)
+            CC.SOURCE_MODE_GET_SOURCE
+        else
+            CC.SOURCE_MODE_FORCE_SOURCE
+        end
+        ci = CC.typeinf_ext(interp, mi, source_mode)
+        @assert ci !== nothing "Inference of $mi failed"
+
+        # Collect all code that needs compilation (including callees)
+        codeinfos = Pair{Core.CodeInstance, Core.CodeInfo}[]
+
+        @static if VERSION >= v"1.13.0-DEV.499" || v"1.12-beta3" <= VERSION < v"1.13-"
+            workqueue = CC.CompilationQueue(; interp)
+            push!(workqueue, ci)
+            while !isempty(workqueue)
+                callee = pop!(workqueue)
+                CC.isinspected(workqueue, callee) && continue
+                CC.markinspected!(workqueue, callee)
+
+                callee_mi = CC.get_ci_mi(callee)
+                if CC.use_const_api(callee)
+                    @static if VERSION >= v"1.13.0-DEV.1121"
+                        src = CC.codeinfo_for_const(interp, callee_mi,
+                            CC.WorldRange(callee.min_world, callee.max_world),
+                            callee.edges, callee.rettype_const)
+                    else
+                        src = CC.codeinfo_for_const(interp, callee_mi, callee.rettype_const)
+                    end
+                else
+                    src = CC.typeinf_code(interp, callee_mi, true)
+                end
+                if src isa Core.CodeInfo
+                    sptypes = CC.sptypes_from_meth_instance(callee_mi)
+                    CC.collectinvokes!(workqueue, src, sptypes)
+                    push!(codeinfos, callee => src)
+                end
+            end
+        else
+            # Older 1.12 API
+            workqueue = Core.CodeInstance[ci]
+            inspected = IdSet{Core.CodeInstance}()
+            while !isempty(workqueue)
+                callee = pop!(workqueue)
+                callee in inspected && continue
+                push!(inspected, callee)
+
+                callee_mi = CC.get_ci_mi(callee)
+                if CC.use_const_api(callee)
+                    src = CC.codeinfo_for_const(interp, callee_mi, callee.rettype_const)
+                else
+                    src = CC.typeinf_code(interp, callee_mi, true)
+                end
+                if src isa Core.CodeInfo
+                    CC.collectinvokes!(workqueue, src)
+                    push!(codeinfos, callee => src)
+                end
+            end
+        end
+
+        return codeinfos
+    elseif VERSION >= v"1.12.0-DEV.15"
+        # Julia 1.12 early API
+        source_mode = @static if isdefined(CC, :SOURCE_MODE_GET_SOURCE)
+            CC.SOURCE_MODE_GET_SOURCE
+        else
+            CC.SOURCE_MODE_FORCE_SOURCE
+        end
+        ci = CC.typeinf_ext_toplevel(interp, mi, source_mode)
+        @assert ci !== nothing "Inference of $mi failed"
+        return Pair{Core.CodeInstance, Core.CodeInfo}[]
+    else
+        # Julia 1.11 API - cache populated implicitly, return nothing
+        src = CC.typeinf_ext_toplevel(interp, mi)
+
+        # Handle const-return case where ci.inferred may be nothing
+        world = @static if isdefined(CC, :get_inference_world)
+            CC.get_inference_world(interp)
+        else
+            CC.get_world_counter(interp)
+        end
+        ci = lookup(cache, mi; world)
+        if ci !== nothing && ci.inferred === nothing
+            @atomic ci.inferred = src
+        end
+
+        return nothing
+    end
+end
 
 #==============================================================================#
 # Internal cache helpers
