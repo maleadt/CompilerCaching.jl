@@ -18,26 +18,37 @@ using Base.Experimental: @MethodTable
     add_method(cache, basic_node, (Int,), 10)
 
     compile_count = Ref(0)
-    my_compile(ctx) = begin
-        source = ctx.mi.def.source
+    function my_compile(mi)
+        source = mi.def.source
         compile_count[] += 1
         source * 2
     end
 
+    world = Base.get_world_counter()
+    mi = method_instance(basic_node, (Int,); world, method_table=cache.method_table)
+
     # First call: cache miss, compile_fn invoked
-    r1 = cached_compilation(my_compile, cache, basic_node, (Int,))
-    @test something(r1) == 20  # 10 * 2
+    r1 = cached_compilation(cache, mi, world) do ctx
+        my_compile(mi)
+    end
+    @test r1 == 20  # 10 * 2
     @test compile_count[] == 1
 
     # Second call: cache hit, compile_fn NOT invoked
-    r2 = cached_compilation(my_compile, cache, basic_node, (Int,))
-    @test something(r2) == 20
+    r2 = cached_compilation(cache, mi, world) do ctx
+        my_compile(mi)
+    end
+    @test r2 == 20
     @test compile_count[] == 1  # still 1
 
     # Redefine method → invalidates cache, recompile
     add_method(cache, basic_node, (Int,), 30)
-    r3 = cached_compilation(my_compile, cache, basic_node, (Int,))
-    @test something(r3) == 60  # 30 * 2
+    world = Base.get_world_counter()
+    mi = method_instance(basic_node, (Int,); world, method_table=cache.method_table)
+    r3 = cached_compilation(cache, mi, world) do ctx
+        my_compile(mi)
+    end
+    @test r3 == 60  # 30 * 2
     @test compile_count[] == 2  # incremented
 end
 
@@ -50,39 +61,58 @@ end
     add_method(cache, dispatch_node, (Float64,), 200)
 
     compile_count = Ref(0)
-    my_compile(ctx) = begin
-        source = ctx.mi.def.source
+    function my_compile(mi)
+        source = mi.def.source
         compile_count[] += 1
         source + 1
     end
 
+    world = Base.get_world_counter()
+    mi_int = method_instance(dispatch_node, (Int,); world, method_table=cache.method_table)
+    mi_float = method_instance(dispatch_node, (Float64,); world, method_table=cache.method_table)
+
     # Different types → different cache entries, each compiles once
-    r_int = cached_compilation(my_compile, cache, dispatch_node, (Int,))
-    @test something(r_int) == 101
+    r_int = cached_compilation(cache, mi_int, world) do ctx
+        my_compile(mi_int)
+    end
+    @test r_int == 101
     @test compile_count[] == 1
 
-    r_float = cached_compilation(my_compile, cache, dispatch_node, (Float64,))
-    @test something(r_float) == 201
+    r_float = cached_compilation(cache, mi_float, world) do ctx
+        my_compile(mi_float)
+    end
+    @test r_float == 201
     @test compile_count[] == 2
 
     # Cache hits - no recompilation
-    r_int2 = cached_compilation(my_compile, cache, dispatch_node, (Int,))
-    @test something(r_int2) == 101
+    r_int2 = cached_compilation(cache, mi_int, world) do ctx
+        my_compile(mi_int)
+    end
+    @test r_int2 == 101
     @test compile_count[] == 2  # unchanged
 
-    r_float2 = cached_compilation(my_compile, cache, dispatch_node, (Float64,))
-    @test something(r_float2) == 201
+    r_float2 = cached_compilation(cache, mi_float, world) do ctx
+        my_compile(mi_float)
+    end
+    @test r_float2 == 201
     @test compile_count[] == 2  # unchanged
 
     # Redefine only Int method → only Int recompiles
     add_method(cache, dispatch_node, (Int,), 50)
-    r_int3 = cached_compilation(my_compile, cache, dispatch_node, (Int,))
-    @test something(r_int3) == 51
+    world = Base.get_world_counter()
+    mi_int = method_instance(dispatch_node, (Int,); world, method_table=cache.method_table)
+    r_int3 = cached_compilation(cache, mi_int, world) do ctx
+        my_compile(mi_int)
+    end
+    @test r_int3 == 51
     @test compile_count[] == 3
 
-    # Float64 still uses cached version
-    r_float3 = cached_compilation(my_compile, cache, dispatch_node, (Float64,))
-    @test something(r_float3) == 201
+    # Float64 still uses cached version (need to re-lookup mi after world change)
+    mi_float = method_instance(dispatch_node, (Float64,); world, method_table=cache.method_table)
+    r_float3 = cached_compilation(cache, mi_float, world) do ctx
+        my_compile(mi_float)
+    end
+    @test r_float3 == 201
     @test compile_count[] == 3  # unchanged
 end
 
@@ -93,14 +123,9 @@ end
     function missing_node end
     # No method registered
 
-    my_compile(ctx) = ctx.mi.def.source
-
     # Returns nothing when no method found
-    result = cached_compilation(my_compile, cache, missing_node, (Int,))
-    @test result === nothing
-
-    # Also test method_instance directly
-    mi = method_instance(missing_node, (Int,); method_table=cache.mt)
+    world = Base.get_world_counter()
+    mi = method_instance(missing_node, (Int,); world, method_table=cache.method_table)
     @test mi === nothing
 end
 
@@ -114,61 +139,73 @@ end
     add_method(cache, sharded_node, (Int,), 42)
 
     compile_count = Ref(0)
-    my_compile(ctx) = begin
+    function my_compile(mi)
         compile_count[] += 1
-        ctx.mi.def.source
+        mi.def.source
     end
+
+    world = Base.get_world_counter()
+    mi = method_instance(sharded_node, (Int,); world, method_table=cache.method_table)
 
     # First key combination
     keys1 = (opt_level=1, debug=false)
-    r1 = cached_compilation(my_compile, cache, sharded_node, (Int,), keys1)
-    @test something(r1) == 42
+    r1 = cached_compilation(cache, mi, world, keys1) do ctx
+        my_compile(mi)
+    end
+    @test r1 == 42
     @test compile_count[] == 1
 
     # Same key combination → cache hit
-    r2 = cached_compilation(my_compile, cache, sharded_node, (Int,), keys1)
-    @test something(r2) == 42
+    r2 = cached_compilation(cache, mi, world, keys1) do ctx
+        my_compile(mi)
+    end
+    @test r2 == 42
     @test compile_count[] == 1  # unchanged
 
     # Different key combination → cache miss (different shard)
     keys2 = (opt_level=2, debug=false)
-    r3 = cached_compilation(my_compile, cache, sharded_node, (Int,), keys2)
-    @test something(r3) == 42
+    r3 = cached_compilation(cache, mi, world, keys2) do ctx
+        my_compile(mi)
+    end
+    @test r3 == 42
     @test compile_count[] == 2  # new compilation
 
     # Yet another key combination
     keys3 = (opt_level=1, debug=true)
-    r4 = cached_compilation(my_compile, cache, sharded_node, (Int,), keys3)
-    @test something(r4) == 42
+    r4 = cached_compilation(cache, mi, world, keys3) do ctx
+        my_compile(mi)
+    end
+    @test r4 == 42
     @test compile_count[] == 3  # another new compilation
 
     # Back to first key combination → still cached
-    r5 = cached_compilation(my_compile, cache, sharded_node, (Int,), keys1)
-    @test something(r5) == 42
+    r5 = cached_compilation(cache, mi, world, keys1) do ctx
+        my_compile(mi)
+    end
+    @test r5 == 42
     @test compile_count[] == 3  # unchanged
 end
 
-@testset "CompilationContext provides mi" begin
+@testset "CompilationContext for dependencies" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
     cache = CompilerCache(:CtxTest, method_table)
 
     function ctx_node end
     add_method(cache, ctx_node, (Int,), :my_source)
 
-    captured_mi = Ref{Any}(nothing)
     captured_source = Ref{Any}(nothing)
 
-    my_compile(ctx) = begin
-        captured_mi[] = ctx.mi
-        captured_source[] = ctx.mi.def.source
+    world = Base.get_world_counter()
+    mi = method_instance(ctx_node, (Int,); world, method_table=cache.method_table)
+
+    cached_compilation(cache, mi, world) do ctx
+        captured_source[] = mi.def.source
         :compiled
     end
 
-    cached_compilation(my_compile, cache, ctx_node, (Int,))
-
     @test captured_source[] === :my_source
-    @test captured_mi[] isa Core.MethodInstance
-    @test captured_mi[].def.name === :ctx_node
+    @test mi isa Core.MethodInstance
+    @test mi.def.name === :ctx_node
 end
 
 @testset "dependency invalidation" begin
@@ -183,41 +220,60 @@ end
     child_compile_count = Ref(0)
     parent_compile_count = Ref(0)
 
-    child_compile(ctx) = begin
+    function child_compile(mi)
         child_compile_count[] += 1
         :child_compiled
     end
 
-    parent_compile(ctx) = begin
+    function parent_compile(ctx, mi, world)
         parent_compile_count[] += 1
         # Register dependency on child
-        child_mi = method_instance(child_node, (Int,); method_table=cache.mt)
+        child_mi = method_instance(child_node, (Int,); world, method_table=cache.method_table)
         register_dependency!(ctx, child_mi)
         :parent_compiled
     end
 
+    world = Base.get_world_counter()
+    child_mi = method_instance(child_node, (Int,); world, method_table=cache.method_table)
+    parent_mi = method_instance(parent_node, (Int,); world, method_table=cache.method_table)
+
     # Compile child first
-    cached_compilation(child_compile, cache, child_node, (Int,))
+    cached_compilation(cache, child_mi, world) do ctx
+        child_compile(child_mi)
+    end
     @test child_compile_count[] == 1
 
     # Compile parent (depends on child)
-    cached_compilation(parent_compile, cache, parent_node, (Int,))
+    cached_compilation(cache, parent_mi, world) do ctx
+        parent_compile(ctx, parent_mi, world)
+    end
     @test parent_compile_count[] == 1
 
     # Cache hits
-    cached_compilation(child_compile, cache, child_node, (Int,))
-    cached_compilation(parent_compile, cache, parent_node, (Int,))
+    cached_compilation(cache, child_mi, world) do ctx
+        child_compile(child_mi)
+    end
+    cached_compilation(cache, parent_mi, world) do ctx
+        parent_compile(ctx, parent_mi, world)
+    end
     @test child_compile_count[] == 1
     @test parent_compile_count[] == 1
 
     # Redefine child → child recompiles
     add_method(cache, child_node, (Int,), :new_child_ir)
-    cached_compilation(child_compile, cache, child_node, (Int,))
+    world = Base.get_world_counter()
+    child_mi = method_instance(child_node, (Int,); world, method_table=cache.method_table)
+    cached_compilation(cache, child_mi, world) do ctx
+        child_compile(child_mi)
+    end
     @test child_compile_count[] == 2
 
     # Parent should also recompile due to dependency
-    cached_compilation(parent_compile, cache, parent_node, (Int,))
-    @test parent_compile_count[] >= 1
+    parent_mi = method_instance(parent_node, (Int,); world, method_table=cache.method_table)
+    cached_compilation(cache, parent_mi, world) do ctx
+        parent_compile(ctx, parent_mi, world)
+    end
+    @test parent_compile_count[] == 2
 end
 
 @testset "method table isolation" begin
@@ -233,11 +289,18 @@ end
     result_a = Ref{Any}(nothing)
     result_b = Ref{Any}(nothing)
 
-    compile_a(ctx) = (result_a[] = ctx.mi.def.source; ctx.mi.def.source)
-    compile_b(ctx) = (result_b[] = ctx.mi.def.source; ctx.mi.def.source)
+    world = Base.get_world_counter()
+    mi_a = method_instance(isolated_node, (Int,); world, method_table=cache_a.method_table)
+    mi_b = method_instance(isolated_node, (Int,); world, method_table=cache_b.method_table)
 
-    cached_compilation(compile_a, cache_a, isolated_node, (Int,))
-    cached_compilation(compile_b, cache_b, isolated_node, (Int,))
+    cached_compilation(cache_a, mi_a, world) do ctx
+        result_a[] = mi_a.def.source
+        mi_a.def.source
+    end
+    cached_compilation(cache_b, mi_b, world) do ctx
+        result_b[] = mi_b.def.source
+        mi_b.def.source
+    end
 
     @test result_a[] === :ir_a
     @test result_b[] === :ir_b
@@ -258,14 +321,16 @@ end
     add_method(cache, complex_node, (Int,), ir)
 
     captured_ir = Ref{Any}(nothing)
-    my_compile(ctx) = begin
-        source = ctx.mi.def.source
+
+    world = Base.get_world_counter()
+    mi = method_instance(complex_node, (Int,); world, method_table=cache.method_table)
+
+    result = cached_compilation(cache, mi, world) do ctx
+        source = mi.def.source
         captured_ir[] = source
         length(source.nodes)
     end
-
-    result = cached_compilation(my_compile, cache, complex_node, (Int,))
-    @test something(result) == 3
+    @test result == 3
     @test captured_ir[] isa MyIR
     @test captured_ir[].nodes == [:a, :b, :c]
     @test captured_ir[].edges[:a] == [:b]
@@ -293,21 +358,28 @@ end # Mode 1
     cache = CompilerCache(:OverlayTest, method_table)
 
     compile_count = Ref(0)
-    my_compile(ctx) = begin
+    function my_compile(mi)
         compile_count[] += 1
         # Source is compressed Julia source (can use Base.uncompressed_ast if needed)
         # Return something based on the method
-        ctx.mi.def.name
+        mi.def.name
     end
 
-    result = cached_compilation(my_compile, cache, overlay_double, (Int,))
+    world = Base.get_world_counter()
+    mi = method_instance(overlay_double, (Int,); world, method_table=cache.method_table)
+
+    result = cached_compilation(cache, mi, world) do ctx
+        my_compile(mi)
+    end
     # Overlay methods may have gensym'd names like "#overlay_double"
-    @test occursin("overlay_double", string(something(result)))
+    @test occursin("overlay_double", string(result))
     @test compile_count[] == 1
 
     # Cache hit
-    result2 = cached_compilation(my_compile, cache, overlay_double, (Int,))
-    @test occursin("overlay_double", string(something(result2)))
+    result2 = cached_compilation(cache, mi, world) do ctx
+        my_compile(mi)
+    end
+    @test occursin("overlay_double", string(result2))
     @test compile_count[] == 1  # unchanged
 end
 
@@ -327,21 +399,28 @@ end # Mode 2
     global_test_fn(x::Int) = x + 100
 
     compile_count = Ref(0)
-    my_compile(ctx) = begin
+    function my_compile(mi)
         compile_count[] += 1
         # For global methods, source may be compressed (String/Vector{UInt8})
         # Use Base.uncompressed_ast() if you need CodeInfo
         # Here we just return the method name
-        ctx.mi.def.name
+        mi.def.name
     end
 
-    result = cached_compilation(my_compile, cache, global_test_fn, (Int,))
-    @test something(result) === :global_test_fn
+    world = Base.get_world_counter()
+    mi = method_instance(global_test_fn, (Int,); world, method_table=cache.method_table)
+
+    result = cached_compilation(cache, mi, world) do ctx
+        my_compile(mi)
+    end
+    @test result === :global_test_fn
     @test compile_count[] == 1
 
     # Cache hit
-    result2 = cached_compilation(my_compile, cache, global_test_fn, (Int,))
-    @test something(result2) === :global_test_fn
+    result2 = cached_compilation(cache, mi, world) do ctx
+        my_compile(mi)
+    end
+    @test result2 === :global_test_fn
     @test compile_count[] == 1  # unchanged
 end
 
@@ -353,22 +432,31 @@ end
     global_sharded_fn(x::Float64) = x * 2.0
 
     compile_count = Ref(0)
-    my_compile(ctx) = begin
+    function my_compile(mi)
         compile_count[] += 1
-        ctx.mi.def.name
+        mi.def.name
     end
 
+    world = Base.get_world_counter()
+    mi = method_instance(global_sharded_fn, (Float64,); world, method_table=cache.method_table)
+
     # Different sharding keys = different cache entries
-    r1 = cached_compilation(my_compile, cache, global_sharded_fn, (Float64,), (opt_level=1,))
-    @test something(r1) === :global_sharded_fn
+    r1 = cached_compilation(cache, mi, world, (opt_level=1,)) do ctx
+        my_compile(mi)
+    end
+    @test r1 === :global_sharded_fn
     @test compile_count[] == 1
 
-    r2 = cached_compilation(my_compile, cache, global_sharded_fn, (Float64,), (opt_level=2,))
-    @test something(r2) === :global_sharded_fn
+    r2 = cached_compilation(cache, mi, world, (opt_level=2,)) do ctx
+        my_compile(mi)
+    end
+    @test r2 === :global_sharded_fn
     @test compile_count[] == 2  # different shard
 
-    r3 = cached_compilation(my_compile, cache, global_sharded_fn, (Float64,), (opt_level=1,))
-    @test something(r3) === :global_sharded_fn
+    r3 = cached_compilation(cache, mi, world, (opt_level=1,)) do ctx
+        my_compile(mi)
+    end
+    @test r3 === :global_sharded_fn
     @test compile_count[] == 2  # cache hit
 end
 

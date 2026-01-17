@@ -52,7 +52,7 @@ Base.:(==)(a::CacheOwner, b::CacheOwner) = a.tag == b.tag && a.keys == b.keys
 A compilation cache instance, parameterized by key type K.
 
 - `tag::Symbol` - Base tag for cache owner
-- `mt::Union{Core.MethodTable, Nothing}` - Method table for dispatch (nothing = global MT)
+- `method_table::Union{Core.MethodTable, Nothing}` - Method table for dispatch (nothing = global MT)
 
 # Usage Modes
 
@@ -84,7 +84,9 @@ end
 
 # Constructors
 function CompilerCache{K}(tag::Symbol, method_table) where K
-    CompilerCache{K}(tag, method_table, Dict{Tuple{Core.CodeInstance, K}, Any}(), ReentrantLock())
+    CompilerCache{K}(tag, method_table,
+                     Dict{Tuple{Core.CodeInstance, K}, Any}(),
+                     ReentrantLock())
 end
 CompilerCache(tag::Symbol, method_table) = CompilerCache{Nothing}(tag, method_table)
 CompilerCache(tag::Symbol) = CompilerCache{Nothing}(tag, nothing)
@@ -221,17 +223,56 @@ function lookup(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothin
 end
 
 """
-    cache!(cache, mi, keys=nothing; world, edges) -> CodeInstance
+    store_backedges(mi::MethodInstance, ci::CodeInstance, deps::Vector{MethodInstance})
+
+Register backedges so Julia automatically invalidates cached code when dependencies change.
+This enables Julia's built-in invalidation mechanism - when any dependency MI is
+invalidated, the caller MI's CodeInstances will have their max_world reduced.
+
+Note: The API changed between Julia versions:
+- Julia 1.11: jl_method_instance_add_backedge takes MethodInstance as caller
+- Julia 1.12+: jl_method_instance_add_backedge takes CodeInstance as caller
+"""
+function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
+                         deps::Vector{Core.MethodInstance})
+    isa(mi.def, Method) || return  # don't add backedges to toplevel
+
+    for dep_mi in deps
+        @static if VERSION >= v"1.12-"
+            # Julia 1.12+: pass CodeInstance as caller
+            ccall(:jl_method_instance_add_backedge, Cvoid,
+                  (Any, Any, Any), dep_mi, nothing, ci)
+        else
+            # Julia 1.11: pass MethodInstance as caller
+            ccall(:jl_method_instance_add_backedge, Cvoid,
+                  (Any, Any, Any), dep_mi, nothing, mi)
+        end
+    end
+    nothing
+end
+
+"""
+    cache!(cache, mi, keys=nothing; world, deps) -> CodeInstance
 
 Create and store a CodeInstance for `mi` in the cache.
 
 Used for foreign mode where inference doesn't run. The CI participates in
-Julia's invalidation mechanism via its edges.
+Julia's invalidation mechanism via backedges registered from `deps`.
+
+# Arguments
+- `cache::CompilerCache{K}` - The compiler cache instance
+- `mi::MethodInstance` - The method instance to cache
+- `keys::K` - Sharding keys (default: nothing)
+- `world::UInt` - World age for the CI
+- `deps::Vector{MethodInstance}` - Dependencies to register as backedges
 """
 function cache!(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothing;
-                world::UInt=Base.get_world_counter(), edges::Core.SimpleVector=Core.svec()) where K
+                world::UInt=Base.get_world_counter(),
+                deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) where K
     owner = cache_owner(cache, keys)
     cc = code_cache(owner, world)
+    edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
+
     @static if VERSION >= v"1.12-"
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
             Int32(0), UInt(world), typemax(UInt), UInt32(0), nothing, nothing, edges)
@@ -240,6 +281,12 @@ function cache!(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothin
             Int32(0), UInt(world), typemax(UInt), UInt32(0), UInt32(0), nothing, UInt8(0))
     end
     CC.setindex!(cc, ci, mi)
+
+    # Register backedges for automatic invalidation
+    if !isempty(deps)
+        store_backedges(mi, ci, deps)
+    end
+
     return ci
 end
 
@@ -253,7 +300,7 @@ end
 Look up or compile code for MethodInstance `mi`.
 
 # Arguments
-- `compiler(ctx) -> result` - Called on cache miss. Access source via `ctx.mi.def.source`.
+- `compiler(ctx) -> result` - Called on cache miss. Use `register_dependency!(ctx, mi)` to track dependencies.
 - `cache::CompilerCache{K}` - Cache instance
 - `mi::MethodInstance` - The method instance to compile
 - `world::UInt` - World age for cache lookup
@@ -269,7 +316,7 @@ mi = method_instance(f, tt; world, method_table=cache.method_table)
 mi === nothing && throw(MethodError(f, tt))
 
 result = cached_compilation(cache, mi, world) do ctx
-    # compile ctx.mi
+    compile(mi)  # mi passed directly, not ctx.mi
 end
 ```
 """
@@ -279,6 +326,8 @@ function cached_compilation(compiler, cache::CompilerCache{K},
     result = nothing
 
     # Fast path: find CI and check cache
+    # Note: lookup() uses Julia's cache which checks max_world,
+    # so invalidated CIs will return nothing automatically
     ci = lookup(cache, mi, keys; world)
     if ci !== nothing
         key = (ci, keys)
@@ -297,9 +346,9 @@ function cached_compilation(compiler, cache::CompilerCache{K},
             ci = lookup(cache, mi, keys; world)
         end
 
-        # For foreign mode (no inference), create CI ourselves
+        # For foreign mode (no inference), create CI ourselves with backedges
         if ci === nothing
-            ci = cache!(cache, mi, keys; world)
+            ci = cache!(cache, mi, keys; world, deps=ctx.deps)
         end
         key = (ci, keys)
 
