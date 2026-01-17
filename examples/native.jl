@@ -60,7 +60,7 @@ const compilations = Ref(0) # for testing
 function compile(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
     compilations[] += 1
     interp = CustomInterpreter(cache, world)
-    codeinfos = run_inference(cache, interp, mi)
+    codeinfos = populate!(cache, interp, mi)
     emit_native(cache, interp, mi, codeinfos)
 end
 

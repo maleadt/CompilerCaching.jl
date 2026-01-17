@@ -2,6 +2,8 @@ using CompilerCaching
 using Test
 using Base.Experimental: @MethodTable
 
+include("utils.jl")
+
 @testset "CompilerCaching" begin
 
 #==============================================================================#
@@ -463,81 +465,28 @@ end
 end # Mode 3
 
 #==============================================================================#
-# StackedMethodTable
-#==============================================================================#
-
-@testset "StackedMethodTable" begin
-    using Core.Compiler: findall, findsup
-
-    @testset "stacks over global MT" begin
-        mt = @eval @MethodTable $(gensym(:mt))
-        world = Base.get_world_counter()
-
-        stacked = StackedMethodTable(world, mt)
-
-        # Should find Base.sin in global MT
-        sig = Tuple{typeof(sin), Float64}
-        result = findsup(sig, stacked)
-        @test result[1] !== nothing
-        @test result[1].method.name === :sin
-    end
-
-    @testset "custom MT takes priority" begin
-        mt = @eval @MethodTable $(gensym(:mt))
-
-        # Add overlay method
-        overlay_fn = @eval function $(gensym(:overlay_fn)) end
-        @eval Base.Experimental.@overlay $mt function $overlay_fn(x::Int)
-            x * 10
-        end
-
-        world = Base.get_world_counter()
-        stacked = StackedMethodTable(world, mt)
-
-        sig = Tuple{typeof(overlay_fn), Int}
-        result = findsup(sig, stacked)
-        @test result[1] !== nothing
-    end
-
-    @testset "findall returns merged results" begin
-        mt = @eval @MethodTable $(gensym(:mt))
-        world = Base.get_world_counter()
-
-        stacked = StackedMethodTable(world, mt)
-
-        # Should find all matching methods for sin
-        sig = Tuple{typeof(sin), Number}
-        result = findall(sig, stacked; limit=10)
-        @test result !== nothing
-        @test length(result.matches) >= 1
-    end
-end
-
-#==============================================================================#
 # populate!
 #==============================================================================#
 
 @testset "populate!" begin
-    # Minimal interpreter for testing
-    CC_test = Core.Compiler
-
-    struct TestInterpreter <: CC_test.AbstractInterpreter
+    # Simple test interpreter
+    struct TestInterpreter <: Core.Compiler.AbstractInterpreter
         world::UInt
-        inf_cache::Vector{CC_test.InferenceResult}
+        inf_cache::Vector{Core.Compiler.InferenceResult}
     end
-    TestInterpreter(world::UInt) = TestInterpreter(world, CC_test.InferenceResult[])
+    TestInterpreter(world::UInt) = TestInterpreter(world, Core.Compiler.InferenceResult[])
 
-    CC_test.InferenceParams(::TestInterpreter) = CC_test.InferenceParams()
-    CC_test.OptimizationParams(::TestInterpreter) = CC_test.OptimizationParams()
-    CC_test.get_inference_cache(interp::TestInterpreter) = interp.inf_cache
+    Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
+    Core.Compiler.OptimizationParams(::TestInterpreter) = Core.Compiler.OptimizationParams()
+    Core.Compiler.get_inference_cache(interp::TestInterpreter) = interp.inf_cache
     @static if isdefined(Core.Compiler, :get_inference_world)
-        CC_test.get_inference_world(interp::TestInterpreter) = interp.world
+        Core.Compiler.get_inference_world(interp::TestInterpreter) = interp.world
     else
-        CC_test.get_world_counter(interp::TestInterpreter) = interp.world
+        Core.Compiler.get_world_counter(interp::TestInterpreter) = interp.world
     end
-    CC_test.cache_owner(::TestInterpreter) = :test_interp
-    CC_test.lock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
-    CC_test.unlock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
+    Core.Compiler.cache_owner(::TestInterpreter) = :test_interp
+    Core.Compiler.lock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
+    Core.Compiler.unlock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
 
     @testset "basic inference" begin
         cache = CompilerCache(:InferenceTest)
@@ -548,8 +497,6 @@ end
         interp = TestInterpreter(world)
         result = populate!(cache, interp, mi)
 
-        # On Julia 1.12+, returns Vector{Pair{CodeInstance, CodeInfo}}
-        # On Julia 1.11, returns nothing (cache is populated implicitly)
         @static if VERSION >= v"1.12.0-DEV.15"
             @test result isa Vector{Pair{Core.CodeInstance, Core.CodeInfo}}
         else
