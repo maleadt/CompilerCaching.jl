@@ -21,7 +21,7 @@ using Pkg
 Pkg.add(url="path/to/CompilerCaching")
 ```
 
-## Eamples
+## Examples
 
 Basic example:
 
@@ -32,25 +32,36 @@ my_function(x::Int) = x + 100
 
 cache = CompilerCache(:MyCompiler)
 
+function infer(cache, mi, world)
+    # Perform type inference, constructing a code instance with invalidation edges
+    ci = cache!(cache, mi; world)
+    [ci => :inferred]
+end
+
+function codegen(cache, mi, world, codeinfos)
+    # Generate serializable code
+    mi.def.n
+end
+
+function link(cache, mi, world, result)
+    # Comple to a session-specific representation
+    result
+end
+
 function call(f, args...)
     tt = map(Core.Typeof, args)
-    result = cached_compilation(cache, f, tt) do ctx
-        run_inference_and_codegen(ctx.mi)
-    end
-    compiled = @something result throw(MethodError(f, args))
+    world = Base.get_world_counter()
+    mi = @something(method_instance(f, tt; world, cache.method_table),
+                    throw(MethodError(f, args)))
 
-    compiled(args...)
+    cached_compilation(cache, mi, world; infer, codegen, link)
 end
 call(my_function, 42)
 ```
 
-<!-- TODO: this shouldn't call a magical run_inference_and_codegen but actually use Julia codegen -->
-
-<!-- how does this work for nested function calls? Doesn't Julia normally do nested copmpilation automatically? how does transient invalidation work? -->
-
 ### Cache sharding
 
-In case you want to compile a single method instance differently, e.g., by doing different optimization levels, you can shard the cache on arbitrary (immutable) keys:
+Partition caches by additional parameters (e.g., optimization level, target device):
 
 ```julia
 using CompilerCaching
@@ -60,20 +71,16 @@ my_function(x::Int) = x + 100
 const CacheKey = @NamedTuple{opt_level::Int}
 cache = CompilerCache{CacheKey}(:MyCompiler)
 
-function call(f, args...)
+function call(f, args...; opt_level=1)
     tt = map(Core.Typeof, args)
-    params = CacheKey(1)
-    result = cached_compilation(cache, f, tt, params) do ctx
-        run_inference_and_codegen(ctx.mi)
-    end
-    compiled = @something result throw(MethodError(f, args))
+    world = Base.get_world_counter()
+    mi = @something(method_instance(f, tt; world).
+                    throw(MethodError(f, args)))
 
-    compiled(args...)
+    cached_compilation(cache, mi, world, (opt_level=opt_level,);
+                       infer, codegen, link)
 end
-call(my_function, 42)
 ```
-
-<!-- TODO: ensure immutability -->
 
 
 ### Overlay methods
@@ -96,17 +103,15 @@ cache = CompilerCache(:MyCompiler, method_table)
 
 function call(f, args...)
     tt = map(Core.Typeof, args)
-    result = cached_compilation(cache, f, tt) do ctx
-        run_inference_and_codegen(ctx.mi)
-    end
-    compiled = @something result throw(MethodError(f, args))
+    world = Base.get_world_counter()
+    mi @something(method_instance(f, tt; world, cache.method_table)
+                  throw(MethodError(f, args)))
 
-    compiled(args...)
+    cached_compilation(cache, mi, world; infer, codegen, link)
 end
-call(my_function, 42)
 ```
 
-### Foreign IR with custom dependency tracking
+### Foreign IR with dependency tracking
 
 For compilers that define their own IR format that Julia doesn't know about:
 
@@ -115,28 +120,43 @@ using CompilerCaching
 using Base.Experimental: @MethodTable
 
 @MethodTable method_table
+cache = CompilerCache(:MyCompiler, method_table)
 
 function really_special end
 add_method(cache, really_special, (Int,), MyCustomIR([:a, :b]))
 
-cache = CompilerCache(:MyCompiler, method_table)
+# Infer phase: handles dependency tracking via cache!
+function foreign_infer(cache, mi, world)
+    ir = mi.def.source::MyCustomIR
+    deps = Core.MethodInstance[]
 
-function call(f, args...)
-    tt = map(Core.Typeof, args)
-    result = cached_compilation(cache, f, tt) do ctx
-        ir = ctx.mi.def.source # custom IR
-        # mark dependencies
-        register_dependency!(ctx, called_mi)
-        compile_my_ir(ir)
+    # Recursively compile any callees and collect deps
+    for callee in ir.callees
+        callee_mi = method_instance(callee.f, callee.tt;
+                                    world, method_table=cache.method_table)
+        cached_compilation(cache, callee_mi, world;
+            infer = foreign_infer,
+            codegen = foreign_codegen,
+            link = foreign_link)
+        push!(deps, callee_mi)
     end
-    compiled = @something result throw(MethodError(f, args))
 
-    compiled(args...)
+    # Create CI with backedges for dependency tracking
+    ci = cache!(cache, mi; world, deps)
+    return [ci => ir]
 end
-call(really_special, 42)
+
+function foreign_codegen(cache, mi, world, codeinfos)
+    _, ir = only(codeinfos)
+    compile_my_ir(ir)
+end
+
+function foreign_link(cache, mi, world, result)
+    result
+end
 ```
 
-Since inference isn't used, Julia doesn't know which functions are called, so we need to track these ourselves by caling `register_dependency!`.
+Dependency tracking is handled by the `infer` phase via `cache!`, which registers backedges for automatic invalidation.
 
 
 ## API Reference
@@ -144,7 +164,6 @@ Since inference isn't used, Julia doesn't know which functions are called, so we
 ### Types
 
 - `CompilerCache{K}` - Main cache instance parameterized by key type K
-- `CompilationContext` - Context passed to compile function
 - `CacheOwner{K}` - Cache partition identifier (internal)
 
 ### Functions
@@ -153,10 +172,9 @@ Since inference isn't used, Julia doesn't know which functions are called, so we
 - `CompilerCache(tag::Symbol)` - Create cache using global method table
 - `CompilerCache{K}(tag::Symbol)` - Create cache with sharding keys and global MT
 - `add_method(cache, f, arg_types, source)` - Register method with custom source
-- `cached_compilation(cache, f, tt, [keys,] compile_fn)` - Look up or compile
-- `method_instance(sig; world, method_table)` - Get MethodInstance by signature type
+- `cached_compilation(cache, mi, world, [keys]; infer, codegen, link)` - Three-phase compilation API
 - `method_instance(f, tt; world, method_table)` - Get MethodInstance for function + arg types
-- `register_dependency!(ctx, mi)` - Register transitive dependency
+- `cache!(cache, mi; world, deps)` - Create CodeInstance with dependency tracking
 
 ## How It Works
 

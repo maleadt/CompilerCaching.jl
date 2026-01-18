@@ -1,9 +1,4 @@
-# examples/helpers.jl - Reusable compilation helpers
-#
-# Provides inference and native code emission utilities that can be used by
-# different example compilers. Each example defines its own AbstractInterpreter.
-#
-# Requires Julia 1.11+ and LLVM.jl
+# examples/julia.jl - Julia native code compilation helpers
 
 using CompilerCaching
 using LLVM
@@ -59,25 +54,18 @@ function getglobal_jljit()
 end
 
 """
-    emit_native(cache, interp, mi, codeinfos) -> Ptr{Cvoid}
+    julia_codegen(cache, mi, world, codeinfos) -> (ir_bytes, entry_name)
 
-Generate native code for `mi` and JIT compile it.
-Returns a function pointer to the compiled code.
+Generate LLVM IR and return serializable intermediate result.
+Returns a tuple of (LLVM bitcode bytes, entry function name).
 
 On Julia 1.12+, uses `codeinfos` (CodeInstance/CodeInfo pairs) for codegen.
-On Julia 1.11, `codeinfos` should be `nothing`; uses cache lookup callback instead.
+On Julia 1.11, `codeinfos` contains `[ci => nothing]`; uses cache lookup callback instead.
 
-The `cache` is used to look up CodeInstances during codegen.
+This function handles codegen but does not JIT compile - use `julia_jit` for that.
 """
-function emit_native(cache::CompilerCache, interp::CC.AbstractInterpreter,
-                     mi::Core.MethodInstance,
-                     codeinfos::Union{Vector{Pair{Core.CodeInstance, Core.CodeInfo}}, Nothing})
-    # Extract world from interpreter
-    world = @static if isdefined(CC, :get_inference_world)
-        CC.get_inference_world(interp)
-    else
-        CC.get_world_counter(interp)
-    end
+function julia_codegen(cache::CompilerCache, mi::Core.MethodInstance,
+                       world::UInt, codeinfos::Vector{<:Pair{Core.CodeInstance}})
 
     # Set up globals for the lookup callback
     _codegen_cache[] = cache
@@ -91,11 +79,10 @@ function emit_native(cache::CompilerCache, interp::CC.AbstractInterpreter,
         params = CodegenParams()
     end
 
-    # Get JuliaOJIT for JIT compilation
+    # Get JuliaOJIT for target configuration
     jljit = getglobal_jljit()
-    jd = JITDylib(jljit)
 
-    # Generate LLVM IR and JIT compile
+    # Generate LLVM IR
     with_llvm_context() do ctx
         # Create LLVM module
         ts_mod = ThreadSafeModule("native_compile")
@@ -138,8 +125,7 @@ function emit_native(cache::CompilerCache, interp::CC.AbstractInterpreter,
 
         @assert native_code != C_NULL "Code generation failed"
 
-        # Get the ThreadSafeModule for JIT
-        # XXX: this is the same module as `ts_mod` above
+        # Get the ThreadSafeModule
         llvm_mod_ref = @ccall jl_get_llvm_module(
                 native_code::Ptr{Cvoid}
             )::LLVM.API.LLVMOrcThreadSafeModuleRef
@@ -175,16 +161,44 @@ function emit_native(cache::CompilerCache, interp::CC.AbstractInterpreter,
 
         @assert func_name !== nothing "No compiled function found"
 
+        # Serialize to bitcode
+        ir_bytes = llvm_ts_mod() do mod
+            convert(Vector{UInt8}, mod)
+        end
+
+        return (ir_bytes, func_name)
+    end
+end
+
+"""
+    julia_jit(cache, mi, world, ir_data) -> Ptr{Cvoid}
+
+JIT compile LLVM bitcode to a function pointer.
+
+Takes a tuple of (LLVM bitcode bytes, entry function name) as returned by `julia_codegen`.
+The `cache`, `mi`, and `world` arguments are ignored but included for use as a `link` callback.
+"""
+function julia_jit(cache, mi, world, ir_data)
+    ir_bytes, entry_name = ir_data
+
+    jljit = getglobal_jljit()
+    jd = JITDylib(jljit)
+
+    with_llvm_context() do ctx
+        # Parse bitcode back into a module, then wrap in ThreadSafeModule
+        mod = parse(LLVM.Module, ir_bytes)
+        ts_mod = ThreadSafeModule(mod)
+
         # Run Julia's optimization pipeline to lower intrinsics
-        llvm_ts_mod() do mod
-            run!(JuliaPipeline(), mod)
+        ts_mod() do m
+            run!(JuliaPipeline(), m)
         end
 
         # Add to JIT
-        add!(jljit, jd, llvm_ts_mod)
+        add!(jljit, jd, ts_mod)
 
         # Look up the compiled function
-        addr = LLVM.lookup(jljit, func_name)
+        addr = LLVM.lookup(jljit, entry_name)
         return pointer(addr)
     end
 end

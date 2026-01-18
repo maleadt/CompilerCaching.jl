@@ -4,14 +4,17 @@
 # - LLVM IR is generated and plugged back into Julia's JIT
 # - overlay method tables are used to demonstrate method overrides
 
-include("helpers.jl")
+include("julia.jl")
 
 using Base: get_world_counter
 
 using Base.Experimental: @MethodTable, @overlay
 @MethodTable CUSTOM_MT
 
-const CUSTOM_CACHE = CompilerCache(:CustomExample, CUSTOM_MT)
+# Enable disk caching using the three-phase API with CI build_id keys.
+# This avoids stale bitcode conflicts on method redefinition.
+const CUSTOM_CACHE = CompilerCache(:NativeExample, CUSTOM_MT;
+                                   disk_cache=(VERSION >= v"1.12-"))
 
 
 ## abstract interpreter
@@ -57,11 +60,17 @@ CC.cache_owner(interp::CustomInterpreter) = cache_owner(interp.cache)
 ## high-level API
 
 const compilations = Ref(0) # for testing
-function compile(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
-    compilations[] += 1
+
+# Inference phase: returns Vector{Pair{CI, IR}} where root CI is first entry
+function julia_infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
     interp = CustomInterpreter(cache, world)
-    codeinfos = populate!(cache, interp, mi)
-    emit_native(cache, interp, mi, codeinfos)
+    CompilerCaching.populate!(cache, interp, mi)
+end
+
+# Codegen phase wrapper: counts compilations for testing
+function julia_codegen_counted(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, codeinfos)
+    compilations[] += 1
+    julia_codegen(cache, mi, world, codeinfos)
 end
 
 """
@@ -100,9 +109,11 @@ end
     end
 end
 function _call_compile(cache, mi, world)
-    cached_compilation(cache, mi, world) do ctx
-        compile(cache, mi, world)
-    end
+    cached_compilation(cache, mi, world;
+        infer = julia_infer,
+        codegen = julia_codegen_counted,
+        link = julia_jit
+    )
 end
 
 

@@ -11,14 +11,17 @@
 module CompilerCaching
 
 using Base.Experimental: @MethodTable
+using Scratch: @get_scratch!
+using Serialization: serialize, deserialize
 const CC = Core.Compiler
 
 include("utils.jl")
 
-export CompilerCache, CacheOwner, CompilationContext
-export add_method, cached_compilation, method_instance, register_dependency!
+export CompilerCache, CacheOwner
+export add_method, cached_compilation, method_instance
 export cache_owner, cache!
 export populate!, StackedMethodTable
+export disk_cache_path, clear_disk_cache!
 
 #==============================================================================#
 # CacheOwner - identifies a cache partition
@@ -44,6 +47,25 @@ function Base.hash(o::CacheOwner, h::UInt)
 end
 
 Base.:(==)(a::CacheOwner, b::CacheOwner) = a.tag == b.tag && a.keys == b.keys
+
+#==============================================================================#
+# DiskCacheEntry - serializable cache entry
+#==============================================================================#
+
+"""
+    DiskCacheEntry{K}
+
+A serializable entry for disk caching.
+
+- `spec_types::Type` - mi.specTypes for validation
+- `keys::K` - sharding keys
+- `data::Any` - serializable compile result
+"""
+struct DiskCacheEntry{K}
+    spec_types::Type
+    keys::K
+    data::Any
+end
 
 #==============================================================================#
 # CompilerCache - main entry point
@@ -83,17 +105,21 @@ struct CompilerCache{K}
     method_table::Union{Core.MethodTable, Nothing}
     external_cache::Dict{Tuple{Core.CodeInstance, K}, Any}
     lock::ReentrantLock
+    disk_cache::Bool
 end
 
 # Constructors
-function CompilerCache{K}(tag::Symbol, method_table) where K
+function CompilerCache{K}(tag::Symbol, method_table=nothing; disk_cache::Bool=false) where K
+    if disk_cache && VERSION < v"1.12-"
+        error("disk_cache=true requires Julia 1.12+ (object_build_id not available)")
+    end
     CompilerCache{K}(tag, method_table,
                      Dict{Tuple{Core.CodeInstance, K}, Any}(),
-                     ReentrantLock())
+                     ReentrantLock(),
+                     disk_cache)
 end
-CompilerCache(tag::Symbol, method_table) = CompilerCache{Nothing}(tag, method_table)
-CompilerCache(tag::Symbol) = CompilerCache{Nothing}(tag, nothing)
-CompilerCache{K}(tag::Symbol) where K = CompilerCache{K}(tag, nothing)  # Global MT with sharding keys
+CompilerCache(tag::Symbol, method_table=nothing; disk_cache::Bool=false) =
+    CompilerCache{Nothing}(tag, method_table; disk_cache)
 
 """
     cache_owner(cache::CompilerCache, keys=nothing) -> CacheOwner
@@ -102,33 +128,6 @@ Get the CacheOwner for a cache. Use this as your interpreter's cache token
 with `CC.cache_owner(interp)`.
 """
 cache_owner(cache::CompilerCache{K}, keys::K=nothing) where K = CacheOwner{K}(cache.tag, keys)
-
-#==============================================================================#
-# CompilationContext - passed to compiler
-#==============================================================================#
-
-"""
-    CompilationContext
-
-Context passed to the compile function on cache miss.
-
-- Use `register_dependency!(ctx, other_mi)` to track dependencies
-"""
-mutable struct CompilationContext
-    deps::Vector{Core.MethodInstance}
-
-    CompilationContext() = new(Core.MethodInstance[])
-end
-
-"""
-    register_dependency!(ctx, mi)
-
-Register that the current compilation depends on `mi`.
-When `mi` is invalidated, this compilation will also be invalidated.
-"""
-function register_dependency!(ctx::CompilationContext, mi::Core.MethodInstance)
-    push!(ctx.deps, mi)
-end
 
 #==============================================================================#
 # Method registration
@@ -206,7 +205,7 @@ method_instance
 #==============================================================================#
 
 """
-    populate!(cache, interp, mi) -> Union{Vector{Pair{CodeInstance, CodeInfo}}, Nothing}
+    populate!(cache, interp, mi) -> Vector{Pair{CodeInstance, Union{CodeInfo, Nothing}}}
 
 Populate the code cache with CodeInstances for `mi` and its callees.
 
@@ -214,8 +213,11 @@ Runs type inference on `mi` using the provided interpreter, which must implement
 the `CC.AbstractInterpreter` interface. The resulting CodeInstances are stored
 in the cache for later retrieval.
 
-On Julia 1.12+, returns a vector of (CodeInstance, CodeInfo) pairs for codegen.
-On Julia 1.11, returns `nothing` (cache is populated implicitly by typeinf_ext_toplevel).
+Returns a vector of (CodeInstance, IR) pairs where:
+- Native 1.12+: `[ci => CodeInfo, ...]` for root + callees
+- Native 1.11: `[ci => nothing]` (codegen uses callback-based path)
+
+The root CI is always the first entry: `first(result)[1]`
 
 # Arguments
 - `cache::CompilerCache` - The compiler cache instance to populate
@@ -230,8 +232,8 @@ end
 
 mi = method_instance(f, (Int,); world, method_table=cache.method_table)
 interp = MyInterpreter(...)
-result = populate!(cache, interp, mi)
-# result is Vector{Pair{CodeInstance, CodeInfo}} on 1.12+, nothing on 1.11
+codeinfos = populate!(cache, interp, mi)
+ci = first(codeinfos)[1]  # Root CodeInstance
 ```
 """
 function populate!(cache::CompilerCache, interp::CC.AbstractInterpreter,
@@ -310,7 +312,7 @@ function populate!(cache::CompilerCache, interp::CC.AbstractInterpreter,
         @assert ci !== nothing "Inference of $mi failed"
         return Pair{Core.CodeInstance, Core.CodeInfo}[]
     else
-        # Julia 1.11 API - cache populated implicitly, return nothing
+        # Julia 1.11 API - cache populated implicitly
         src = CC.typeinf_ext_toplevel(interp, mi)
 
         # Handle const-return case where ci.inferred may be nothing
@@ -320,11 +322,13 @@ function populate!(cache::CompilerCache, interp::CC.AbstractInterpreter,
             CC.get_world_counter(interp)
         end
         ci = lookup(cache, mi; world)
-        if ci !== nothing && ci.inferred === nothing
+        @assert ci !== nothing "Inference of $mi failed"
+        if ci.inferred === nothing
             @atomic ci.inferred = src
         end
 
-        return nothing
+        # Return consistent type: [ci => nothing] (codegen uses callback path)
+        return Pair{Core.CodeInstance, Union{Core.CodeInfo, Nothing}}[ci => nothing]
     end
 end
 
@@ -420,43 +424,217 @@ function cache!(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothin
 end
 
 #==============================================================================#
+# Disk cache I/O helpers
+#==============================================================================#
+
+"""
+    disk_cache_path() -> String
+
+Return the path to the disk cache directory.
+"""
+disk_cache_path() = @get_scratch!("disk_cache")
+
+"""
+    clear_disk_cache!(cache::CompilerCache)
+
+Remove disk-cached compilation results for the given cache (by tag).
+"""
+clear_disk_cache!(cache::CompilerCache) =
+    rm(joinpath(disk_cache_path(), string(cache.tag)); recursive=true, force=true)
+
+"""
+    cache_file(cache, ci, keys) -> Union{String, Nothing}
+
+Return the path to the cache file for the given CodeInstance and keys.
+
+On Julia 1.12+, uses `Base.object_build_id(ci)` as the cache key:
+- Stable across sessions for precompiled package code
+- Different after method redefinition (new CI = new build_id)
+- Returns `nothing` for runtime compilations (build_id === nothing)
+
+On Julia 1.11, returns `nothing` to skip disk caching. Without `object_build_id`,
+we cannot safely distinguish between different versions of the same method,
+which would cause stale bitcode to be loaded after method redefinition.
+"""
+function cache_file(cache::CompilerCache{K}, ci::Core.CodeInstance,
+                    keys::K) where K
+    @static if VERSION >= v"1.12-"
+        # Use the MethodInstance's build_id, not the CodeInstance's.
+        # CodeInstances created at runtime (via populate!) have build_id === nothing,
+        # but their MethodInstance retains the stable build_id from precompilation.
+        mi = ci.def
+        bid = Base.object_build_id(mi)
+        bid === nothing && return nothing  # runtime MI, skip disk cache
+
+        # Use only stable identifiers for disk cache key:
+        # - object_build_id(mi): stable across sessions for precompiled methods
+        # - specTypes: identifies the specific method instance (redundant but safe)
+        # - keys: sharding keys
+        # NOTE: Do NOT use objectid() - it's a memory address that changes between sessions
+        h = hash(bid)
+        h = hash(mi.specTypes, h)
+        h = hash(keys, h)
+        return joinpath(disk_cache_path(), string(cache.tag), string(h, ".jls"))
+    else
+        # Julia 1.11: no object_build_id, skip disk caching
+        # Using specTypes would load stale bitcode after method redefinition
+        return nothing
+    end
+end
+
+"""
+    write_disk_cache(path, mi, keys, data)
+
+Atomically write a cache entry to disk.
+"""
+function write_disk_cache(path::String, mi::Core.MethodInstance,
+                          keys::K, data) where K
+    mkpath(dirname(path))
+    entry = DiskCacheEntry{K}(mi.specTypes, keys, data)
+    tmppath, io = mktemp(dirname(path); cleanup=false)
+    try
+        serialize(io, entry)
+        close(io)
+        mv(tmppath, path; force=true)
+    catch
+        close(io)
+        rm(tmppath; force=true)
+        rethrow()
+    end
+end
+
+"""
+    read_disk_cache(path, mi, keys) -> Union{Any, Nothing}
+
+Read a cache entry from disk with validation.
+Returns `nothing` if validation fails.
+"""
+function read_disk_cache(path::String, mi::Core.MethodInstance,
+                         keys::K) where K
+    isfile(path) || return nothing
+    try
+        entry = deserialize(path)::DiskCacheEntry
+        if entry.spec_types == mi.specTypes && entry.keys == keys
+            return entry.data
+        end
+        @warn "Disk cache mismatch" mi path
+        return nothing
+    catch e
+        @warn "Failed to read disk cache" path exception=e
+        return nothing
+    end
+end
+
+#==============================================================================#
 # Cached compilation - main API
 #==============================================================================#
 
 """
-    cached_compilation(compiler, cache, mi, world, keys=nothing) -> result
+    cached_compilation(cache, mi, world, [keys]; infer, codegen, link) -> result
 
-Look up or compile code for MethodInstance `mi`.
+Three-phase cached compilation with automatic invalidation and optional disk persistence.
+
+# Three-Phase Design
+
+The compilation pipeline is split into three phases to enable caching at different granularities:
+
+## Phase 1: `infer(cache, mi, world) -> Vector{Pair{CodeInstance, Any}}`
+
+**Purpose**: Establish the compilation unit and its dependencies.
+
+**Returns**: A vector of `CodeInstance => IR` pairs where:
+- The first entry's CodeInstance becomes the cache key
+- The IR can be any type (CodeInfo for native, custom IR for foreign compilers)
+
+**Why separate**: The CodeInstance provides:
+- A stable identity for cache lookup (`object_build_id` for disk caching)
+- Automatic invalidation tracking via Julia's backedge mechanism
+- World age bounds (`min_world`/`max_world`) for validity checking
+
+**Native mode**: Call `populate!(cache, interp, mi)` to run Julia's type inference.
+The returned CodeInstances have edges tracking all called methods.
+
+**Foreign mode**: Call `cache!(cache, mi; world, deps)` to create a CodeInstance
+with explicit dependency tracking. Pass the MethodInstances of any callees as `deps`.
+
+## Phase 2: `codegen(cache, mi, world, codeinfos) -> ir_data`
+
+**Purpose**: Generate serializable intermediate representation.
+
+**Input**: The `codeinfos` vector from the infer phase.
+
+**Returns**: Serializable IR data (e.g., LLVM bitcode, custom bytecode).
+
+**Why separate**: This is typically the expensive phase. Separating it enables:
+- Disk caching of the IR (keyed by CodeInstance's `object_build_id`)
+- Skipping codegen entirely on disk cache hit
+- Cross-session persistence of compilation work
+
+**Requirements**: The returned data must be serializable if `disk_cache=true`.
+
+## Phase 3: `link(cache, mi, world, ir_data) -> result`
+
+**Purpose**: Create the final session-specific result.
+
+**Input**: The `ir_data` from codegen (or disk cache).
+
+**Returns**: The final compilation result (e.g., function pointer, executable handle).
+
+**Why separate**: Link results are inherently session-specific:
+- Function pointers are valid only in the current process
+- JIT'd machine code lives in process memory
+- Must be re-executed each session, even with disk cache hits
+
+The link result is stored in memory cache for reuse within the session.
+
+# Cache Behavior
+
+1. **Memory cache hit**: Return immediately (no phases run)
+2. **Memory miss, disk hit**: Run only `link` phase
+3. **Full miss**: Run all three phases
 
 # Arguments
-- `compiler(ctx) -> result` - Called on cache miss. Use `register_dependency!(ctx, mi)` to track dependencies.
-- `cache::CompilerCache{K}` - Cache instance
-- `mi::MethodInstance` - The method instance to compile
-- `world::UInt` - World age for cache lookup
-- `keys::K` - Sharding keys (default: nothing)
 
-# Returns
-The compilation result (from cache or freshly compiled).
+- `cache::CompilerCache{K}` - Cache instance (set `disk_cache=true` for persistence)
+- `mi::MethodInstance` - The method instance to compile
+- `world::UInt` - World age for cache lookup and validity
+- `keys::K` - Optional sharding keys (default: nothing)
+
+# Keyword Arguments
+
+- `infer` - Inference function: `(cache, mi, world) -> Vector{Pair{CodeInstance, Any}}`
+- `codegen` - Code generation function: `(cache, mi, world, codeinfos) -> ir_data`
+- `link` - Linking function: `(cache, mi, world, ir_data) -> result`
 
 # Example
-```julia
-world = Base.get_world_counter()
-mi = method_instance(f, tt; world, method_table=cache.method_table)
-mi === nothing && throw(MethodError(f, tt))
 
-result = cached_compilation(cache, mi, world) do ctx
-    compile(mi)  # mi passed directly, not ctx.mi
-end
+```julia
+# Native compilation with Julia's inference
+cached_compilation(cache, mi, world;
+    infer = (c, m, w) -> populate!(c, MyInterpreter(c, w), m),
+    codegen = (c, m, w, cis) -> emit_llvm_ir(cis),
+    link = (c, m, w, ir) -> jit_compile(ir)
+)
+
+# Foreign IR compilation with explicit dependencies
+cached_compilation(cache, mi, world;
+    infer = (c, m, w) -> begin
+        ir = m.def.source::MyIR
+        deps = [method_instance(f, tt; world=w) for (f, tt) in ir.calls]
+        ci = cache!(c, m; world=w, deps)
+        [ci => ir]
+    end,
+    codegen = (c, m, w, cis) -> compile_my_ir(only(cis)[2]),
+    link = (c, m, w, result) -> result
+)
 ```
 """
-function cached_compilation(compiler, cache::CompilerCache{K},
-                            mi::Core.MethodInstance, world::UInt,
-                            keys::K=nothing) where K
+function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
+                            world::UInt, keys::K=nothing;
+                            infer, codegen, link) where K
     result = nothing
 
-    # Fast path: find CI and check cache
-    # Note: lookup() uses Julia's cache which checks max_world,
-    # so invalidated CIs will return nothing automatically
+    # 1. Check memory cache
     ci = lookup(cache, mi, keys; world)
     if ci !== nothing
         key = (ci, keys)
@@ -464,26 +642,50 @@ function cached_compilation(compiler, cache::CompilerCache{K},
             result = get(cache.external_cache, key, nothing)
         end
     end
+    result !== nothing && return result
 
-    # Slow path: compile
-    if result === nothing
-        ctx = CompilationContext()
-        result = compiler(ctx)
+    # 2. Run inference to get codeinfos (root CI is first entry)
+    #    infer() calls populate! or cache! depending on mode
+    codeinfos = nothing
+    if ci === nothing
+        codeinfos = infer(cache, mi, world)
+        ci, _ = first(codeinfos)
+        @assert ci !== nothing "Inference failed to produce a CodeInstance"
+    end
 
-        # Look up CI (inference may have created it)
-        if ci === nothing
-            ci = lookup(cache, mi, keys; world)
+    # 3. Check disk cache using CI's build_id
+    ir_data = nothing
+    if cache.disk_cache
+        path = cache_file(cache, ci, keys)
+        if path !== nothing
+            ir_data = read_disk_cache(path, ci.def, keys)
+        end
+    end
+
+    # 4. If disk miss, run codegen
+    if ir_data === nothing
+        # Need codeinfos for codegen - if we had a memory cache hit on CI but
+        # disk miss, we need to re-run inference to get codeinfos
+        if codeinfos === nothing
+            codeinfos = infer(cache, mi, world)
         end
 
-        # For foreign mode (no inference), create CI ourselves with backedges
-        if ci === nothing
-            ci = cache!(cache, mi, keys; world, deps=ctx.deps)
-        end
-        key = (ci, keys)
+        ir_data = codegen(cache, mi, world, codeinfos)
 
-        lock(cache.lock) do
-            cache.external_cache[key] = result
+        # Write to disk cache if enabled
+        if cache.disk_cache
+            path = cache_file(cache, ci, keys)
+            if path !== nothing
+                write_disk_cache(path, ci.def, keys, ir_data)
+            end
         end
+    end
+
+    # 5. Link and store in memory cache
+    result = link(cache, mi, world, ir_data)
+    key = (ci, keys)
+    lock(cache.lock) do
+        cache.external_cache[key] = result
     end
 
     return result
