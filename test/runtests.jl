@@ -5,21 +5,7 @@ using Base.Experimental: @MethodTable
 include("utils.jl")
 
 # Test helper: wraps simple compile functions in three-phase API
-# For non-sharded caches
-function test_compile(compile_fn, cache::CompilerCache{Nothing}, mi, world)
-    cached_compilation(cache, mi, world;
-        infer = (c, m, w) -> begin
-            result = compile_fn(m)
-            ci = CompilerCaching.cache!(c, m; world=w)
-            [ci => result]
-        end,
-        codegen = (c, m, w, codeinfos) -> only(codeinfos)[2],
-        link = (c, m, w, r) -> r
-    )
-end
-
-# Test helper for sharded caches
-function test_compile(compile_fn, cache::CompilerCache{K}, mi, world, keys::K) where K
+function simple_cached_compilation(compile_fn, cache::CompilerCache{K}, mi, world, keys::K=nothing) where K
     cached_compilation(cache, mi, world, keys;
         infer = (c, m, w) -> begin
             result = compile_fn(m)
@@ -57,12 +43,12 @@ end
     mi = method_instance(basic_node, (Int,); world, method_table=cache.method_table)
 
     # First call: cache miss, compile_fn invoked
-    r1 = test_compile(my_compile, cache, mi, world)
+    r1 = simple_cached_compilation(my_compile, cache, mi, world)
     @test r1 == 20  # 10 * 2
     @test compile_count[] == 1
 
     # Second call: cache hit, compile_fn NOT invoked
-    r2 = test_compile(my_compile, cache, mi, world)
+    r2 = simple_cached_compilation(my_compile, cache, mi, world)
     @test r2 == 20
     @test compile_count[] == 1  # still 1
 
@@ -70,7 +56,7 @@ end
     add_method(cache, basic_node, (Int,), 30)
     world = Base.get_world_counter()
     mi = method_instance(basic_node, (Int,); world, method_table=cache.method_table)
-    r3 = test_compile(my_compile, cache, mi, world)
+    r3 = simple_cached_compilation(my_compile, cache, mi, world)
     @test r3 == 60  # 30 * 2
     @test compile_count[] == 2  # incremented
 end
@@ -95,20 +81,20 @@ end
     mi_float = method_instance(dispatch_node, (Float64,); world, method_table=cache.method_table)
 
     # Different types → different cache entries, each compiles once
-    r_int = test_compile(my_compile, cache, mi_int, world)
+    r_int = simple_cached_compilation(my_compile, cache, mi_int, world)
     @test r_int == 101
     @test compile_count[] == 1
 
-    r_float = test_compile(my_compile, cache, mi_float, world)
+    r_float = simple_cached_compilation(my_compile, cache, mi_float, world)
     @test r_float == 201
     @test compile_count[] == 2
 
     # Cache hits - no recompilation
-    r_int2 = test_compile(my_compile, cache, mi_int, world)
+    r_int2 = simple_cached_compilation(my_compile, cache, mi_int, world)
     @test r_int2 == 101
     @test compile_count[] == 2  # unchanged
 
-    r_float2 = test_compile(my_compile, cache, mi_float, world)
+    r_float2 = simple_cached_compilation(my_compile, cache, mi_float, world)
     @test r_float2 == 201
     @test compile_count[] == 2  # unchanged
 
@@ -116,13 +102,13 @@ end
     add_method(cache, dispatch_node, (Int,), 50)
     world = Base.get_world_counter()
     mi_int = method_instance(dispatch_node, (Int,); world, method_table=cache.method_table)
-    r_int3 = test_compile(my_compile, cache, mi_int, world)
+    r_int3 = simple_cached_compilation(my_compile, cache, mi_int, world)
     @test r_int3 == 51
     @test compile_count[] == 3
 
     # Float64 still uses cached version (need to re-lookup mi after world change)
     mi_float = method_instance(dispatch_node, (Float64,); world, method_table=cache.method_table)
-    r_float3 = test_compile(my_compile, cache, mi_float, world)
+    r_float3 = simple_cached_compilation(my_compile, cache, mi_float, world)
     @test r_float3 == 201
     @test compile_count[] == 3  # unchanged
 end
@@ -160,29 +146,29 @@ end
 
     # First key combination
     keys1 = (opt_level=1, debug=false)
-    r1 = test_compile(my_compile, cache, mi, world, keys1)
+    r1 = simple_cached_compilation(my_compile, cache, mi, world, keys1)
     @test r1 == 42
     @test compile_count[] == 1
 
     # Same key combination → cache hit
-    r2 = test_compile(my_compile, cache, mi, world, keys1)
+    r2 = simple_cached_compilation(my_compile, cache, mi, world, keys1)
     @test r2 == 42
     @test compile_count[] == 1  # unchanged
 
     # Different key combination → cache miss (different shard)
     keys2 = (opt_level=2, debug=false)
-    r3 = test_compile(my_compile, cache, mi, world, keys2)
+    r3 = simple_cached_compilation(my_compile, cache, mi, world, keys2)
     @test r3 == 42
     @test compile_count[] == 2  # new compilation
 
     # Yet another key combination
     keys3 = (opt_level=1, debug=true)
-    r4 = test_compile(my_compile, cache, mi, world, keys3)
+    r4 = simple_cached_compilation(my_compile, cache, mi, world, keys3)
     @test r4 == 42
     @test compile_count[] == 3  # another new compilation
 
     # Back to first key combination → still cached
-    r5 = test_compile(my_compile, cache, mi, world, keys1)
+    r5 = simple_cached_compilation(my_compile, cache, mi, world, keys1)
     @test r5 == 42
     @test compile_count[] == 3  # unchanged
 end
@@ -204,7 +190,7 @@ end
         :compiled
     end
 
-    result = test_compile(my_compile, cache, mi, world)
+    result = simple_cached_compilation(my_compile, cache, mi, world)
 
     @test captured_source[] === :my_source
     @test mi isa Core.MethodInstance
@@ -305,8 +291,8 @@ end
         m.def.source
     end
 
-    test_compile(compile_a, cache_a, mi_a, world)
-    test_compile(compile_b, cache_b, mi_b, world)
+    simple_cached_compilation(compile_a, cache_a, mi_a, world)
+    simple_cached_compilation(compile_b, cache_b, mi_b, world)
 
     @test result_a[] === :ir_a
     @test result_b[] === :ir_b
@@ -337,7 +323,7 @@ end
         length(source.nodes)
     end
 
-    result = test_compile(my_compile, cache, mi, world)
+    result = simple_cached_compilation(my_compile, cache, mi, world)
     @test result == 3
     @test captured_ir[] isa MyIR
     @test captured_ir[].nodes == [:a, :b, :c]
@@ -376,13 +362,13 @@ end # Mode 1
     world = Base.get_world_counter()
     mi = method_instance(overlay_double, (Int,); world, method_table=cache.method_table)
 
-    result = test_compile(my_compile, cache, mi, world)
+    result = simple_cached_compilation(my_compile, cache, mi, world)
     # Overlay methods may have gensym'd names like "#overlay_double"
     @test occursin("overlay_double", string(result))
     @test compile_count[] == 1
 
     # Cache hit
-    result2 = test_compile(my_compile, cache, mi, world)
+    result2 = simple_cached_compilation(my_compile, cache, mi, world)
     @test occursin("overlay_double", string(result2))
     @test compile_count[] == 1  # unchanged
 end
@@ -414,12 +400,12 @@ end # Mode 2
     world = Base.get_world_counter()
     mi = method_instance(global_test_fn, (Int,); world, method_table=cache.method_table)
 
-    result = test_compile(my_compile, cache, mi, world)
+    result = simple_cached_compilation(my_compile, cache, mi, world)
     @test result === :global_test_fn
     @test compile_count[] == 1
 
     # Cache hit
-    result2 = test_compile(my_compile, cache, mi, world)
+    result2 = simple_cached_compilation(my_compile, cache, mi, world)
     @test result2 === :global_test_fn
     @test compile_count[] == 1  # unchanged
 end
@@ -441,15 +427,15 @@ end
     mi = method_instance(global_sharded_fn, (Float64,); world, method_table=cache.method_table)
 
     # Different sharding keys = different cache entries
-    r1 = test_compile(my_compile, cache, mi, world, (opt_level=1,))
+    r1 = simple_cached_compilation(my_compile, cache, mi, world, (opt_level=1,))
     @test r1 === :global_sharded_fn
     @test compile_count[] == 1
 
-    r2 = test_compile(my_compile, cache, mi, world, (opt_level=2,))
+    r2 = simple_cached_compilation(my_compile, cache, mi, world, (opt_level=2,))
     @test r2 === :global_sharded_fn
     @test compile_count[] == 2  # different shard
 
-    r3 = test_compile(my_compile, cache, mi, world, (opt_level=1,))
+    r3 = simple_cached_compilation(my_compile, cache, mi, world, (opt_level=1,))
     @test r3 === :global_sharded_fn
     @test compile_count[] == 2  # cache hit
 end
