@@ -17,7 +17,7 @@ function simple_cached_compilation(compile_fn, cache::CompilerCache{K}, mi, worl
     )
 end
 
-@testset "CompilerCaching" begin
+@testset "CompilerCaching" verbose=true begin
 
 #==============================================================================#
 # Mode 1: Custom IR - Empty methods with add_method
@@ -571,6 +571,35 @@ end
 end
 end # @static if
 
-end # @testset "ForeignCompiler"
+#==============================================================================#
+# Examples
+#==============================================================================#
+
+@testset "Examples" begin
+    function find_sources(path::String, sources=String[])
+        if isdir(path)
+            for entry in readdir(path)
+                find_sources(joinpath(path, entry), sources)
+            end
+        elseif endswith(path, ".jl")
+            push!(sources, path)
+        end
+        sources
+    end
+
+    examples_dir = joinpath(@__DIR__, "..", "examples")
+    examples = find_sources(examples_dir)
+    filter!(file -> readline(file) != "# EXCLUDE FROM TESTING", examples)
+
+    for example in examples
+        name = splitext(basename(example))[1]
+        @testset "$name" begin
+            cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) $example`
+            @test success(pipeline(cmd; stdout=devnull, stderr=devnull))
+        end
+    end
+end
+
+end # @testset "CompilerCaching"
 
 println("All tests passed!")

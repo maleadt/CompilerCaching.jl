@@ -1,3 +1,4 @@
+# EXCLUDE FROM TESTING
 # examples/julia.jl - Julia native code compilation helpers
 
 using CompilerCaching
