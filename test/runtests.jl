@@ -10,10 +10,12 @@ function simple_cached_compilation(compile_fn, cache::CompilerCache, mi, world)
         infer = (c, m, w) -> begin
             result = compile_fn(m)
             ci = CompilerCaching.cache!(c, m; world=w)
-            [ci => result]
+            ci, result
         end,
-        codegen = (c, m, w, codeinfos) -> only(codeinfos)[2],
-        link = (c, m, w, r) -> r
+
+        # passthrough
+        codegen = (c, m, w, result) -> result,
+        link = (c, m, w, result) -> result
     )
 end
 
@@ -217,7 +219,7 @@ end
     function child_infer(c, m, w)
         child_compile_count[] += 1
         ci = cache!(c, m; world=w)
-        [ci => :child_compiled]
+        ci, :child_compiled
     end
 
     # Parent infer: creates CI with dependency on child
@@ -225,10 +227,10 @@ end
         parent_compile_count[] += 1
         child_mi = method_instance(child_node, (Int,); world=w, method_table)
         ci = cache!(c, m; world=w, deps=[child_mi])
-        [ci => :parent_compiled]
+        ci, :parent_compiled
     end
 
-    passthrough_codegen(c, m, w, codeinfos) = only(codeinfos)[2]
+    passthrough_codegen(c, m, w, result) = result
     passthrough_link(c, m, w, r) = r
 
     world = Base.get_world_counter()
@@ -532,7 +534,9 @@ end
     function disk_infer(cache, mi, world)
         infer_count[] += 1
         interp = DiskCacheInterpreter(cache, world)
-        populate!(cache, interp, mi)
+        codeinfos = populate!(cache, interp, mi)
+        root_ci = first(codeinfos)[1]
+        root_ci, codeinfos
     end
     disk_codegen(cache, mi, world, codeinfos) = (codegen_count[] += 1; :codegen_result)
     disk_link(cache, mi, world, ir_data) = (link_count[] += 1; ir_data)
@@ -586,8 +590,8 @@ end # @static if
     @test mi !== nothing
 
     # Minimal callbacks for cached_compilation
-    infer_fn = (cache, mi, world) -> [(CompilerCaching.cache!(cache, mi; world) => nothing)]
-    codegen_fn = (cache, mi, world, codeinfos) -> :ir_data
+    infer_fn = (cache, mi, world) -> (CompilerCaching.cache!(cache, mi; world), nothing)
+    codegen_fn = (cache, mi, world, result) -> :ir_data
     link_fn = (cache, mi, world, ir_data) -> :result
 
     # Test 1: Hook called on cache miss

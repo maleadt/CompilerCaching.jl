@@ -59,10 +59,12 @@ CC.method_table(interp::CustomInterpreter) = interp.method_table
 
 ## high-level API
 
-# Inference phase: returns Vector{Pair{CI, IR}} where root CI is first entry
+# Inference phase: returns (root_ci, codeinfos) tuple
 function julia_infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
     interp = CustomInterpreter(cache, world)
-    CompilerCaching.populate!(cache, interp, mi)
+    codeinfos = CompilerCaching.populate!(cache, interp, mi)
+    root_ci = first(codeinfos)[1]
+    return root_ci, codeinfos  # Tuple: (root_ci, full vector for codegen)
 end
 
 # Codegen phase wrapper: counts compilations for testing

@@ -78,50 +78,51 @@ Base.:(==)(a::CacheOwner, b::CacheOwner) = a.tag == b.tag && a.keys == b.keys
 Mutable wrapper type to identify our compilation results in the `analysis_results` chain.
 This allows multiple compiler plugins to store results on the same CodeInstance.
 
-The wrapper is created empty during `cache!` and populated later via `set_result!`.
+Fields:
+- `inferred::Any` - Result from inference phase (e.g., codeinfos vector)
+- `linked::Any` - Result from link phase (e.g., function pointer)
+
+The wrapper is created empty during `cache!` and populated via direct field access.
 """
 mutable struct CachedCompilationResult
-    result::Any
+    inferred::Any
+    linked::Any
 end
-CachedCompilationResult() = CachedCompilationResult(nothing)
+CachedCompilationResult() = CachedCompilationResult(nothing, nothing)
 
 """
     initialize_result!(caller::CC.InferenceResult)
 
 Create an empty `CachedCompilationResult` wrapper during inference.
 The wrapper will be transferred to the CodeInstance and can later be
-populated via `set_result!` after the link phase.
+populated via direct field access after the link phase.
 """
 function initialize_result!(caller::CC.InferenceResult)
     CC.stack_analysis_result!(caller, CachedCompilationResult())
 end
 
 """
-    get_result(ci::CodeInstance) -> Union{Any, Nothing}
+    get_result(ci::CodeInstance) -> Union{CachedCompilationResult, Nothing}
 
-Retrieve a compilation result from the CodeInstance's `analysis_results` chain.
-Returns `nothing` if no `CachedCompilationResult` is found or if the wrapper is empty.
+Retrieve the `CachedCompilationResult` wrapper from a CodeInstance's `analysis_results` chain.
+Returns `nothing` if no wrapper is found.
 """
 function get_result(ci::Core.CodeInstance)
-    wrapper = CC.traverse_analysis_results(ci) do @nospecialize result
+    CC.traverse_analysis_results(ci) do @nospecialize result
         result isa CachedCompilationResult ? result : nothing
     end
-    wrapper === nothing && return nothing
-    return wrapper.result
 end
 
 """
     set_result!(ci::CodeInstance, result)
 
-Populate the `CachedCompilationResult` wrapper on a CodeInstance with the compilation result.
+Populate the `CachedCompilationResult` wrapper's `.linked` field with the compilation result.
 The wrapper must have been created during `cache!`.
 """
 function set_result!(ci::Core.CodeInstance, result)
-    wrapper = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CachedCompilationResult ? result : nothing
-    end
+    wrapper = get_result(ci)
     @assert wrapper !== nothing "CodeInstance without CachedCompilationResult wrapper; Please use `@setup_caching`."
-    wrapper.result = result
+    wrapper.linked = result
     return
 end
 
@@ -624,7 +625,7 @@ end
 #==============================================================================#
 
 """
-    cached_inference(cache, mi, world; infer) -> (CodeInstance, codeinfos_or_nothing)
+    cached_inference(cache, mi, world; infer) -> (CodeInstance, result_or_nothing)
 
 Run only the inference phase for a method instance without codegen or link.
 
@@ -632,20 +633,35 @@ This is useful when recursively processing dependencies during the infer phase:
 you want to establish the dependency tracking (creating CodeInstances with backedges)
 without running codegen/link for each callee.
 
-Returns `(ci, codeinfos)` where `codeinfos` is the result of the infer callback,
-or `nothing` if the CI was already cached.
+The `infer` callback must return a tuple `(ci::CodeInstance, result::Any)` where
+`result` is opaque to the caching layer and stored for later retrieval.
+
+Returns `(ci, result)` where `result` is from the infer callback,
+or `nothing` if the CI was already cached without a stored result.
 """
 function cached_inference(cache::CompilerCache, mi::Core.MethodInstance,
                           world::UInt; infer)
     ci = lookup(cache, mi; world)
     if ci !== nothing
+        # Check if we have cached infer result
+        wrapper = get_result(ci)
+        if wrapper !== nothing && wrapper.inferred !== nothing
+            return ci, wrapper.inferred
+        end
+        # CI exists but no cached infer result (e.g., Julia-created CI)
         return ci, nothing
     end
 
-    codeinfos = infer(cache, mi, world)
-    ci, _ = first(codeinfos)
+    ci, result = infer(cache, mi, world)  # Simple tuple destructure
     @assert ci !== nothing "Inference failed to produce a CodeInstance"
-    return ci, codeinfos
+
+    # Store infer result for cache hit retrieval
+    wrapper = get_result(ci)
+    if wrapper !== nothing
+        wrapper.inferred = result
+    end
+
+    return ci, result
 end
 
 #==============================================================================#
@@ -666,44 +682,46 @@ function cached_compilation(cache::CompilerCache, mi::Core.MethodInstance,
     end
 
     # 1. Run inference phase (checks cache internally, returns early if CI exists)
-    ci, codeinfos = cached_inference(cache, mi, world; infer)
+    ci, inferred = cached_inference(cache, mi, world; infer)
 
-    # 2. Check for cached compiled result
-    result = get_result(ci)
-    result !== nothing && return result
+    # 2. Check for cached linked result
+    wrapper = get_result(ci)
+    if wrapper !== nothing && wrapper.linked !== nothing
+        return wrapper.linked
+    end
 
     # 3. Check disk cache using CI's build_id
-    ir_data = nothing
+    compiled = nothing
     if cache.disk_cache
         path = cache_file(cache, ci)
         if path !== nothing
-            ir_data = read_disk_cache(path, ci.def, cache.keys)
+            compiled = read_disk_cache(path, ci.def, cache.keys)
         end
     end
 
     # 4. If disk miss, run codegen
-    if ir_data === nothing
-        # Need codeinfos for codegen - re-run infer if we had a cache hit on CI
-        if codeinfos === nothing
-            codeinfos = infer(cache, mi, world)
+    if compiled === nothing
+        # Need inferred result for codegen - re-run infer if we had a cache hit on CI
+        if inferred === nothing
+            _, inferred = infer(cache, mi, world)
         end
 
-        ir_data = codegen(cache, mi, world, codeinfos)
+        compiled = codegen(cache, mi, world, inferred)
 
         # Write to disk cache if enabled
         if cache.disk_cache
             path = cache_file(cache, ci)
             if path !== nothing
-                write_disk_cache(path, ci.def, cache.keys, ir_data)
+                write_disk_cache(path, ci.def, cache.keys, compiled)
             end
         end
     end
 
     # 5. Link and store result
-    result = link(cache, mi, world, ir_data)
-    set_result!(ci, result)
+    linked = link(cache, mi, world, compiled)
+    set_result!(ci, linked)
 
-    return result
+    return linked
 end
 
 end # module CompilerCaching

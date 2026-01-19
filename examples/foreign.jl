@@ -3,67 +3,70 @@
 # - Cache handles created on-the-fly before compilation
 # - Demonstrates: caching, redefinition, multiple dispatch
 
-using CompilerCaching: CompilerCache, add_method, method_instance, cache!, cached_compilation, cached_inference
+using CompilerCaching: CompilerCache, add_method, method_instance, cache!,
+                       cached_inference, cached_compilation
+
 
 Base.Experimental.@MethodTable method_table
 
 
-## foreign IR definition
+## Simple IR: numbers, arithmetic ops as heads, calls to foreign functions
+#
+# Examples:
+#   42                          → literal
+#   Expr(:*, 21, 2)             → 21 * 2
+#   Expr(:+, 1, Expr(:*, 2, 3)) → 1 + (2 * 3)
+#   Expr(:call, myfunc)         → call myfunc()
 
-struct ForeignIR
-    op::Symbol
-    value::Any
-    calls::Vector{Tuple{Any, Tuple}}  # [(callee_func, arg_types), ...]
+function interpret(cache, world, expr, deps)
+    # Literals
+    expr isa Number && return expr
 
-    ForeignIR(op::Symbol, value::Any) = new(op, value, Tuple{Any, Tuple}[])
-    ForeignIR(op::Symbol, value::Any, calls::Vector) = new(op, value, calls)
+    # Expressions
+    if expr isa Expr
+        head, args... = expr.head, expr.args...
+
+        # Arithmetic operations
+        if head === :+
+            return sum(interpret(cache, world, a, deps) for a in args)
+        elseif head === :*
+            return prod(interpret(cache, world, a, deps) for a in args)
+        elseif head === :^
+            base, exp = args
+            return interpret(cache, world, base, deps) ^ interpret(cache, world, exp, deps)
+        end
+
+        # Call to function in our method table. This triggers recursive inference.
+        if head === :call
+            f = only(args)::Function
+            mi = @something(method_instance(f, (); world, method_table),
+                            error("Unknown function: $f"))
+            _, result = cached_inference(cache, mi, world; infer)
+            push!(deps, mi)
+            return result
+        end
+
+        error("Unknown expression head: $head")
+    end
+
+    error("Unsupported IR: $expr")
 end
-
-
-## three-phase compilation
 
 const compilations = Ref(0)
-
-# Infer phase: handles dependency tracking via cache!
-function infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
-    ir = mi.def.source::ForeignIR
+function infer(cache, mi, world)
+    ir = mi.def.source::Expr
     deps = Core.MethodInstance[]
-
-    # Recursively infer callees (no codegen/link) and collect dependencies
-    for (callee_func, callee_tt) in ir.calls
-        callee_mi = method_instance(callee_func, callee_tt; world, method_table)
-        callee_mi === nothing && error("No method for $callee_func with $callee_tt")
-
-        # Only run inference for dependency - establishes CI and backedges
-        cached_inference(cache, callee_mi, world; infer)
-        push!(deps, callee_mi)
-    end
-
-    # Create CI with backedges for dependency tracking
-    ci = cache!(cache, mi; world, deps)
-    return [ci => ir]
-end
-
-# Codegen phase: "compile" by evaluating the operation
-function codegen(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, codeinfos)
     compilations[] += 1
-    _, ir = only(codeinfos)
 
-    if ir.op == :identity
-        return ir.value
-    elseif ir.op == :double
-        return ir.value * 2
-    elseif ir.op == :square
-        return ir.value * ir.value
-    else
-        error("Unknown operation: $(ir.op)")
-    end
+    result = interpret(cache, world, ir, deps)
+
+    ci = cache!(cache, mi; world, deps)
+    return ci, result
 end
 
-# Link phase: just pass through the result
-function link(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, result)
-    result
-end
+# simple pass-through
+codegen(cache, mi, world, result) = result
+link(cache, mi, world, result) = result
 
 
 ## high-level API
@@ -81,34 +84,34 @@ end
 
 ## demo
 
-# Define a function with foreign IR
+# Define a function with Expr IR (just returns 42)
 function myop end
-add_method(method_table, myop, (Int,), ForeignIR(:double, 21))
+add_method(method_table, myop, (), Expr(:*, 21, 2))
 
 # First call compiles
-result = call(myop, 0)  # argument value unused, IR has the value
+result = call(myop)  # argument value unused, IR has the value
 @assert result == 42
 @assert compilations[] == 1
 
 # Second call uses cache
-result = call(myop, 0)
+result = call(myop)
 @assert result == 42
 @assert compilations[] == 1
 
 # Redefine with different IR - invalidates cache
-add_method(method_table, myop, (Int,), ForeignIR(:square, 7))
-result = call(myop, 0)
+add_method(method_table, myop, (), Expr(:^, 7, 2))
+result = call(myop)
 @assert result == 49
 @assert compilations[] == 2
 
 # Repeated call still cached
-result = call(myop, 0)
+result = call(myop)
 @assert result == 49
 @assert compilations[] == 2
 
 # Add method for different argument type - doesn't invalidate existing
-add_method(method_table, myop, (Float64,), ForeignIR(:identity, 3.14))
-result = call(myop, 0)  # Int version still cached
+add_method(method_table, myop, (Float64,), Expr(:*, 3.14, 1))
+result = call(myop)  # Int version still cached
 @assert result == 49
 @assert compilations[] == 2
 
@@ -118,7 +121,7 @@ result = call(myop, 0.0)
 @assert compilations[] == 3
 
 # Both versions now cached
-result = call(myop, 0)
+result = call(myop)
 @assert result == 49
 result = call(myop, 0.0)
 @assert result == 3.14
@@ -136,70 +139,70 @@ println("Basic assertions passed!")
 println("\n--- Transitive Dependency Demo ---")
 compilations[] = 0
 
+
+# grandchild: base function, returns 1
 function grandchild_node end
+add_method(method_table, grandchild_node, (), Expr(:*, 1, 1))
+
+# child: calls grandchild, multiplies by 2
 function child_node end
+add_method(method_table, child_node, (),
+           Expr(:*, Expr(:call, grandchild_node), 2))
+
+# parent: calls child, squares the result
 function parent_node end
-
-# grandchild: base function
-add_method(method_table, grandchild_node, (Int,), ForeignIR(:identity, 1))
-
-# child: calls grandchild
-add_method(method_table, child_node, (Int,),
-           ForeignIR(:double, 2, [(grandchild_node, (Int,))]))
-
-# parent: calls child (which transitively depends on grandchild)
-add_method(method_table, parent_node, (Int,),
-           ForeignIR(:square, 3, [(child_node, (Int,))]))
+add_method(method_table, parent_node, (),
+           Expr(:^, Expr(:call, child_node), 2))
 
 # Compile all three
-result = call(grandchild_node, 0)
-@assert result == 1
+result = call(grandchild_node)
+@assert result == 1  # 1 * 1
 @assert compilations[] == 1
 println("grandchild compiled: $result (compilations: $(compilations[]))")
 
-result = call(child_node, 0)
-@assert result == 4  # 2 * 2
+result = call(child_node)
+@assert result == 2  # grandchild() * 2 = 1 * 2
 @assert compilations[] == 2  # child compiles, grandchild cached
 println("child compiled: $result (compilations: $(compilations[]))")
 
-result = call(parent_node, 0)
-@assert result == 9  # 3 * 3
+result = call(parent_node)
+@assert result == 4  # child()^2 = 2^2
 @assert compilations[] == 3  # parent compiles, child+grandchild cached
 println("parent compiled: $result (compilations: $(compilations[]))")
 
 # Cache hits - no recompilation
-call(grandchild_node, 0)
-call(child_node, 0)
-call(parent_node, 0)
+call(grandchild_node)
+call(child_node)
+call(parent_node)
 @assert compilations[] == 3
 println("All cached (compilations still: $(compilations[]))")
 
-# Now redefine grandchild
+# Now redefine grandchild to return 100
 println("\nRedefining grandchild...")
-add_method(method_table, grandchild_node, (Int,), ForeignIR(:identity, 100))
+add_method(method_table, grandchild_node, (), Expr(:*, 100, 1))
 
 # grandchild should recompile
-result = call(grandchild_node, 0)
+result = call(grandchild_node)
 @assert result == 100
 @assert compilations[] == 4
 println("grandchild recompiled: $result (compilations: $(compilations[]))")
 
 # child should recompile due to dependency on grandchild
-result = call(child_node, 0)
-@assert result == 4  # still 2*2, the value in child's IR
+result = call(child_node)
+@assert result == 200  # 100 * 2
 @assert compilations[] == 5
 println("child recompiled: $result (compilations: $(compilations[]))")
 
 # parent should recompile due to transitive dependency via child
-result = call(parent_node, 0)
-@assert result == 9  # still 3*3, the value in parent's IR
+result = call(parent_node)
+@assert result == 40000  # 200^2
 @assert compilations[] == 6
 println("parent recompiled: $result (compilations: $(compilations[]))")
 
 # All cached again
-call(grandchild_node, 0)
-call(child_node, 0)
-call(parent_node, 0)
+call(grandchild_node)
+call(child_node)
+call(parent_node)
 @assert compilations[] == 6
 println("All cached again (compilations still: $(compilations[]))")
 
