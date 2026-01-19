@@ -498,8 +498,9 @@ This is useful when recursively processing dependencies during the infer phase:
 you want to establish the dependency tracking (creating CodeInstances with backedges)
 without running codegen/link for each callee.
 
-The `infer` callback must return a tuple `(ci::CodeInstance, result::Any)` where
-`result` is opaque to the caching layer and stored for later retrieval.
+The `infer` callback must:
+1. Return the inference result (opaque to the caching layer)
+2. Ensure a CodeInstance is stored in the cache via `cache!` or `populate!`
 
 Returns `(ci, result)` where `result` is from the infer callback,
 or `nothing` if the CI was already cached without a stored result.
@@ -517,8 +518,12 @@ function cached_inference(cache::CompilerCache, mi::Core.MethodInstance,
         return ci, nothing
     end
 
-    ci, result = infer(cache, mi, world)  # Simple tuple destructure
-    @assert ci !== nothing "Inference failed to produce a CodeInstance"
+    # Run infer - it must create CI via populate! or cache!
+    result = infer(cache, mi, world)
+
+    # Look up the CI that was created during infer
+    ci = lookup(cache, mi; world)
+    @assert ci !== nothing "infer must create a CodeInstance via cache! or populate!"
 
     # Store infer result for cache hit retrieval
     wrapper = get_result(ci)
@@ -558,7 +563,7 @@ function cached_compilation(cache::CompilerCache, mi::Core.MethodInstance,
     # 3. Run codegen
     # Need inferred result for codegen - re-run infer if we had a cache hit on CI
     if inferred === nothing
-        _, inferred = infer(cache, mi, world)
+        inferred = infer(cache, mi, world)
     end
 
     compiled = codegen(cache, mi, world, inferred)

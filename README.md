@@ -16,7 +16,7 @@ Pkg.add(url="path/to/CompilerCaching")
 
 The basic usage pattern is to create a `CompilerCache` handle and invoke `cached_compilation`
 with three callbacks:
-- `infer`: Perform type inference and construct a `CodeInstance` with valid invalidation edges
+- `infer`: Perform type inference, store a `CodeInstance` in the cache (via `populate!` or `cache!`), and return the data for codegen
 - `codegen`: Generate serializable code that can be cached across sessions
 - `link`: Generate a session-specific representation (e.g., JIT-compiled function pointer)
 
@@ -35,9 +35,9 @@ end
 @setup_caching CustomInterpreter.cache
 
 function infer(cache, mi, world)
-    # Let Julia populate the cache
+    # Let Julia populate the cache and return codeinfos for codegen
     interp = CustomInterpreter(cache, world)
-    CompilerCaching.populate!(cache, interp, mi)
+    return CompilerCaching.populate!(cache, interp, mi)
 end
 
 # generate some IR representation
@@ -131,12 +131,12 @@ function infer(cache, mi, world)
     ir = mi.def.source::MyCustomIR
     deps = Core.MethodInstance[]
     for callee in ir.callees
-        callee_mi = method_instance(callee.f, callee.tt; world, cache.method_table)
-        cached_compilation(cache, callee_mi, world; infer, codegen, link)
+        callee_mi = method_instance(callee.f, callee.tt; world, method_table)
+        cached_inference(cache, callee_mi, world; infer)
         push!(deps, callee_mi)
     end
-    ci = cache!(cache, mi; world, deps)
-    return [ci => ir]
+    cache!(cache, mi; world, deps)
+    return ir
 end
 
 function codegen(cache, mi, world, codeinfos) end

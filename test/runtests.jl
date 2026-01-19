@@ -7,8 +7,8 @@ function simple_cached_compilation(compile_fn, cache::CompilerCache, mi, world)
     cached_compilation(cache, mi, world;
         infer = (c, m, w) -> begin
             result = compile_fn(m)
-            ci = CompilerCaching.cache!(c, m; world=w)
-            ci, result
+            CompilerCaching.cache!(c, m; world=w)
+            result
         end,
 
         # passthrough
@@ -169,7 +169,10 @@ end
     @test mi !== nothing
 
     # Minimal callbacks for cached_compilation
-    infer_fn = (cache, mi, world) -> (CompilerCaching.cache!(cache, mi; world), nothing)
+    infer_fn = (cache, mi, world) -> begin
+        CompilerCaching.cache!(cache, mi; world)
+        nothing
+    end
     codegen_fn = (cache, mi, world, result) -> :ir_data
     link_fn = (cache, mi, world, ir_data) -> :result
 
@@ -319,16 +322,16 @@ end
     # Child infer: creates CI with no deps
     function child_infer(c, m, w)
         child_compile_count[] += 1
-        ci = cache!(c, m; world=w)
-        ci, :child_compiled
+        cache!(c, m; world=w)
+        :child_compiled
     end
 
     # Parent infer: creates CI with dependency on child
     function parent_infer(c, m, w)
         parent_compile_count[] += 1
         child_mi = method_instance(child_node, (Int,); world=w, method_table)
-        ci = cache!(c, m; world=w, deps=[child_mi])
-        ci, :parent_compiled
+        cache!(c, m; world=w, deps=[child_mi])
+        :parent_compiled
     end
 
     passthrough_codegen(c, m, w, result) = result

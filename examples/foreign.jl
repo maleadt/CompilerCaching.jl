@@ -59,9 +59,8 @@ function infer(cache, mi, world)
     compilations[] += 1
 
     result = interpret(cache, world, ir, deps)
-
-    ci = cache!(cache, mi; world, deps)
-    return ci, result
+    cache!(cache, mi; world, deps)
+    return result
 end
 
 # simple pass-through
