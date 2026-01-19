@@ -4,22 +4,13 @@ A package for interfacing with Julia's compiler caching infrastructure for the p
 of building custom compilers.
 
 
-## Features
-
-- **Lazy compilation with caching**: Only compile when needed, cache results for reuse
-- **Type-based specialization**: Automatic dispatch based on argument types
-- **Automatic invalidation**: Cache entries invalidated when methods are redefined
-- **Transitive dependency tracking**: Register dependencies to propagate invalidation
-- **Sharding keys**: Partition caches by additional parameters (optimization level, target device, etc.)
-
-Requires Julia 1.11+.
-
 ## Installation
 
 ```julia
 using Pkg
 Pkg.add(url="path/to/CompilerCaching")
 ```
+
 
 ## Usage
 
@@ -42,18 +33,16 @@ end
 CC.cache_owner(interp::CustomInterpreter) = cache_owner(interp.cache)
 
 function infer(cache, mi, world)
-    # Let Julia infer the method
+    # Let Julia populate the cache
     interp = MyInterpreter(cache, world)
     CompilerCaching.populate!(cache, interp, mi)
 end
 
-function codegen(cache, mi, world, codeinfos)
-    # generate some IR representation
-end
+ # generate some IR representation
+function codegen(cache, mi, world, codeinfos) end
 
-function link(cache, mi, world, result)
-    # compile IR to function pointer
-end
+# compile IR to function pointer
+function link(cache, mi, world, result) end
 
 function call(f, args...)
     tt = map(Core.Typeof, args)
@@ -80,8 +69,7 @@ const cache = CompilerCache{CacheKey}(:MyCompiler)
 function call(f, args...; opt_level=1)
     # ...
 
-    cached_compilation(cache, mi, world, (opt_level=opt_level,);
-                       infer, codegen, link)
+    cached_compilation(cache, mi, world, (;opt_level); infer, codegen, link)
 end
 ```
 
@@ -117,7 +105,6 @@ function call(f, args...)
 end
 ```
 
-
 ### Foreign IR
 
 For compilers that define their own IR format that Julia doesn't know about:
@@ -143,25 +130,19 @@ function infer(cache, mi, world)
     return [ci => ir]
 end
 
-function codegen(cache, mi, world, codeinfos)
-    _, ir = only(codeinfos)
-    compile_my_ir(ir)
-end
+function codegen(cache, mi, world, codeinfos) end
 
-function link(cache, mi, world, result)
-    result
-end
+function link(cache, mi, world, result) end
 
 function call(f, args...)
     tt = Tuple{map(Core.Typeof, args)...}
     world = get_world_counter()
-    mi = method_instance(f, tt; world, method_table=FOREIGN_CACHE.method_table)
+    mi = method_instance(f, tt; world, method_table)
     mi === nothing && throw(MethodError(f, args))
 
-    cached_compilation(FOREIGN_CACHE, mi, world; infer, codegen, link)
+    cached_compilation(cache, mi, world; infer, codegen, link)
 end
 ```
-
 
 ### Disk caching
 
@@ -175,7 +156,6 @@ clear_disk_cache!(cache)
 ```
 
 Serialized IR will be stored in a scratch space, keyed on the cache name and any sharding keys.
-
 
 ### Stacked method tables
 
