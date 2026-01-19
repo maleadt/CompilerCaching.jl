@@ -3,6 +3,7 @@
 # - inference is used to track dependencies
 # - LLVM IR is generated and plugged back into Julia's JIT
 # - overlay method tables are used to demonstrate method overrides
+# - cache handles created on-the-fly before compilation
 
 include("julia.jl")
 
@@ -11,10 +12,9 @@ using Base: get_world_counter
 using Base.Experimental: @MethodTable, @overlay
 @MethodTable CUSTOM_MT
 
-# Enable disk caching using the three-phase API with CI build_id keys.
-# This avoids stale bitcode conflicts on method redefinition.
-const CUSTOM_CACHE = CompilerCache(:NativeExample, CUSTOM_MT;
-                                   disk_cache=(VERSION >= v"1.12-"))
+# Helper to create cache handles on-the-fly
+# Enable disk caching on Julia 1.12+ to avoid stale bitcode conflicts
+custom_cache() = CompilerCache(:NativeExample; disk_cache=(VERSION >= v"1.12-"))
 
 
 ## abstract interpreter
@@ -103,7 +103,8 @@ end
                         method_instance(f, $argtypes; world),
                         throw(MethodError(f, $argtypes)))
 
-        ptr = _call_compile(CUSTOM_CACHE, mi, world)
+        cache = custom_cache()
+        ptr = _call_compile(cache, mi, world)
         ccall(ptr, R, $ccall_types, $(argexprs...))
     end
 end

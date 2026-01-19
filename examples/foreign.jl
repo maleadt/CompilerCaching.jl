@@ -1,16 +1,11 @@
 # Foreign IR example - bypasses Julia's inference/compiler stack entirely
 # - Methods registered with add_method storing custom IR
-# - Compiler function transforms the foreign IR
+# - Cache handles created on-the-fly before compilation
 # - Demonstrates: caching, redefinition, multiple dispatch
 
 using CompilerCaching: CompilerCache, add_method, method_instance, cache!, cached_compilation, cached_inference
 
-using Base: get_world_counter
-using Base.Experimental: @MethodTable
-
-@MethodTable FOREIGN_MT
-
-const FOREIGN_CACHE = CompilerCache(:ForeignExample, FOREIGN_MT)
+Base.Experimental.@MethodTable method_table
 
 
 ## foreign IR definition
@@ -36,7 +31,7 @@ function infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
 
     # Recursively infer callees (no codegen/link) and collect dependencies
     for (callee_func, callee_tt) in ir.calls
-        callee_mi = method_instance(callee_func, callee_tt; world, cache.method_table)
+        callee_mi = method_instance(callee_func, callee_tt; world, method_table)
         callee_mi === nothing && error("No method for $callee_func with $callee_tt")
 
         # Only run inference for dependency - establishes CI and backedges
@@ -75,11 +70,12 @@ end
 
 function call(f, args...)
     tt = Tuple{map(Core.Typeof, args)...}
-    world = get_world_counter()
-    mi = method_instance(f, tt; world, method_table=FOREIGN_CACHE.method_table)
-    mi === nothing && throw(MethodError(f, args))
+    world = Base.get_world_counter()
+    mi = @something(method_instance(f, tt; world, method_table),
+                    throw(MethodError(f, args)))
 
-    cached_compilation(FOREIGN_CACHE, mi, world; infer, codegen, link)
+    cache = CompilerCache(:ForeignExample)
+    cached_compilation(cache, mi, world; infer, codegen, link)
 end
 
 
@@ -87,7 +83,7 @@ end
 
 # Define a function with foreign IR
 function myop end
-add_method(FOREIGN_CACHE, myop, (Int,), ForeignIR(:double, 21))
+add_method(method_table, myop, (Int,), ForeignIR(:double, 21))
 
 # First call compiles
 result = call(myop, 0)  # argument value unused, IR has the value
@@ -100,7 +96,7 @@ result = call(myop, 0)
 @assert compilations[] == 1
 
 # Redefine with different IR - invalidates cache
-add_method(FOREIGN_CACHE, myop, (Int,), ForeignIR(:square, 7))
+add_method(method_table, myop, (Int,), ForeignIR(:square, 7))
 result = call(myop, 0)
 @assert result == 49
 @assert compilations[] == 2
@@ -111,7 +107,7 @@ result = call(myop, 0)
 @assert compilations[] == 2
 
 # Add method for different argument type - doesn't invalidate existing
-add_method(FOREIGN_CACHE, myop, (Float64,), ForeignIR(:identity, 3.14))
+add_method(method_table, myop, (Float64,), ForeignIR(:identity, 3.14))
 result = call(myop, 0)  # Int version still cached
 @assert result == 49
 @assert compilations[] == 2
@@ -145,14 +141,14 @@ function child_node end
 function parent_node end
 
 # grandchild: base function
-add_method(FOREIGN_CACHE, grandchild_node, (Int,), ForeignIR(:identity, 1))
+add_method(method_table, grandchild_node, (Int,), ForeignIR(:identity, 1))
 
 # child: calls grandchild
-add_method(FOREIGN_CACHE, child_node, (Int,),
+add_method(method_table, child_node, (Int,),
            ForeignIR(:double, 2, [(grandchild_node, (Int,))]))
 
 # parent: calls child (which transitively depends on grandchild)
-add_method(FOREIGN_CACHE, parent_node, (Int,),
+add_method(method_table, parent_node, (Int,),
            ForeignIR(:square, 3, [(child_node, (Int,))]))
 
 # Compile all three
@@ -180,7 +176,7 @@ println("All cached (compilations still: $(compilations[]))")
 
 # Now redefine grandchild
 println("\nRedefining grandchild...")
-add_method(FOREIGN_CACHE, grandchild_node, (Int,), ForeignIR(:identity, 100))
+add_method(method_table, grandchild_node, (Int,), ForeignIR(:identity, 100))
 
 # grandchild should recompile
 result = call(grandchild_node, 0)

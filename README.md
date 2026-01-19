@@ -14,17 +14,17 @@ Pkg.add(url="path/to/CompilerCaching")
 
 ## Usage
 
-The very basic usage pattern is to create a `CompilerCache` instance, and invoke its
-`cached_compilation` function passing along three callbacks to perform various aspects
-of the compilation process:
+The basic usage pattern is to create a `CompilerCache` handle and invoke `cached_compilation`
+with three callbacks:
 - `infer`: Perform type inference and construct a `CodeInstance` with valid invalidation edges
 - `codegen`: Generate serializable code that can be cached across sessions
 - `link`: Generate a session-specific representation (e.g., JIT-compiled function pointer)
 
+A `CompilerCache` is a lightweight handle to Julia's global `InternalCodeCache`. Creating
+cache handles is cheap, so they can be constructed on-the-fly right before compilation.
+
 ```julia
 using CompilerCaching
-
-const cache = CompilerCache(:MyCompiler)
 
 # Set-up a custom interpreter, and link it to the cache
 struct CustomInterpreter <: CC.AbstractInterpreter
@@ -36,11 +36,11 @@ end
 
 function infer(cache, mi, world)
     # Let Julia populate the cache
-    interp = MyInterpreter(cache, world)
+    interp = CustomInterpreter(cache, world)
     CompilerCaching.populate!(cache, interp, mi)
 end
 
- # generate some IR representation
+# generate some IR representation
 function codegen(cache, mi, world, codeinfos) end
 
 # compile IR to function pointer
@@ -52,6 +52,7 @@ function call(f, args...)
     mi = @something(method_instance(f, tt; world, cache.method_table),
                     throw(MethodError(f, args)))
 
+    cache = CompilerCache(:MyCompiler)
     cached_compilation(cache, mi, world; infer, codegen, link)
 end
 
@@ -64,19 +65,24 @@ to the cache, and can be customized further if needed.
 
 ### Cache sharding
 
-It is possible to partition the cache by additional parameters by passing `keys` to
-`cached_compilation`, e.g., encoding the optimization level or target device:
+It is possible to partition the cache by additional parameters by storing `keys` in the
+cache handle, e.g., encoding the optimization level or target device:
 
 ```julia
 const CacheKey = @NamedTuple{opt_level::Int}
-const cache = CompilerCache{CacheKey}(:MyCompiler)
 
 function call(f, args...; opt_level=1)
-    # ...
+    tt = map(Core.Typeof, args)
+    world = Base.get_world_counter()
+    mi = @something(method_instance(f, tt; world),
+                    throw(MethodError(f, args)))
 
-    cached_compilation(cache, mi, world, (;opt_level); infer, codegen, link)
+    cache = CompilerCache{CacheKey}(:MyCompiler, (; opt_level))
+    cached_compilation(cache, mi, world; infer, codegen, link)
 end
 ```
+
+Different calls with the same `(tag, keys)` will hit the same cache partition.
 
 ### Overlay methods
 
@@ -89,23 +95,22 @@ Base.Experimental.@overlay method_table function Base.sin(x::Int)
     # custom implementation
 end
 
-const cache = CompilerCache(:MyCompiler, method_table)
-
 # Expose the method table to the interpreter
 struct CustomInterpreter <: CC.AbstractInterpreter
+    cache::CompilerCache
+    world::UInt
     ...
 end
-CC.method_table(interp::CustomInterpreter) = method_table
+CC.method_table(interp::CustomInterpreter) = CC.OverlayMethodTable(interp.world, method_table)
 
 function call(f, args...)
     tt = map(Core.Typeof, args)
     world = Base.get_world_counter()
-
-    # if relevant, look for the entry point in the custom method table too
-    mi = @something(method_instance(f, tt; world, cache.method_table),
-                    method_instance(f, tt; world),
+    mi = @something(method_instance(f, tt; world, method_table),
+                    # if relevant, look for global methods too
                     throw(MethodError(f, args)))
 
+    cache = CompilerCache(:MyCompiler)
     cached_compilation(cache, mi, world; infer, codegen, link)
 end
 ```
@@ -116,11 +121,10 @@ For compilers that define their own IR format that Julia doesn't know about:
 
 ```julia
 Base.Experimental.@MethodTable method_table
-const cache = CompilerCache(:MyCompiler, method_table)
 
-# add a method to the method table and cache, providing a custom IR source
+# Add a method to the method table, providing a custom IR source
 function really_special end
-add_method(cache, really_special, (Int,), MyCustomIR([:a, :b]))
+add_method(method_table, really_special, (Int,), MyCustomIR([:a, :b]))
 
 # Since we're not relying on Julia's inference, we need to create and cache our own CIs
 function infer(cache, mi, world)
@@ -142,9 +146,10 @@ function link(cache, mi, world, result) end
 function call(f, args...)
     tt = Tuple{map(Core.Typeof, args)...}
     world = get_world_counter()
-    mi = method_instance(f, tt; world, method_table)
-    mi === nothing && throw(MethodError(f, args))
+    mi = @something(method_instance(f, tt; world, method_table),
+                    throw(MethodError(f, args)))
 
+    cache = CompilerCache(:MyCompiler; method_table)
     cached_compilation(cache, mi, world; infer, codegen, link)
 end
 ```
@@ -154,13 +159,17 @@ end
 On Julia 1.12 and up, it is possible to back the cache by a disk-based store:
 
 ```julia
-const cache = CompilerCache(:MyCompiler; disk_cache=true)
+function call(f, args...)
+    # ...
+    cache = CompilerCache(:MyCompiler; disk_cache=true)
+    cached_compilation(cache, mi, world; infer, codegen, link)
+end
 
-# explicitly wipe the cache, if needed
-clear_disk_cache!(cache)
+# Explicitly wipe the disk cache if needed
+clear_disk_cache!(CompilerCache(:MyCompiler))
 ```
 
-Serialized IR will be stored in a scratch space, keyed on the cache name and any sharding keys.
+Serialized IR will be stored in a scratch space, keyed on the cache tag and any sharding keys.
 
 ### Stacked method tables
 

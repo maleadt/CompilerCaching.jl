@@ -135,52 +135,34 @@ end
 A compilation cache instance, parameterized by key type K.
 
 - `tag::Symbol` - Base tag for cache owner
-- `method_table::Union{Core.MethodTable, Nothing}` - Method table for dispatch (nothing = global MT)
-
-# Usage Modes
-
-1. **Custom IR mode**: `CompilerCache(:Tag, MY_MT)` with `add_method` for custom source
-2. **Overlay mode**: `CompilerCache(:Tag, MY_MT)` with Julia methods in custom MT
-3. **Global mode**: `CompilerCache(:Tag)` with standard Julia methods
-
-# Examples
-
-```julia
-using CompilerCaching: CompilerCache
-
-# Mode 1/2: Custom MT (for custom IR or overlay methods)
-const synch = CompilerCache(:SynchJulia, MY_MT)
-
-# Mode 3: Global MT (for standard Julia methods)
-const gpu = CompilerCache(:GPUCompiler)
-
-# With sharding keys
-const gpu = CompilerCache{@NamedTuple{cap::VersionNumber}}(:GPUCompiler)
-```
+- `keys::K` - Sharding keys (e.g., device capability, optimization level)
+- `disk_cache::Bool` - Whether to persist compiled results to disk
 """
 struct CompilerCache{K}
     tag::Symbol
-    method_table::Union{Core.MethodTable, Nothing}
+    keys::K
     disk_cache::Bool
 end
 
 # Constructors
-function CompilerCache{K}(tag::Symbol, method_table=nothing; disk_cache::Bool=false) where K
+function CompilerCache{K}(tag::Symbol, keys::K; disk_cache::Bool=false) where K
     if disk_cache && VERSION < v"1.12-"
         error("disk_cache=true requires Julia 1.12+ (object_build_id not available)")
     end
-    CompilerCache{K}(tag, method_table, disk_cache)
+    CompilerCache{K}(tag, keys, disk_cache)
 end
-CompilerCache(tag::Symbol, method_table=nothing; disk_cache::Bool=false) =
-    CompilerCache{Nothing}(tag, method_table; disk_cache)
+
+# Non-parameterized constructor for K=Nothing
+CompilerCache(tag::Symbol; disk_cache::Bool=false) =
+    CompilerCache{Nothing}(tag, nothing; disk_cache)
 
 """
-    cache_owner(cache::CompilerCache, keys=nothing) -> CacheOwner
+    cache_owner(cache::CompilerCache) -> CacheOwner
 
 Get the CacheOwner for a cache. Use this as your interpreter's cache token
 with `CC.cache_owner(interp)`.
 """
-cache_owner(cache::CompilerCache{K}, keys::K=nothing) where K = CacheOwner{K}(cache.tag, keys)
+cache_owner(cache::CompilerCache{K}) where K = CacheOwner{K}(cache.tag, cache.keys)
 
 """
     @setup_caching InterpreterType.cache_field
@@ -233,12 +215,12 @@ end
 #==============================================================================#
 
 """
-    add_method(cache, f, arg_types, source) -> Method
+    add_method(mt, f, arg_types, source) -> Method
 
 Register a method with custom source IR in the cache's method table.
 
 # Arguments
-- `cache::CompilerCache` - The compiler cache instance
+- `mt::Core.MethodTable` - The method table to add the method to
 - `f::Function` - The function to add a method to
 - `arg_types::Tuple` - Argument types for this method
 - `source` - Custom IR to store (any type)
@@ -246,8 +228,7 @@ Register a method with custom source IR in the cache's method table.
 # Returns
 The created `Method` object.
 """
-function add_method(cache::CompilerCache, f::Function, arg_types::Tuple, source)
-    mt = cache.method_table
+function add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source)
     sig = Tuple{typeof(f), arg_types...}
 
     m = ccall(:jl_new_method_uninit, Any, (Any,), parentmodule(f))
@@ -317,23 +298,6 @@ Returns a vector of (CodeInstance, IR) pairs where:
 - Native 1.11: `[ci => nothing]` (codegen uses callback-based path)
 
 The root CI is always the first entry: `first(result)[1]`
-
-# Arguments
-- `cache::CompilerCache` - The compiler cache instance to populate
-- `interp` - Your AbstractInterpreter implementation
-- `mi` - The MethodInstance to infer
-
-# Example
-```julia
-struct MyInterpreter <: CC.AbstractInterpreter
-    # ...
-end
-
-mi = method_instance(f, (Int,); world, method_table=cache.method_table)
-interp = MyInterpreter(...)
-codeinfos = populate!(cache, interp, mi)
-ci = first(codeinfos)[1]  # Root CodeInstance
-```
 """
 function populate!(cache::CompilerCache, interp::CC.AbstractInterpreter,
                    mi::Core.MethodInstance)
@@ -447,9 +411,9 @@ else
     end
 end
 
-function lookup(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothing;
-                world::UInt=Base.get_world_counter()) where K
-    owner = cache_owner(cache, keys)
+function lookup(cache::CompilerCache, mi::Core.MethodInstance;
+                world::UInt=Base.get_world_counter())
+    owner = cache_owner(cache)
     cc = code_cache(owner, world)
     return CC.get(cc, mi, nothing)
 end
@@ -484,7 +448,7 @@ function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
 end
 
 """
-    cache!(cache, mi, keys=nothing; world, deps) -> CodeInstance
+    cache!(cache, mi; world, deps) -> CodeInstance
 
 Create and store a CodeInstance for `mi` in the cache.
 
@@ -492,16 +456,15 @@ Used for foreign mode where inference doesn't run. The CI participates in
 Julia's invalidation mechanism via backedges registered from `deps`.
 
 # Arguments
-- `cache::CompilerCache{K}` - The compiler cache instance
+- `cache::CompilerCache` - The compiler cache instance
 - `mi::MethodInstance` - The method instance to cache
-- `keys::K` - Sharding keys (default: nothing)
 - `world::UInt` - World age for the CI
 - `deps::Vector{MethodInstance}` - Dependencies to register as backedges
 """
-function cache!(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothing;
+function cache!(cache::CompilerCache, mi::Core.MethodInstance;
                 world::UInt=Base.get_world_counter(),
-                deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) where K
-    owner = cache_owner(cache, keys)
+                deps::Vector{Core.MethodInstance}=Core.MethodInstance[])
+    owner = cache_owner(cache)
     cc = code_cache(owner, world)
     edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
 
@@ -545,9 +508,9 @@ clear_disk_cache!(cache::CompilerCache) =
     rm(joinpath(disk_cache_path(), string(cache.tag)); recursive=true, force=true)
 
 """
-    cache_file(cache, ci, keys) -> Union{String, Nothing}
+    cache_file(cache, ci) -> Union{String, Nothing}
 
-Return the path to the cache file for the given CodeInstance and keys.
+Return the path to the cache file for the given CodeInstance.
 
 On Julia 1.12+, uses `Base.object_build_id(ci)` as the cache key:
 - Stable across sessions for precompiled package code
@@ -558,8 +521,7 @@ On Julia 1.11, returns `nothing` to skip disk caching. Without `object_build_id`
 we cannot safely distinguish between different versions of the same method,
 which would cause stale bitcode to be loaded after method redefinition.
 """
-function cache_file(cache::CompilerCache{K}, ci::Core.CodeInstance,
-                    keys::K) where K
+function cache_file(cache::CompilerCache, ci::Core.CodeInstance)
     @static if VERSION >= v"1.12-"
         # Use the MethodInstance's build_id, not the CodeInstance's.
         # CodeInstances created at runtime (via populate!) have build_id === nothing,
@@ -571,11 +533,11 @@ function cache_file(cache::CompilerCache{K}, ci::Core.CodeInstance,
         # Use only stable identifiers for disk cache key:
         # - object_build_id(mi): stable across sessions for precompiled methods
         # - specTypes: identifies the specific method instance (redundant but safe)
-        # - keys: sharding keys
+        # - keys: sharding keys from cache
         # NOTE: Do NOT use objectid() - it's a memory address that changes between sessions
         h = hash(bid)
         h = hash(mi.specTypes, h)
-        h = hash(keys, h)
+        h = hash(cache.keys, h)
         return joinpath(disk_cache_path(), string(cache.tag), string(h, ".jls"))
     else
         # Julia 1.11: no object_build_id, skip disk caching
@@ -632,7 +594,7 @@ end
 #==============================================================================#
 
 """
-    cached_inference(cache, mi, world, [keys]; infer) -> (CodeInstance, codeinfos_or_nothing)
+    cached_inference(cache, mi, world; infer) -> (CodeInstance, codeinfos_or_nothing)
 
 Run only the inference phase for a method instance without codegen or link.
 
@@ -643,9 +605,9 @@ without running codegen/link for each callee.
 Returns `(ci, codeinfos)` where `codeinfos` is the result of the infer callback,
 or `nothing` if the CI was already cached.
 """
-function cached_inference(cache::CompilerCache{K}, mi::Core.MethodInstance,
-                          world::UInt, keys::K=nothing; infer) where K
-    ci = lookup(cache, mi, keys; world)
+function cached_inference(cache::CompilerCache, mi::Core.MethodInstance,
+                          world::UInt; infer)
+    ci = lookup(cache, mi; world)
     if ci !== nothing
         return ci, nothing
     end
@@ -661,15 +623,14 @@ end
 #==============================================================================#
 
 """
-    cached_compilation(cache, mi, world, [keys]; infer, codegen, link) -> result
+    cached_compilation(cache, mi, world; infer, codegen, link) -> result
 
 Three-phase cached compilation with automatic invalidation and optional disk persistence.
 """
-function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
-                            world::UInt, keys::K=nothing;
-                            infer, codegen, link) where K
+function cached_compilation(cache::CompilerCache, mi::Core.MethodInstance,
+                            world::UInt; infer, codegen, link)
     # 1. Run inference phase (checks cache internally, returns early if CI exists)
-    ci, codeinfos = cached_inference(cache, mi, world, keys; infer)
+    ci, codeinfos = cached_inference(cache, mi, world; infer)
 
     # 2. Check for cached compiled result
     result = get_result(ci)
@@ -678,9 +639,9 @@ function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
     # 3. Check disk cache using CI's build_id
     ir_data = nothing
     if cache.disk_cache
-        path = cache_file(cache, ci, keys)
+        path = cache_file(cache, ci)
         if path !== nothing
-            ir_data = read_disk_cache(path, ci.def, keys)
+            ir_data = read_disk_cache(path, ci.def, cache.keys)
         end
     end
 
@@ -695,9 +656,9 @@ function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
 
         # Write to disk cache if enabled
         if cache.disk_cache
-            path = cache_file(cache, ci, keys)
+            path = cache_file(cache, ci)
             if path !== nothing
-                write_disk_cache(path, ci.def, keys, ir_data)
+                write_disk_cache(path, ci.def, cache.keys, ir_data)
             end
         end
     end
