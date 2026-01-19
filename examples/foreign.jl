@@ -30,31 +30,30 @@ end
 const compilations = Ref(0)
 
 # Infer phase: handles dependency tracking via cache!
-function foreign_infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
+function infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
     ir = mi.def.source::ForeignIR
     deps = Core.MethodInstance[]
 
     # Recursively compile callees and collect dependencies
     for (callee_func, callee_tt) in ir.calls
-        callee_mi = method_instance(callee_func, callee_tt;
-                                    world, method_table=cache.method_table)
+        callee_mi = method_instance(callee_func, callee_tt; world, cache.method_table)
         callee_mi === nothing && error("No method for $callee_func with $callee_tt")
 
         # Recursively compile callee (cache handles memoization)
-        cached_compilation(cache, callee_mi, world;
-            infer = foreign_infer,
-            codegen = foreign_codegen,
-            link = foreign_link)
+        cached_compilation(cache, callee_mi, world; infer, codegen, link)
+        # XXX: doesn't this need to use the result? isn't it wasteful we're linking here?
+        #      we basically only want inference, no?
         push!(deps, callee_mi)
     end
 
     # Create CI with backedges for dependency tracking
+    # XXX: why does this return the parent IR again?
     ci = cache!(cache, mi; world, deps)
     return [ci => ir]
 end
 
 # Codegen phase: "compile" by evaluating the operation
-function foreign_codegen(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, codeinfos)
+function codegen(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, codeinfos)
     compilations[] += 1
     _, ir = only(codeinfos)
 
@@ -70,7 +69,7 @@ function foreign_codegen(cache::CompilerCache, mi::Core.MethodInstance, world::U
 end
 
 # Link phase: just pass through the result
-function foreign_link(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, result)
+function link(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, result)
     result
 end
 
@@ -83,10 +82,7 @@ function call(f, args...)
     mi = method_instance(f, tt; world, method_table=FOREIGN_CACHE.method_table)
     mi === nothing && throw(MethodError(f, args))
 
-    cached_compilation(FOREIGN_CACHE, mi, world;
-        infer = foreign_infer,
-        codegen = foreign_codegen,
-        link = foreign_link)
+    cached_compilation(FOREIGN_CACHE, mi, world; infer, codegen, link)
 end
 
 
