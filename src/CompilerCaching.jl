@@ -18,10 +18,10 @@ const CC = Core.Compiler
 include("utils.jl")
 
 export CompilerCache, CacheOwner
-export add_method, cached_compilation, method_instance
+export add_method, cached_compilation, cached_inference, method_instance
 export cache_owner, cache!
 export populate!, StackedMethodTable
-export disk_cache_path, clear_disk_cache!
+export clear_disk_cache!
 
 #==============================================================================#
 # CacheOwner - identifies a cache partition
@@ -526,6 +526,35 @@ function read_disk_cache(path::String, mi::Core.MethodInstance,
 end
 
 #==============================================================================#
+# Cached inference - dependency discovery without full compilation
+#==============================================================================#
+
+"""
+    cached_inference(cache, mi, world, [keys]; infer) -> (CodeInstance, codeinfos_or_nothing)
+
+Run only the inference phase for a method instance without codegen or link.
+
+This is useful when recursively processing dependencies during the infer phase:
+you want to establish the dependency tracking (creating CodeInstances with backedges)
+without running codegen/link for each callee.
+
+Returns `(ci, codeinfos)` where `codeinfos` is the result of the infer callback,
+or `nothing` if the CI was already cached.
+"""
+function cached_inference(cache::CompilerCache{K}, mi::Core.MethodInstance,
+                          world::UInt, keys::K=nothing; infer) where K
+    ci = lookup(cache, mi, keys; world)
+    if ci !== nothing
+        return ci, nothing
+    end
+
+    codeinfos = infer(cache, mi, world)
+    ci, _ = first(codeinfos)
+    @assert ci !== nothing "Inference failed to produce a CodeInstance"
+    return ci, codeinfos
+end
+
+#==============================================================================#
 # Cached compilation - main API
 #==============================================================================#
 
@@ -533,125 +562,19 @@ end
     cached_compilation(cache, mi, world, [keys]; infer, codegen, link) -> result
 
 Three-phase cached compilation with automatic invalidation and optional disk persistence.
-
-# Three-Phase Design
-
-The compilation pipeline is split into three phases to enable caching at different granularities:
-
-## Phase 1: `infer(cache, mi, world) -> Vector{Pair{CodeInstance, Any}}`
-
-**Purpose**: Establish the compilation unit and its dependencies.
-
-**Returns**: A vector of `CodeInstance => IR` pairs where:
-- The first entry's CodeInstance becomes the cache key
-- The IR can be any type (CodeInfo for native, custom IR for foreign compilers)
-
-**Why separate**: The CodeInstance provides:
-- A stable identity for cache lookup (`object_build_id` for disk caching)
-- Automatic invalidation tracking via Julia's backedge mechanism
-- World age bounds (`min_world`/`max_world`) for validity checking
-
-**Native mode**: Call `populate!(cache, interp, mi)` to run Julia's type inference.
-The returned CodeInstances have edges tracking all called methods.
-
-**Foreign mode**: Call `cache!(cache, mi; world, deps)` to create a CodeInstance
-with explicit dependency tracking. Pass the MethodInstances of any callees as `deps`.
-
-## Phase 2: `codegen(cache, mi, world, codeinfos) -> ir_data`
-
-**Purpose**: Generate serializable intermediate representation.
-
-**Input**: The `codeinfos` vector from the infer phase.
-
-**Returns**: Serializable IR data (e.g., LLVM bitcode, custom bytecode).
-
-**Why separate**: This is typically the expensive phase. Separating it enables:
-- Disk caching of the IR (keyed by CodeInstance's `object_build_id`)
-- Skipping codegen entirely on disk cache hit
-- Cross-session persistence of compilation work
-
-**Requirements**: The returned data must be serializable if `disk_cache=true`.
-
-## Phase 3: `link(cache, mi, world, ir_data) -> result`
-
-**Purpose**: Create the final session-specific result.
-
-**Input**: The `ir_data` from codegen (or disk cache).
-
-**Returns**: The final compilation result (e.g., function pointer, executable handle).
-
-**Why separate**: Link results are inherently session-specific:
-- Function pointers are valid only in the current process
-- JIT'd machine code lives in process memory
-- Must be re-executed each session, even with disk cache hits
-
-The link result is stored in memory cache for reuse within the session.
-
-# Cache Behavior
-
-1. **Memory cache hit**: Return immediately (no phases run)
-2. **Memory miss, disk hit**: Run only `link` phase
-3. **Full miss**: Run all three phases
-
-# Arguments
-
-- `cache::CompilerCache{K}` - Cache instance (set `disk_cache=true` for persistence)
-- `mi::MethodInstance` - The method instance to compile
-- `world::UInt` - World age for cache lookup and validity
-- `keys::K` - Optional sharding keys (default: nothing)
-
-# Keyword Arguments
-
-- `infer` - Inference function: `(cache, mi, world) -> Vector{Pair{CodeInstance, Any}}`
-- `codegen` - Code generation function: `(cache, mi, world, codeinfos) -> ir_data`
-- `link` - Linking function: `(cache, mi, world, ir_data) -> result`
-
-# Example
-
-```julia
-# Native compilation with Julia's inference
-cached_compilation(cache, mi, world;
-    infer = (c, m, w) -> populate!(c, MyInterpreter(c, w), m),
-    codegen = (c, m, w, cis) -> emit_llvm_ir(cis),
-    link = (c, m, w, ir) -> jit_compile(ir)
-)
-
-# Foreign IR compilation with explicit dependencies
-cached_compilation(cache, mi, world;
-    infer = (c, m, w) -> begin
-        ir = m.def.source::MyIR
-        deps = [method_instance(f, tt; world=w) for (f, tt) in ir.calls]
-        ci = cache!(c, m; world=w, deps)
-        [ci => ir]
-    end,
-    codegen = (c, m, w, cis) -> compile_my_ir(only(cis)[2]),
-    link = (c, m, w, result) -> result
-)
-```
 """
 function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
                             world::UInt, keys::K=nothing;
                             infer, codegen, link) where K
-    result = nothing
+    # 1. Run inference phase (checks cache internally, returns early if CI exists)
+    ci, codeinfos = cached_inference(cache, mi, world, keys; infer)
 
-    # 1. Check memory cache
-    ci = lookup(cache, mi, keys; world)
-    if ci !== nothing
-        key = (ci, keys)
-        lock(cache.lock) do
-            result = get(cache.external_cache, key, nothing)
-        end
+    # 2. Check memory cache for compiled result
+    key = (ci, keys)
+    result = lock(cache.lock) do
+        get(cache.external_cache, key, nothing)
     end
     result !== nothing && return result
-
-    # 2. Run inference to get codeinfos (root CI is first entry)
-    #    infer() calls populate! or cache! depending on mode
-    codeinfos = nothing
-    if ci === nothing
-        codeinfos = infer(cache, mi, world)
-        ci, _ = first(codeinfos)
-        @assert ci !== nothing "Inference failed to produce a CodeInstance"
-    end
 
     # 3. Check disk cache using CI's build_id
     ir_data = nothing
@@ -664,8 +587,7 @@ function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
 
     # 4. If disk miss, run codegen
     if ir_data === nothing
-        # Need codeinfos for codegen - if we had a memory cache hit on CI but
-        # disk miss, we need to re-run inference to get codeinfos
+        # Need codeinfos for codegen - re-run infer if we had a cache hit on CI
         if codeinfos === nothing
             codeinfos = infer(cache, mi, world)
         end
@@ -683,7 +605,6 @@ function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
 
     # 5. Link and store in memory cache
     result = link(cache, mi, world, ir_data)
-    key = (ci, keys)
     lock(cache.lock) do
         cache.external_cache[key] = result
     end

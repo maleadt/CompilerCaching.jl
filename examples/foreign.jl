@@ -3,7 +3,7 @@
 # - Compiler function transforms the foreign IR
 # - Demonstrates: caching, redefinition, multiple dispatch
 
-using CompilerCaching
+using CompilerCaching: CompilerCache, add_method, method_instance, cache!, cached_compilation, cached_inference
 
 using Base: get_world_counter
 using Base.Experimental: @MethodTable
@@ -34,20 +34,17 @@ function infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
     ir = mi.def.source::ForeignIR
     deps = Core.MethodInstance[]
 
-    # Recursively compile callees and collect dependencies
+    # Recursively infer callees (no codegen/link) and collect dependencies
     for (callee_func, callee_tt) in ir.calls
         callee_mi = method_instance(callee_func, callee_tt; world, cache.method_table)
         callee_mi === nothing && error("No method for $callee_func with $callee_tt")
 
-        # Recursively compile callee (cache handles memoization)
-        cached_compilation(cache, callee_mi, world; infer, codegen, link)
-        # XXX: doesn't this need to use the result? isn't it wasteful we're linking here?
-        #      we basically only want inference, no?
+        # Only run inference for dependency - establishes CI and backedges
+        cached_inference(cache, callee_mi, world; infer)
         push!(deps, callee_mi)
     end
 
     # Create CI with backedges for dependency tracking
-    # XXX: why does this return the parent IR again?
     ci = cache!(cache, mi; world, deps)
     return [ci => ir]
 end
