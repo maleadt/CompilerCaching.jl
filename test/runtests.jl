@@ -439,5 +439,6 @@ end
 end
 
 include("utils.jl")
+include("precompile.jl")
 
 end
