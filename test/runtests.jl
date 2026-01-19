@@ -463,6 +463,7 @@ end # Mode 3
         end
         TestInterpreter(cache::CompilerCache, world::UInt) =
             TestInterpreter(world, cache, Core.Compiler.InferenceResult[])
+        @setup_caching TestInterpreter.cache
 
         Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
         Core.Compiler.OptimizationParams(::TestInterpreter) = Core.Compiler.OptimizationParams()
@@ -472,7 +473,6 @@ end # Mode 3
         else
             Core.Compiler.get_world_counter(interp::TestInterpreter) = interp.world
         end
-        Core.Compiler.cache_owner(interp::TestInterpreter) = cache_owner(interp.cache)
         Core.Compiler.lock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
         Core.Compiler.unlock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
 
@@ -570,6 +570,50 @@ end
     run_script("cleanup")
 end
 end # @static if
+
+#==============================================================================#
+# compile_hook
+#==============================================================================#
+
+@testset "compile_hook" begin
+    cache = CompilerCache(:HookTest)
+    calls = []
+
+    # Define function and get world counter after definition
+    test_func_hook(x::Int) = x + 1
+    world = Base.get_world_counter()
+    mi = method_instance(test_func_hook, (Int,); world)
+    @test mi !== nothing
+
+    # Minimal callbacks for cached_compilation
+    infer_fn = (cache, mi, world) -> [(CompilerCaching.cache!(cache, mi; world) => nothing)]
+    codegen_fn = (cache, mi, world, codeinfos) -> :ir_data
+    link_fn = (cache, mi, world, ir_data) -> :result
+
+    # Test 1: Hook called on cache miss
+    compile_hook!() do cache, mi, world
+        push!(calls, :called)
+    end
+
+    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    @test length(calls) == 1
+
+    # Test 2: Hook called on cache hit (key behavior!)
+    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    @test length(calls) == 2  # Called again even though cached
+
+    # Test 3: No hook when disabled
+    compile_hook!(nothing)
+    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    @test length(calls) == 2  # No new call
+
+    # Test 4: Getter returns current hook
+    f = (cache, mi, world) -> nothing
+    compile_hook!(f)
+    @test compile_hook() === f
+    compile_hook!(nothing)
+    @test compile_hook() === nothing
+end
 
 #==============================================================================#
 # Examples

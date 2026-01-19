@@ -17,12 +17,31 @@ const CC = Core.Compiler
 
 include("utils.jl")
 
-export CompilerCache, CacheOwner
-export add_method, cached_compilation, cached_inference, method_instance
-export cache_owner, cache!
-export populate!, StackedMethodTable
-export clear_disk_cache!
-export initialize_result!, @setup_caching
+#==============================================================================#
+# Global compile hook for debugging/inspection/reflection
+#==============================================================================#
+
+export compile_hook, compile_hook!
+
+const _COMPILE_HOOK = Ref{Union{Nothing, Function}}(nothing)
+
+"""
+    compile_hook() -> Union{Nothing, Function}
+
+Get the current compile hook.
+"""
+compile_hook() = _COMPILE_HOOK[]
+
+"""
+    compile_hook!(f)
+    compile_hook!(nothing)
+
+Set the global compile hook. Called at the start of every `cached_compilation`
+invocation with `(cache, mi, world)`. Return value ignored.
+
+The hook is called even for fully cached calls that don't re-link.
+"""
+compile_hook!(f) = _COMPILE_HOOK[] = f
 
 #==============================================================================#
 # CacheOwner - identifies a cache partition
@@ -129,6 +148,8 @@ end
 # CompilerCache - main entry point
 #==============================================================================#
 
+export CompilerCache, @setup_caching, cached_inference, cached_compilation
+
 """
     CompilerCache{K}
 
@@ -214,6 +235,8 @@ end
 # Method registration
 #==============================================================================#
 
+export add_method
+
 """
     add_method(mt, f, arg_types, source) -> Method
 
@@ -255,6 +278,8 @@ end
 # Method lookup
 #==============================================================================#
 
+export method_instance
+
 # Before JuliaLang/julia#60718, `jl_method_lookup_by_tt` did not correctly cache overlay
 # methods, causing lookups to fail or return stale global entries, so don't use the cache.
 @static if VERSION >= v"1.14.0-DEV.1581"
@@ -284,6 +309,8 @@ method_instance
 #==============================================================================#
 # Inference helpers
 #==============================================================================#
+
+export populate!, cache!
 
 """
     populate!(cache, interp, mi) -> Vector{Pair{CodeInstance, Union{CodeInfo, Nothing}}}
@@ -493,6 +520,8 @@ end
 # Disk cache I/O helpers
 #==============================================================================#
 
+export clear_disk_cache!
+
 """
     disk_cache_path() -> String
 
@@ -630,6 +659,12 @@ Three-phase cached compilation with automatic invalidation and optional disk per
 """
 function cached_compilation(cache::CompilerCache, mi::Core.MethodInstance,
                             world::UInt; infer, codegen, link)
+    # Call compile hook if set (even on cache hit)
+    hook = compile_hook()
+    if hook !== nothing
+        hook(cache, mi, world)
+    end
+
     # 1. Run inference phase (checks cache internally, returns early if CI exists)
     ci, codeinfos = cached_inference(cache, mi, world; infer)
 
