@@ -257,7 +257,8 @@ end
 
 # Before JuliaLang/julia#60718, `jl_method_lookup_by_tt` did not correctly cache overlay
 # methods, causing lookups to fail or return stale global entries, so don't use the cache.
-@static if false
+@static if VERSION >= v"1.14.0-DEV.1581"
+    # NOTE: is being backported
     using Base: method_instance
 else
     function method_instance(@nospecialize(f), @nospecialize(tt);
