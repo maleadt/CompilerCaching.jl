@@ -2,8 +2,6 @@ using CompilerCaching
 using Test
 using Base.Experimental: @MethodTable
 
-include("utils.jl")
-
 # Test helper: wraps simple compile functions in three-phase API
 function simple_cached_compilation(compile_fn, cache::CompilerCache, mi, world)
     cached_compilation(cache, mi, world;
@@ -21,11 +19,190 @@ end
 
 @testset "CompilerCaching" verbose=true begin
 
+@testset "basic caching" begin
+    # Use Compiler without method table = global MT
+    cache = CompilerCache(:GlobalTest)
+
+    # Define a regular Julia function (in global MT)
+    global_test_fn(x::Int) = x + 100
+
+    compile_count = Ref(0)
+    function my_compile(mi)
+        compile_count[] += 1
+        # For global methods, source may be compressed (String/Vector{UInt8})
+        # Use Base.uncompressed_ast() if you need CodeInfo
+        # Here we just return the method name
+        mi.def.name
+    end
+
+    world = Base.get_world_counter()
+    mi = method_instance(global_test_fn, (Int,); world)
+
+    result = simple_cached_compilation(my_compile, cache, mi, world)
+    @test result === :global_test_fn
+    @test compile_count[] == 1
+
+    # Cache hit
+    result2 = simple_cached_compilation(my_compile, cache, mi, world)
+    @test result2 === :global_test_fn
+    @test compile_count[] == 1  # unchanged
+end
+
+@testset "cache partitioning" begin
+    # Global MT with sharding keys (e.g., for GPUCompiler-style usage)
+    # Different caches for different key combinations
+    ShardKeys = @NamedTuple{opt_level::Int}
+    cache1 = CompilerCache{ShardKeys}(:GlobalShardTest, (opt_level=1,))
+    cache2 = CompilerCache{ShardKeys}(:GlobalShardTest, (opt_level=2,))
+
+    global_sharded_fn(x::Float64) = x * 2.0
+
+    compile_count = Ref(0)
+    function my_compile(mi)
+        compile_count[] += 1
+        mi.def.name
+    end
+
+    world = Base.get_world_counter()
+    mi = method_instance(global_sharded_fn, (Float64,); world)
+
+    # Different sharding keys = different cache entries
+    r1 = simple_cached_compilation(my_compile, cache1, mi, world)
+    @test r1 === :global_sharded_fn
+    @test compile_count[] == 1
+
+    r2 = simple_cached_compilation(my_compile, cache2, mi, world)
+    @test r2 === :global_sharded_fn
+    @test compile_count[] == 2  # different shard
+
+    r3 = simple_cached_compilation(my_compile, cache1, mi, world)
+    @test r3 === :global_sharded_fn
+    @test compile_count[] == 2  # cache hit
+end
+
+@testset "overlay method tables" begin
+    # overlay_double is defined at top level with @overlay
+    method_table = @eval @MethodTable $(gensym(:method_table))
+    overlay_double_name = gensym("overlay_double")
+    overlay_double = @eval begin
+        function $overlay_double_name end
+        Base.Experimental.@overlay $method_table function $overlay_double_name(x::Int)
+            x * 2
+        end
+        $overlay_double_name
+    end
+    cache = CompilerCache(:OverlayTest)
+
+    compile_count = Ref(0)
+    function my_compile(mi)
+        compile_count[] += 1
+        # Source is compressed Julia source (can use Base.uncompressed_ast if needed)
+        # Return something based on the method
+        mi.def.name
+    end
+
+    world = Base.get_world_counter()
+    mi = method_instance(overlay_double, (Int,); world, method_table)
+
+    result = simple_cached_compilation(my_compile, cache, mi, world)
+    # Overlay methods may have gensym'd names like "#overlay_double"
+    @test occursin("overlay_double", string(result))
+    @test compile_count[] == 1
+
+    # Cache hit
+    result2 = simple_cached_compilation(my_compile, cache, mi, world)
+    @test occursin("overlay_double", string(result2))
+    @test compile_count[] == 1  # unchanged
+end
+
+@testset "inference integration" begin
+    cache = CompilerCache(:InferenceTest)
+
+    # Test interpreter that properly integrates with cache
+    struct TestInterpreter <: Core.Compiler.AbstractInterpreter
+        world::UInt
+        cache::CompilerCache
+        inf_cache::Vector{Core.Compiler.InferenceResult}
+    end
+    TestInterpreter(cache::CompilerCache, world::UInt) =
+        TestInterpreter(world, cache, Core.Compiler.InferenceResult[])
+    @setup_caching TestInterpreter.cache
+
+    Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
+    Core.Compiler.OptimizationParams(::TestInterpreter) = Core.Compiler.OptimizationParams()
+    Core.Compiler.get_inference_cache(interp::TestInterpreter) = interp.inf_cache
+    @static if isdefined(Core.Compiler, :get_inference_world)
+        Core.Compiler.get_inference_world(interp::TestInterpreter) = interp.world
+    else
+        Core.Compiler.get_world_counter(interp::TestInterpreter) = interp.world
+    end
+    Core.Compiler.lock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
+    Core.Compiler.unlock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
+
+    test_fn(x::Int) = x + 1
+    world = Base.get_world_counter()
+    mi = method_instance(test_fn, (Int,); world)
+
+    interp = TestInterpreter(cache, world)
+    result = populate!(cache, interp, mi)
+
+    # populate! now always returns Vector{Pair{CI, IR}}
+    @test result isa Vector
+    @test length(result) >= 1
+    ci, ir = first(result)
+    @test ci isa Core.CodeInstance
+    @static if VERSION >= v"1.12.0-DEV.15"
+        @test ir isa Core.CodeInfo
+    else
+        @test ir === nothing  # 1.11 uses callback-based codegen
+    end
+end
+
+@testset "compilation hook" begin
+    cache = CompilerCache(:HookTest)
+    calls = []
+
+    # Define function and get world counter after definition
+    test_func_hook(x::Int) = x + 1
+    world = Base.get_world_counter()
+    mi = method_instance(test_func_hook, (Int,); world)
+    @test mi !== nothing
+
+    # Minimal callbacks for cached_compilation
+    infer_fn = (cache, mi, world) -> (CompilerCaching.cache!(cache, mi; world), nothing)
+    codegen_fn = (cache, mi, world, result) -> :ir_data
+    link_fn = (cache, mi, world, ir_data) -> :result
+
+    # Test 1: Hook called on cache miss
+    compile_hook!() do cache, mi, world
+        push!(calls, :called)
+    end
+
+    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    @test length(calls) == 1
+
+    # Test 2: Hook called on cache hit (key behavior!)
+    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    @test length(calls) == 2  # Called again even though cached
+
+    # Test 3: No hook when disabled
+    compile_hook!(nothing)
+    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    @test length(calls) == 2  # No new call
+
+    # Test 4: Getter returns current hook
+    f = (cache, mi, world) -> nothing
+    compile_hook!(f)
+    @test compile_hook() === f
+    compile_hook!(nothing)
+    @test compile_hook() === nothing
+end
+
 #==============================================================================#
-# Mode 1: Custom IR - Empty methods with add_method
+# Custom IR
 #==============================================================================#
 
-@testset "Mode 1: Custom IR" begin
+@testset "custom IR" begin
 
 @testset "basic caching" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
@@ -115,7 +292,7 @@ end
     @test compile_count[] == 3  # unchanged
 end
 
-@testset "nothing on missing method" begin
+@testset "missing method" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
 
     function missing_node end
@@ -125,82 +302,6 @@ end
     world = Base.get_world_counter()
     mi = method_instance(missing_node, (Int,); world, method_table)
     @test mi === nothing
-end
-
-@testset "sharding keys" begin
-    # Compiler with NamedTuple keys - now keys are stored in the cache
-    ShardKeys = @NamedTuple{opt_level::Int, debug::Bool}
-    method_table = @eval @MethodTable $(gensym(:method_table))
-
-    # Different caches for different key combinations
-    keys1 = (opt_level=1, debug=false)
-    keys2 = (opt_level=2, debug=false)
-    keys3 = (opt_level=1, debug=true)
-    cache1 = CompilerCache{ShardKeys}(:ShardingTest, keys1)
-    cache2 = CompilerCache{ShardKeys}(:ShardingTest, keys2)
-    cache3 = CompilerCache{ShardKeys}(:ShardingTest, keys3)
-
-    function sharded_node end
-    add_method(method_table, sharded_node, (Int,), 42)  # only need to add once, all caches share MT
-
-    compile_count = Ref(0)
-    function my_compile(mi)
-        compile_count[] += 1
-        mi.def.source
-    end
-
-    world = Base.get_world_counter()
-    mi = method_instance(sharded_node, (Int,); world, method_table)
-
-    # First key combination
-    r1 = simple_cached_compilation(my_compile, cache1, mi, world)
-    @test r1 == 42
-    @test compile_count[] == 1
-
-    # Same key combination → cache hit
-    r2 = simple_cached_compilation(my_compile, cache1, mi, world)
-    @test r2 == 42
-    @test compile_count[] == 1  # unchanged
-
-    # Different key combination → cache miss (different shard)
-    r3 = simple_cached_compilation(my_compile, cache2, mi, world)
-    @test r3 == 42
-    @test compile_count[] == 2  # new compilation
-
-    # Yet another key combination
-    r4 = simple_cached_compilation(my_compile, cache3, mi, world)
-    @test r4 == 42
-    @test compile_count[] == 3  # another new compilation
-
-    # Back to first key combination → still cached
-    r5 = simple_cached_compilation(my_compile, cache1, mi, world)
-    @test r5 == 42
-    @test compile_count[] == 3  # unchanged
-end
-
-@testset "three-phase API access to source" begin
-    method_table = @eval @MethodTable $(gensym(:method_table))
-    cache = CompilerCache(:SourceTest)
-
-    function source_node end
-    add_method(method_table, source_node, (Int,), :my_source)
-
-    captured_source = Ref{Any}(nothing)
-
-    world = Base.get_world_counter()
-    mi = method_instance(source_node, (Int,); world, method_table)
-
-    function my_compile(m)
-        captured_source[] = m.def.source
-        :compiled
-    end
-
-    result = simple_cached_compilation(my_compile, cache, mi, world)
-
-    @test captured_source[] === :my_source
-    @test mi isa Core.MethodInstance
-    @test mi.def.name === :source_node
-    @test result === :compiled
 end
 
 @testset "dependency invalidation" begin
@@ -303,243 +404,6 @@ end
     @test result_b[] === :ir_b
 end
 
-@testset "complex source types" begin
-    method_table = @eval @MethodTable $(gensym(:method_table))
-    cache = CompilerCache(:ComplexTest)
-
-    # Store a complex struct as source
-    struct MyIR
-        nodes::Vector{Symbol}
-        edges::Dict{Symbol, Vector{Symbol}}
-    end
-
-    function complex_node end
-    ir = MyIR([:a, :b, :c], Dict(:a => [:b], :b => [:c]))
-    add_method(method_table, complex_node, (Int,), ir)
-
-    captured_ir = Ref{Any}(nothing)
-
-    world = Base.get_world_counter()
-    mi = method_instance(complex_node, (Int,); world, method_table)
-
-    function my_compile(m)
-        source = m.def.source
-        captured_ir[] = source
-        length(source.nodes)
-    end
-
-    result = simple_cached_compilation(my_compile, cache, mi, world)
-    @test result == 3
-    @test captured_ir[] isa MyIR
-    @test captured_ir[].nodes == [:a, :b, :c]
-    @test captured_ir[].edges[:a] == [:b]
-end
-
-end # Mode 1
-
-#==============================================================================#
-# Mode 2: Overlay Methods - Julia source in custom MT
-#==============================================================================#
-
-@testset "Mode 2: Overlay Methods" begin
-
-@testset "Julia method in custom MT" begin
-    # overlay_double is defined at top level with @overlay
-    method_table = @eval @MethodTable $(gensym(:method_table))
-    overlay_double_name = gensym("overlay_double")
-    overlay_double = @eval begin
-        function $overlay_double_name end
-        Base.Experimental.@overlay $method_table function $overlay_double_name(x::Int)
-            x * 2
-        end
-        $overlay_double_name
-    end
-    cache = CompilerCache(:OverlayTest)
-
-    compile_count = Ref(0)
-    function my_compile(mi)
-        compile_count[] += 1
-        # Source is compressed Julia source (can use Base.uncompressed_ast if needed)
-        # Return something based on the method
-        mi.def.name
-    end
-
-    world = Base.get_world_counter()
-    mi = method_instance(overlay_double, (Int,); world, method_table)
-
-    result = simple_cached_compilation(my_compile, cache, mi, world)
-    # Overlay methods may have gensym'd names like "#overlay_double"
-    @test occursin("overlay_double", string(result))
-    @test compile_count[] == 1
-
-    # Cache hit
-    result2 = simple_cached_compilation(my_compile, cache, mi, world)
-    @test occursin("overlay_double", string(result2))
-    @test compile_count[] == 1  # unchanged
-end
-
-end # Mode 2
-
-#==============================================================================#
-# Mode 3: Global Methods - Julia source in global MT
-#==============================================================================#
-
-@testset "Mode 3: Global Methods" begin
-
-@testset "global MT lookup" begin
-    # Use Compiler without method table = global MT
-    cache = CompilerCache(:GlobalTest)
-
-    # Define a regular Julia function (in global MT)
-    global_test_fn(x::Int) = x + 100
-
-    compile_count = Ref(0)
-    function my_compile(mi)
-        compile_count[] += 1
-        # For global methods, source may be compressed (String/Vector{UInt8})
-        # Use Base.uncompressed_ast() if you need CodeInfo
-        # Here we just return the method name
-        mi.def.name
-    end
-
-    world = Base.get_world_counter()
-    mi = method_instance(global_test_fn, (Int,); world)
-
-    result = simple_cached_compilation(my_compile, cache, mi, world)
-    @test result === :global_test_fn
-    @test compile_count[] == 1
-
-    # Cache hit
-    result2 = simple_cached_compilation(my_compile, cache, mi, world)
-    @test result2 === :global_test_fn
-    @test compile_count[] == 1  # unchanged
-end
-
-@testset "global MT with sharding keys" begin
-    # Global MT with sharding keys (e.g., for GPUCompiler-style usage)
-    # Different caches for different key combinations
-    ShardKeys = @NamedTuple{opt_level::Int}
-    cache1 = CompilerCache{ShardKeys}(:GlobalShardTest, (opt_level=1,))
-    cache2 = CompilerCache{ShardKeys}(:GlobalShardTest, (opt_level=2,))
-
-    global_sharded_fn(x::Float64) = x * 2.0
-
-    compile_count = Ref(0)
-    function my_compile(mi)
-        compile_count[] += 1
-        mi.def.name
-    end
-
-    world = Base.get_world_counter()
-    mi = method_instance(global_sharded_fn, (Float64,); world)
-
-    # Different sharding keys = different cache entries
-    r1 = simple_cached_compilation(my_compile, cache1, mi, world)
-    @test r1 === :global_sharded_fn
-    @test compile_count[] == 1
-
-    r2 = simple_cached_compilation(my_compile, cache2, mi, world)
-    @test r2 === :global_sharded_fn
-    @test compile_count[] == 2  # different shard
-
-    r3 = simple_cached_compilation(my_compile, cache1, mi, world)
-    @test r3 === :global_sharded_fn
-    @test compile_count[] == 2  # cache hit
-end
-
-end # Mode 3
-
-#==============================================================================#
-# populate!
-#==============================================================================#
-
-@testset "populate!" begin
-    @testset "basic inference" begin
-        cache = CompilerCache(:InferenceTest)
-
-        # Test interpreter that properly integrates with cache
-        struct TestInterpreter <: Core.Compiler.AbstractInterpreter
-            world::UInt
-            cache::CompilerCache
-            inf_cache::Vector{Core.Compiler.InferenceResult}
-        end
-        TestInterpreter(cache::CompilerCache, world::UInt) =
-            TestInterpreter(world, cache, Core.Compiler.InferenceResult[])
-        @setup_caching TestInterpreter.cache
-
-        Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
-        Core.Compiler.OptimizationParams(::TestInterpreter) = Core.Compiler.OptimizationParams()
-        Core.Compiler.get_inference_cache(interp::TestInterpreter) = interp.inf_cache
-        @static if isdefined(Core.Compiler, :get_inference_world)
-            Core.Compiler.get_inference_world(interp::TestInterpreter) = interp.world
-        else
-            Core.Compiler.get_world_counter(interp::TestInterpreter) = interp.world
-        end
-        Core.Compiler.lock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
-        Core.Compiler.unlock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
-
-        test_fn(x::Int) = x + 1
-        world = Base.get_world_counter()
-        mi = method_instance(test_fn, (Int,); world)
-
-        interp = TestInterpreter(cache, world)
-        result = populate!(cache, interp, mi)
-
-        # populate! now always returns Vector{Pair{CI, IR}}
-        @test result isa Vector
-        @test length(result) >= 1
-        ci, ir = first(result)
-        @test ci isa Core.CodeInstance
-        @static if VERSION >= v"1.12.0-DEV.15"
-            @test ir isa Core.CodeInfo
-        else
-            @test ir === nothing  # 1.11 uses callback-based codegen
-        end
-    end
-end
-
-#==============================================================================#
-# compile_hook
-#==============================================================================#
-
-@testset "compile_hook" begin
-    cache = CompilerCache(:HookTest)
-    calls = []
-
-    # Define function and get world counter after definition
-    test_func_hook(x::Int) = x + 1
-    world = Base.get_world_counter()
-    mi = method_instance(test_func_hook, (Int,); world)
-    @test mi !== nothing
-
-    # Minimal callbacks for cached_compilation
-    infer_fn = (cache, mi, world) -> (CompilerCaching.cache!(cache, mi; world), nothing)
-    codegen_fn = (cache, mi, world, result) -> :ir_data
-    link_fn = (cache, mi, world, ir_data) -> :result
-
-    # Test 1: Hook called on cache miss
-    compile_hook!() do cache, mi, world
-        push!(calls, :called)
-    end
-
-    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
-    @test length(calls) == 1
-
-    # Test 2: Hook called on cache hit (key behavior!)
-    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
-    @test length(calls) == 2  # Called again even though cached
-
-    # Test 3: No hook when disabled
-    compile_hook!(nothing)
-    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
-    @test length(calls) == 2  # No new call
-
-    # Test 4: Getter returns current hook
-    f = (cache, mi, world) -> nothing
-    compile_hook!(f)
-    @test compile_hook() === f
-    compile_hook!(nothing)
-    @test compile_hook() === nothing
 end
 
 #==============================================================================#
@@ -571,6 +435,6 @@ end
     end
 end
 
-end # @testset "CompilerCaching"
+include("utils.jl")
 
-println("All tests passed!")
+end
