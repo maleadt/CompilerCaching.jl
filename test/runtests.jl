@@ -497,77 +497,72 @@ end
 
 @static if VERSION >= v"1.12-"
 @testset "disk cache" begin
-    # Counters to track phase execution
+    # Test disk cache by running in subprocess (fresh Julia = no in-memory CI)
+    # First process populates the disk cache, second process hits it
+
+    disk_cache_script = """
+    using CompilerCaching
+    const CC = Core.Compiler
+
+    struct DiskCacheInterpreter <: CC.AbstractInterpreter
+        world::UInt
+        cache::CompilerCache
+        inf_cache::Vector{CC.InferenceResult}
+    end
+    DiskCacheInterpreter(cache::CompilerCache, world::UInt) =
+        DiskCacheInterpreter(world, cache, CC.InferenceResult[])
+
+    CC.InferenceParams(::DiskCacheInterpreter) = CC.InferenceParams()
+    CC.OptimizationParams(::DiskCacheInterpreter) = CC.OptimizationParams()
+    CC.get_inference_cache(interp::DiskCacheInterpreter) = interp.inf_cache
+    CC.get_inference_world(interp::DiskCacheInterpreter) = interp.world
+    CC.lock_mi_inference(::DiskCacheInterpreter, ::Core.MethodInstance) = nothing
+    CC.unlock_mi_inference(::DiskCacheInterpreter, ::Core.MethodInstance) = nothing
+    @setup_caching DiskCacheInterpreter.cache
+
     infer_count = Ref(0)
     codegen_count = Ref(0)
     link_count = Ref(0)
 
-    # Test interpreter
-    struct DiskCacheInterpreter <: Core.Compiler.AbstractInterpreter
-        world::UInt
-        cache::CompilerCache
-        inf_cache::Vector{Core.Compiler.InferenceResult}
-    end
-    DiskCacheInterpreter(cache::CompilerCache, world::UInt) =
-        DiskCacheInterpreter(world, cache, Core.Compiler.InferenceResult[])
-
-    Core.Compiler.InferenceParams(::DiskCacheInterpreter) = Core.Compiler.InferenceParams()
-    Core.Compiler.OptimizationParams(::DiskCacheInterpreter) = Core.Compiler.OptimizationParams()
-    Core.Compiler.get_inference_cache(interp::DiskCacheInterpreter) = interp.inf_cache
-    Core.Compiler.get_inference_world(interp::DiskCacheInterpreter) = interp.world
-    Core.Compiler.cache_owner(interp::DiskCacheInterpreter) = cache_owner(interp.cache)
-    Core.Compiler.lock_mi_inference(::DiskCacheInterpreter, ::Core.MethodInstance) = nothing
-    Core.Compiler.unlock_mi_inference(::DiskCacheInterpreter, ::Core.MethodInstance) = nothing
-
-    # Use precompiled function from Base
-    world = Base.get_world_counter()
-    mi = method_instance(identity, (Int,); world)
-
-    # Phase callbacks with counting
     function disk_infer(cache, mi, world)
         infer_count[] += 1
         interp = DiskCacheInterpreter(cache, world)
         populate!(cache, interp, mi)
     end
+    disk_codegen(cache, mi, world, codeinfos) = (codegen_count[] += 1; :codegen_result)
+    disk_link(cache, mi, world, ir_data) = (link_count[] += 1; ir_data)
 
-    function disk_codegen(cache, mi, world, codeinfos)
-        codegen_count[] += 1
-        :codegen_result  # serializable
+    world = Base.get_world_counter()
+    mi = method_instance(identity, (Int,); world)
+    cache = CompilerCache(:DiskCacheTest; disk_cache=true)
+
+    mode = ARGS[1]
+    if mode == "populate"
+        clear_disk_cache!(cache)
+        result = cached_compilation(cache, mi, world;
+            infer=disk_infer, codegen=disk_codegen, link=disk_link)
+        @assert result === :codegen_result
+        @assert infer_count[] == 1
+        @assert codegen_count[] == 1
+        @assert link_count[] == 1
+    elseif mode == "hit"
+        result = cached_compilation(cache, mi, world;
+            infer=disk_infer, codegen=disk_codegen, link=disk_link)
+        @assert result === :codegen_result
+        @assert infer_count[] == 1    "infer should be called (fresh CI needs wrapper)"
+        @assert codegen_count[] == 0  "codegen should be SKIPPED (disk cache hit)"
+        @assert link_count[] == 1     "link should be called"
+    elseif mode == "cleanup"
+        clear_disk_cache!(cache)
     end
+    """
 
-    function disk_link(cache, mi, world, ir_data)
-        link_count[] += 1
-        ir_data
-    end
+    prj = Base.active_project()
+    run_script(mode) = run(`$(Base.julia_cmd()) --project=$prj -e $disk_cache_script -- $mode`)
 
-    # First run: full miss, all phases called
-    cache1 = CompilerCache(:DiskCacheTest; disk_cache=true)
-    clear_disk_cache!(cache1)  # ensure clean state
-    result1 = cached_compilation(cache1, mi, world;
-        infer = disk_infer, codegen = disk_codegen, link = disk_link)
-
-    @test result1 === :codegen_result
-    @test infer_count[] == 1
-    @test codegen_count[] == 1
-    @test link_count[] == 1
-
-    # Reset counters
-    infer_count[] = 0
-    codegen_count[] = 0
-    link_count[] = 0
-
-    # Second run: NEW cache instance (empty memory), same disk cache
-    cache2 = CompilerCache(:DiskCacheTest; disk_cache=true)
-    result2 = cached_compilation(cache2, mi, world;
-        infer = disk_infer, codegen = disk_codegen, link = disk_link)
-
-    @test result2 === :codegen_result
-    @test infer_count[] == 0   # infer NOT called (CI found via lookup in internal cache)
-    @test codegen_count[] == 0 # codegen SKIPPED (disk hit!)
-    @test link_count[] == 1    # link called
-
-    # Cleanup (only this cache's entries)
-    clear_disk_cache!(cache2)
+    @test success(run_script("populate"))
+    @test success(run_script("hit"))
+    run_script("cleanup")
 end
 end # @static if
 

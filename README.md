@@ -28,9 +28,11 @@ const cache = CompilerCache(:MyCompiler)
 
 # Set-up a custom interpreter, and link it to the cache
 struct CustomInterpreter <: CC.AbstractInterpreter
+    cache::CompilerCache
+    world::UInt
     ...
 end
-CC.cache_owner(interp::CustomInterpreter) = cache_owner(interp.cache)
+@setup_caching CustomInterpreter.cache
 
 function infer(cache, mi, world)
     # Let Julia populate the cache
@@ -56,6 +58,9 @@ end
 my_function(x::Int) = x + 100
 call(my_function, 42)
 ```
+
+The `@setup_caching` macro defines the necessary methods to connect the interpreter
+to the cache, and can be customized further if needed.
 
 ### Cache sharding
 

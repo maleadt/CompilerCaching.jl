@@ -22,6 +22,7 @@ export add_method, cached_compilation, cached_inference, method_instance
 export cache_owner, cache!
 export populate!, StackedMethodTable
 export clear_disk_cache!
+export initialize_result!, @setup_caching
 
 #==============================================================================#
 # CacheOwner - identifies a cache partition
@@ -47,6 +48,63 @@ function Base.hash(o::CacheOwner, h::UInt)
 end
 
 Base.:(==)(a::CacheOwner, b::CacheOwner) = a.tag == b.tag && a.keys == b.keys
+
+#==============================================================================#
+# CachedCompilationResult - wrapper for analysis_results storage
+#==============================================================================#
+
+"""
+    CachedCompilationResult
+
+Mutable wrapper type to identify our compilation results in the `analysis_results` chain.
+This allows multiple compiler plugins to store results on the same CodeInstance.
+
+The wrapper is created empty during `cache!` and populated later via `set_result!`.
+"""
+mutable struct CachedCompilationResult
+    result::Any
+end
+CachedCompilationResult() = CachedCompilationResult(nothing)
+
+"""
+    initialize_result!(caller::CC.InferenceResult)
+
+Create an empty `CachedCompilationResult` wrapper during inference.
+The wrapper will be transferred to the CodeInstance and can later be
+populated via `set_result!` after the link phase.
+"""
+function initialize_result!(caller::CC.InferenceResult)
+    CC.stack_analysis_result!(caller, CachedCompilationResult())
+end
+
+"""
+    get_result(ci::CodeInstance) -> Union{Any, Nothing}
+
+Retrieve a compilation result from the CodeInstance's `analysis_results` chain.
+Returns `nothing` if no `CachedCompilationResult` is found or if the wrapper is empty.
+"""
+function get_result(ci::Core.CodeInstance)
+    wrapper = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedCompilationResult ? result : nothing
+    end
+    wrapper === nothing && return nothing
+    return wrapper.result
+end
+
+"""
+    set_result!(ci::CodeInstance, result)
+
+Populate the `CachedCompilationResult` wrapper on a CodeInstance with the compilation result.
+The wrapper must have been created during `cache!`.
+"""
+function set_result!(ci::Core.CodeInstance, result)
+    wrapper = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedCompilationResult ? result : nothing
+    end
+    @assert wrapper !== nothing "CodeInstance without CachedCompilationResult wrapper; Please use `@setup_caching`."
+    wrapper.result = result
+    return
+end
 
 #==============================================================================#
 # DiskCacheEntry - serializable cache entry
@@ -103,8 +161,6 @@ const gpu = CompilerCache{@NamedTuple{cap::VersionNumber}}(:GPUCompiler)
 struct CompilerCache{K}
     tag::Symbol
     method_table::Union{Core.MethodTable, Nothing}
-    external_cache::Dict{Tuple{Core.CodeInstance, K}, Any}
-    lock::ReentrantLock
     disk_cache::Bool
 end
 
@@ -113,10 +169,7 @@ function CompilerCache{K}(tag::Symbol, method_table=nothing; disk_cache::Bool=fa
     if disk_cache && VERSION < v"1.12-"
         error("disk_cache=true requires Julia 1.12+ (object_build_id not available)")
     end
-    CompilerCache{K}(tag, method_table,
-                     Dict{Tuple{Core.CodeInstance, K}, Any}(),
-                     ReentrantLock(),
-                     disk_cache)
+    CompilerCache{K}(tag, method_table, disk_cache)
 end
 CompilerCache(tag::Symbol, method_table=nothing; disk_cache::Bool=false) =
     CompilerCache{Nothing}(tag, method_table; disk_cache)
@@ -128,6 +181,52 @@ Get the CacheOwner for a cache. Use this as your interpreter's cache token
 with `CC.cache_owner(interp)`.
 """
 cache_owner(cache::CompilerCache{K}, keys::K=nothing) where K = CacheOwner{K}(cache.tag, keys)
+
+"""
+    @setup_caching InterpreterType.cache_field
+
+Generate the required methods for an AbstractInterpreter to work with CompilerCaching.
+"""
+macro setup_caching(expr)
+    # Parse InterpreterType.cache_field
+    if !(expr isa Expr && expr.head == :.)
+        error("Expected InterpreterType.cache_field, e.g., @setup_caching MyInterpreter.cache")
+    end
+    InterpType = expr.args[1]
+    cache_field = expr.args[2]
+    if cache_field isa QuoteNode
+        cache_field = cache_field.value
+    end
+
+    # Generate the appropriate ipo_dataflow_analysis! signature based on Julia version
+    ipo_method = if hasmethod(CC.ipo_dataflow_analysis!, Tuple{CC.AbstractInterpreter, CC.OptimizationState, CC.IRCode, CC.InferenceResult})
+        # Julia 1.12+: (interp, opt, ir, result)
+        quote
+            function $CC.ipo_dataflow_analysis!(interp::$InterpType, opt::$CC.OptimizationState,
+                                                ir::$CC.IRCode, caller::$CC.InferenceResult)
+                $initialize_result!(caller)
+                @invoke $CC.ipo_dataflow_analysis!(interp::$CC.AbstractInterpreter, opt::$CC.OptimizationState,
+                                                   ir::$CC.IRCode, caller::$CC.InferenceResult)
+            end
+        end
+    else
+        # Julia 1.11: (interp, ir, result)
+        quote
+            function $CC.ipo_dataflow_analysis!(interp::$InterpType, ir::$CC.IRCode,
+                                                caller::$CC.InferenceResult)
+                $initialize_result!(caller)
+                @invoke $CC.ipo_dataflow_analysis!(interp::$CC.AbstractInterpreter, ir::$CC.IRCode,
+                                                   caller::$CC.InferenceResult)
+            end
+        end
+    end
+
+    quote
+        $CC.cache_owner(interp::$InterpType) = $cache_owner(interp.$cache_field)
+        $ipo_method
+    end |> esc
+end
+
 
 #==============================================================================#
 # Method registration
@@ -406,12 +505,15 @@ function cache!(cache::CompilerCache{K}, mi::Core.MethodInstance, keys::K=nothin
     cc = code_cache(owner, world)
     edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
 
+    # Create empty wrapper for later population via `set_result!`
+    ar = CC.AnalysisResults(CachedCompilationResult(), CC.NULL_ANALYSIS_RESULTS)
+
     @static if VERSION >= v"1.12-"
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), UInt(world), typemax(UInt), UInt32(0), nothing, nothing, edges)
+            Int32(0), UInt(world), typemax(UInt), UInt32(0), ar, nothing, edges)
     else
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), UInt(world), typemax(UInt), UInt32(0), UInt32(0), nothing, UInt8(0))
+            Int32(0), UInt(world), typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
     end
     CC.setindex!(cc, ci, mi)
 
@@ -569,11 +671,8 @@ function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
     # 1. Run inference phase (checks cache internally, returns early if CI exists)
     ci, codeinfos = cached_inference(cache, mi, world, keys; infer)
 
-    # 2. Check memory cache for compiled result
-    key = (ci, keys)
-    result = lock(cache.lock) do
-        get(cache.external_cache, key, nothing)
-    end
+    # 2. Check for cached compiled result
+    result = get_result(ci)
     result !== nothing && return result
 
     # 3. Check disk cache using CI's build_id
@@ -603,11 +702,9 @@ function cached_compilation(cache::CompilerCache{K}, mi::Core.MethodInstance,
         end
     end
 
-    # 5. Link and store in memory cache
+    # 5. Link and store result
     result = link(cache, mi, world, ir_data)
-    lock(cache.lock) do
-        cache.external_cache[key] = result
-    end
+    set_result!(ci, result)
 
     return result
 end

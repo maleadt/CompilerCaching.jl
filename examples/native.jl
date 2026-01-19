@@ -54,12 +54,10 @@ CC.unlock_mi_inference(::CustomInterpreter, ::Core.MethodInstance) = nothing
 CC.method_table(interp::CustomInterpreter) = interp.method_table
 
 # integration with CompilerCaching.jl
-CC.cache_owner(interp::CustomInterpreter) = cache_owner(interp.cache)
+@setup_caching CustomInterpreter.cache
 
 
 ## high-level API
-
-const compilations = Ref(0) # for testing
 
 # Inference phase: returns Vector{Pair{CI, IR}} where root CI is first entry
 function julia_infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
@@ -68,6 +66,7 @@ function julia_infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
 end
 
 # Codegen phase wrapper: counts compilations for testing
+const compilations = Ref(0) # for testing
 function julia_codegen_counted(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, codeinfos)
     compilations[] += 1
     julia_codegen(cache, mi, world, codeinfos)
