@@ -11,8 +11,6 @@
 module CompilerCaching
 
 using Base.Experimental: @MethodTable
-using Scratch: @get_scratch!
-using Serialization: serialize, deserialize
 const CC = Core.Compiler
 
 include("utils.jl")
@@ -127,25 +125,6 @@ function set_result!(ci::Core.CodeInstance, result)
 end
 
 #==============================================================================#
-# DiskCacheEntry - serializable cache entry
-#==============================================================================#
-
-"""
-    DiskCacheEntry{K}
-
-A serializable entry for disk caching.
-
-- `spec_types::Type` - mi.specTypes for validation
-- `keys::K` - sharding keys
-- `data::Any` - serializable compile result
-"""
-struct DiskCacheEntry{K}
-    spec_types::Type
-    keys::K
-    data::Any
-end
-
-#==============================================================================#
 # CompilerCache - main entry point
 #==============================================================================#
 
@@ -158,25 +137,14 @@ A compilation cache instance, parameterized by key type K.
 
 - `tag::Symbol` - Base tag for cache owner
 - `keys::K` - Sharding keys (e.g., device capability, optimization level)
-- `disk_cache::Bool` - Whether to persist compiled results to disk
 """
 struct CompilerCache{K}
     tag::Symbol
     keys::K
-    disk_cache::Bool
-end
-
-# Constructors
-function CompilerCache{K}(tag::Symbol, keys::K; disk_cache::Bool=false) where K
-    if disk_cache && VERSION < v"1.12-"
-        error("disk_cache=true requires Julia 1.12+ (object_build_id not available)")
-    end
-    CompilerCache{K}(tag, keys, disk_cache)
 end
 
 # Non-parameterized constructor for K=Nothing
-CompilerCache(tag::Symbol; disk_cache::Bool=false) =
-    CompilerCache{Nothing}(tag, nothing; disk_cache)
+CompilerCache(tag::Symbol) = CompilerCache{Nothing}(tag, nothing)
 
 """
     cache_owner(cache::CompilerCache) -> CacheOwner
@@ -518,109 +486,6 @@ function cache!(cache::CompilerCache, mi::Core.MethodInstance;
 end
 
 #==============================================================================#
-# Disk cache I/O helpers
-#==============================================================================#
-
-export clear_disk_cache!
-
-"""
-    disk_cache_path() -> String
-
-Return the path to the disk cache directory.
-"""
-disk_cache_path() = @get_scratch!("disk_cache")
-
-"""
-    clear_disk_cache!(cache::CompilerCache)
-
-Remove disk-cached compilation results for the given cache (by tag).
-"""
-clear_disk_cache!(cache::CompilerCache) =
-    rm(joinpath(disk_cache_path(), string(cache.tag)); recursive=true, force=true)
-
-"""
-    cache_file(cache, ci) -> Union{String, Nothing}
-
-Return the path to the cache file for the given CodeInstance.
-
-On Julia 1.12+, uses `Base.object_build_id(ci)` as the cache key:
-- Stable across sessions for precompiled package code
-- Different after method redefinition (new CI = new build_id)
-- Returns `nothing` for runtime compilations (build_id === nothing)
-
-On Julia 1.11, returns `nothing` to skip disk caching. Without `object_build_id`,
-we cannot safely distinguish between different versions of the same method,
-which would cause stale bitcode to be loaded after method redefinition.
-"""
-function cache_file(cache::CompilerCache, ci::Core.CodeInstance)
-    @static if VERSION >= v"1.12-"
-        # Use the MethodInstance's build_id, not the CodeInstance's.
-        # CodeInstances created at runtime (via populate!) have build_id === nothing,
-        # but their MethodInstance retains the stable build_id from precompilation.
-        mi = ci.def
-        bid = Base.object_build_id(mi)
-        bid === nothing && return nothing  # runtime MI, skip disk cache
-
-        # Use only stable identifiers for disk cache key:
-        # - object_build_id(mi): stable across sessions for precompiled methods
-        # - specTypes: identifies the specific method instance (redundant but safe)
-        # - keys: sharding keys from cache
-        # NOTE: Do NOT use objectid() - it's a memory address that changes between sessions
-        h = hash(bid)
-        h = hash(mi.specTypes, h)
-        h = hash(cache.keys, h)
-        return joinpath(disk_cache_path(), string(cache.tag), string(h, ".jls"))
-    else
-        # Julia 1.11: no object_build_id, skip disk caching
-        # Using specTypes would load stale bitcode after method redefinition
-        return nothing
-    end
-end
-
-"""
-    write_disk_cache(path, mi, keys, data)
-
-Atomically write a cache entry to disk.
-"""
-function write_disk_cache(path::String, mi::Core.MethodInstance,
-                          keys::K, data) where K
-    mkpath(dirname(path))
-    entry = DiskCacheEntry{K}(mi.specTypes, keys, data)
-    tmppath, io = mktemp(dirname(path); cleanup=false)
-    try
-        serialize(io, entry)
-        close(io)
-        mv(tmppath, path; force=true)
-    catch
-        close(io)
-        rm(tmppath; force=true)
-        rethrow()
-    end
-end
-
-"""
-    read_disk_cache(path, mi, keys) -> Union{Any, Nothing}
-
-Read a cache entry from disk with validation.
-Returns `nothing` if validation fails.
-"""
-function read_disk_cache(path::String, mi::Core.MethodInstance,
-                         keys::K) where K
-    isfile(path) || return nothing
-    try
-        entry = deserialize(path)::DiskCacheEntry
-        if entry.spec_types == mi.specTypes && entry.keys == keys
-            return entry.data
-        end
-        @warn "Disk cache mismatch" mi path
-        return nothing
-    catch e
-        @warn "Failed to read disk cache" path exception=e
-        return nothing
-    end
-end
-
-#==============================================================================#
 # Cached inference - dependency discovery without full compilation
 #==============================================================================#
 
@@ -671,7 +536,7 @@ end
 """
     cached_compilation(cache, mi, world; infer, codegen, link) -> result
 
-Three-phase cached compilation with automatic invalidation and optional disk persistence.
+Three-phase cached compilation with automatic invalidation.
 """
 function cached_compilation(cache::CompilerCache, mi::Core.MethodInstance,
                             world::UInt; infer, codegen, link)
@@ -690,34 +555,15 @@ function cached_compilation(cache::CompilerCache, mi::Core.MethodInstance,
         return wrapper.linked
     end
 
-    # 3. Check disk cache using CI's build_id
-    compiled = nothing
-    if cache.disk_cache
-        path = cache_file(cache, ci)
-        if path !== nothing
-            compiled = read_disk_cache(path, ci.def, cache.keys)
-        end
+    # 3. Run codegen
+    # Need inferred result for codegen - re-run infer if we had a cache hit on CI
+    if inferred === nothing
+        _, inferred = infer(cache, mi, world)
     end
 
-    # 4. If disk miss, run codegen
-    if compiled === nothing
-        # Need inferred result for codegen - re-run infer if we had a cache hit on CI
-        if inferred === nothing
-            _, inferred = infer(cache, mi, world)
-        end
+    compiled = codegen(cache, mi, world, inferred)
 
-        compiled = codegen(cache, mi, world, inferred)
-
-        # Write to disk cache if enabled
-        if cache.disk_cache
-            path = cache_file(cache, ci)
-            if path !== nothing
-                write_disk_cache(path, ci.def, cache.keys, compiled)
-            end
-        end
-    end
-
-    # 5. Link and store result
+    # 4. Link and store result
     linked = link(cache, mi, world, compiled)
     set_result!(ci, linked)
 

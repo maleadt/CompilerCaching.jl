@@ -13,8 +13,7 @@ using Base.Experimental: @MethodTable, @overlay
 @MethodTable CUSTOM_MT
 
 # Helper to create cache handles on-the-fly
-# Enable disk caching on Julia 1.12+ to avoid stale bitcode conflicts
-custom_cache() = CompilerCache(:NativeExample; disk_cache=(VERSION >= v"1.12-"))
+custom_cache() = CompilerCache(:NativeExample)
 
 
 ## abstract interpreter

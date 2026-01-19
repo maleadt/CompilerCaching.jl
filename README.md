@@ -154,23 +154,6 @@ function call(f, args...)
 end
 ```
 
-### Disk caching
-
-On Julia 1.12 and up, it is possible to back the cache by a disk-based store:
-
-```julia
-function call(f, args...)
-    # ...
-    cache = CompilerCache(:MyCompiler; disk_cache=true)
-    cached_compilation(cache, mi, world; infer, codegen, link)
-end
-
-# Explicitly wipe the disk cache if needed
-clear_disk_cache!(CompilerCache(:MyCompiler))
-```
-
-Serialized IR will be stored in a scratch space, keyed on the cache tag and any sharding keys.
-
 ### Stacked method tables
 
 A utility `StackedMethodTable` is provided to facilitate layering multiple method tables:
