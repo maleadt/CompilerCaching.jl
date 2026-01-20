@@ -90,7 +90,7 @@ precompile_test_harness("Inference caching") do load_path
 
         # check that identity survived
         @test check_presence(identity_mi, cache) !== nothing broken=VERSION>=v"1.12.0-DEV.1268"
-        ExampleCompiler.precompile(ExampleUser.square, (Float64,))
+        ExampleCompiler.precompile(identity, (Int,))
         @test ExampleCompiler.codegen_count[] == 0 broken=VERSION>=v"1.12.0-DEV.1268"
     end
 end
