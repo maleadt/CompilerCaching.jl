@@ -65,7 +65,7 @@ On Julia 1.11, `codeinfos` contains `[ci => nothing]`; uses cache lookup callbac
 
 This function handles codegen but does not JIT compile - use `julia_jit` for that.
 """
-function julia_codegen(cache::CompilerCache, mi::Core.MethodInstance,
+function julia_codegen(cache::CacheHandle, mi::Core.MethodInstance,
                        world::UInt, codeinfos::Vector{<:Pair{Core.CodeInstance}})
 
     # Set up globals for the lookup callback

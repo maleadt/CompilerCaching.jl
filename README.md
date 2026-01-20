@@ -14,13 +14,13 @@ Pkg.add(url="path/to/CompilerCaching")
 
 ## Usage
 
-The basic usage pattern is to create a `CompilerCache` handle and invoke `cached_compilation`
+The basic usage pattern is to create a `CacheHandle` handle and invoke `cached_compilation`
 with three callbacks:
 - `infer`: Perform type inference, store a `CodeInstance` in the cache (via `populate!` or `cache!`), and return the data for codegen
 - `codegen`: Generate serializable code that can be cached across sessions
 - `link`: Generate a session-specific representation (e.g., JIT-compiled function pointer)
 
-A `CompilerCache` is a lightweight handle to Julia's global `InternalCodeCache`. Creating
+A `CacheHandle` is a lightweight handle to Julia's global `InternalCodeCache`. Creating
 cache handles is cheap, so they can be constructed on-the-fly right before compilation.
 
 ```julia
@@ -28,7 +28,7 @@ using CompilerCaching
 
 # Set-up a custom interpreter, and link it to the cache
 struct CustomInterpreter <: CC.AbstractInterpreter
-    cache::CompilerCache
+    cache::CacheHandle
     world::UInt
     ...
 end
@@ -49,10 +49,10 @@ function link(cache, mi, world, result) end
 function call(f, args...)
     tt = map(Core.Typeof, args)
     world = Base.get_world_counter()
-    mi = @something(method_instance(f, tt; world, cache.method_table),
+    mi = @something(method_instance(f, tt; world),
                     throw(MethodError(f, args)))
 
-    cache = CompilerCache(:MyCompiler)
+    cache = CacheHandle(:MyCompiler)
     cached_compilation(cache, mi, world; infer, codegen, link)
 end
 
@@ -77,7 +77,7 @@ function call(f, args...; opt_level=1)
     mi = @something(method_instance(f, tt; world),
                     throw(MethodError(f, args)))
 
-    cache = CompilerCache{CacheKey}(:MyCompiler, (; opt_level))
+    cache = CacheHandle{CacheKey}(:MyCompiler, (; opt_level))
     cached_compilation(cache, mi, world; infer, codegen, link)
 end
 ```
@@ -97,7 +97,7 @@ end
 
 # Expose the method table to the interpreter
 struct CustomInterpreter <: CC.AbstractInterpreter
-    cache::CompilerCache
+    cache::CacheHandle
     world::UInt
     ...
 end
@@ -110,7 +110,7 @@ function call(f, args...)
                     # if relevant, look for global methods too
                     throw(MethodError(f, args)))
 
-    cache = CompilerCache(:MyCompiler)
+    cache = CacheHandle(:MyCompiler)
     cached_compilation(cache, mi, world; infer, codegen, link)
 end
 ```
@@ -149,7 +149,7 @@ function call(f, args...)
     mi = @something(method_instance(f, tt; world, method_table),
                     throw(MethodError(f, args)))
 
-    cache = CompilerCache(:MyCompiler; method_table)
+    cache = CacheHandle(:MyCompiler)
     cached_compilation(cache, mi, world; infer, codegen, link)
 end
 ```

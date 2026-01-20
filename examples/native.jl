@@ -13,20 +13,20 @@ using Base.Experimental: @MethodTable, @overlay
 @MethodTable CUSTOM_MT
 
 # Helper to create cache handles on-the-fly
-custom_cache() = CompilerCache(:NativeExample)
+custom_cache() = CacheHandle(:NativeExample)
 
 
 ## abstract interpreter
 
 struct CustomInterpreter <: CC.AbstractInterpreter
     world::UInt
-    cache::CompilerCache
+    cache::CacheHandle
     method_table::CC.OverlayMethodTable
     inf_cache::Vector{CC.InferenceResult}
     inf_params::CC.InferenceParams
     opt_params::CC.OptimizationParams
 
-    function CustomInterpreter(cache::CompilerCache, world::UInt)
+    function CustomInterpreter(cache::CacheHandle, world::UInt)
         @assert world <= get_world_counter()
         new(world, cache,
             CC.OverlayMethodTable(world, CUSTOM_MT),
@@ -59,14 +59,14 @@ CC.method_table(interp::CustomInterpreter) = interp.method_table
 ## high-level API
 
 # Inference phase: returns codeinfos, CI is in cache via populate!
-function julia_infer(cache::CompilerCache, mi::Core.MethodInstance, world::UInt)
+function julia_infer(cache::CacheHandle, mi::Core.MethodInstance, world::UInt)
     interp = CustomInterpreter(cache, world)
     return CompilerCaching.populate!(cache, interp, mi)
 end
 
 # Codegen phase wrapper: counts compilations for testing
 const compilations = Ref(0) # for testing
-function julia_codegen_counted(cache::CompilerCache, mi::Core.MethodInstance, world::UInt, codeinfos)
+function julia_codegen_counted(cache::CacheHandle, mi::Core.MethodInstance, world::UInt, codeinfos)
     compilations[] += 1
     julia_codegen(cache, mi, world, codeinfos)
 end

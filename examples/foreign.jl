@@ -3,7 +3,7 @@
 # - Cache handles created on-the-fly before compilation
 # - Demonstrates: caching, redefinition, multiple dispatch
 
-using CompilerCaching: CompilerCache, add_method, method_instance, cache!,
+using CompilerCaching: CacheHandle, add_method, method_instance, cache!,
                        cached_inference, cached_compilation
 
 
@@ -76,7 +76,7 @@ function call(f, args...)
     mi = @something(method_instance(f, tt; world, method_table),
                     throw(MethodError(f, args)))
 
-    cache = CompilerCache(:ForeignExample)
+    cache = CacheHandle(:ForeignExample)
     cached_compilation(cache, mi, world; infer, codegen, link)
 end
 

@@ -3,7 +3,7 @@ using Test
 using Base.Experimental: @MethodTable
 
 # Test helper: wraps simple compile functions in three-phase API
-function simple_cached_compilation(compile_fn, cache::CompilerCache, mi, world)
+function simple_cached_compilation(compile_fn, cache::CacheHandle, mi, world)
     cached_compilation(cache, mi, world;
         infer = (c, m, w) -> begin
             result = compile_fn(m)
@@ -21,7 +21,7 @@ end
 
 @testset "basic caching" begin
     # Use Compiler without method table = global MT
-    cache = CompilerCache(:GlobalTest)
+    cache = CacheHandle(:GlobalTest)
 
     # Define a regular Julia function (in global MT)
     global_test_fn(x::Int) = x + 100
@@ -52,8 +52,8 @@ end
     # Global MT with sharding keys (e.g., for GPUCompiler-style usage)
     # Different caches for different key combinations
     ShardKeys = @NamedTuple{opt_level::Int}
-    cache1 = CompilerCache{ShardKeys}(:GlobalShardTest, (opt_level=1,))
-    cache2 = CompilerCache{ShardKeys}(:GlobalShardTest, (opt_level=2,))
+    cache1 = CacheHandle{ShardKeys}(:GlobalShardTest, (opt_level=1,))
+    cache2 = CacheHandle{ShardKeys}(:GlobalShardTest, (opt_level=2,))
 
     global_sharded_fn(x::Float64) = x * 2.0
 
@@ -91,7 +91,7 @@ end
         end
         $overlay_double_name
     end
-    cache = CompilerCache(:OverlayTest)
+    cache = CacheHandle(:OverlayTest)
 
     compile_count = Ref(0)
     function my_compile(mi)
@@ -116,15 +116,15 @@ end
 end
 
 @testset "inference integration" begin
-    cache = CompilerCache(:InferenceTest)
+    cache = CacheHandle(:InferenceTest)
 
     # Test interpreter that properly integrates with cache
     struct TestInterpreter <: Core.Compiler.AbstractInterpreter
         world::UInt
-        cache::CompilerCache
+        cache::CacheHandle
         inf_cache::Vector{Core.Compiler.InferenceResult}
     end
-    TestInterpreter(cache::CompilerCache, world::UInt) =
+    TestInterpreter(cache::CacheHandle, world::UInt) =
         TestInterpreter(world, cache, Core.Compiler.InferenceResult[])
     @setup_caching TestInterpreter.cache
 
@@ -159,7 +159,7 @@ end
 end
 
 @testset "compilation hook" begin
-    cache = CompilerCache(:HookTest)
+    cache = CacheHandle(:HookTest)
     calls = []
 
     # Define function and get world counter after definition
@@ -209,7 +209,7 @@ end
 
 @testset "basic caching" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
-    cache = CompilerCache(:BasicTest)
+    cache = CacheHandle(:BasicTest)
 
     function basic_node end
     add_method(method_table, basic_node, (Int,), 10)
@@ -245,7 +245,7 @@ end
 
 @testset "multiple dispatch" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
-    cache = CompilerCache(:DispatchTest)
+    cache = CacheHandle(:DispatchTest)
 
     function dispatch_node end
     add_method(method_table, dispatch_node, (Int,), 100)
@@ -309,7 +309,7 @@ end
 
 @testset "dependency invalidation" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
-    cache = CompilerCache(:DepTest)
+    cache = CacheHandle(:DepTest)
 
     function parent_node end
     function child_node end
@@ -376,9 +376,9 @@ end
 
 @testset "method table isolation" begin
     method_table_a = @eval @MethodTable $(gensym(:method_table_a))
-    cache_a = CompilerCache(:IsolationA)
+    cache_a = CacheHandle(:IsolationA)
     method_table_b = @eval @MethodTable $(gensym(:method_table_b))
-    cache_b = CompilerCache(:IsolationB)
+    cache_b = CacheHandle(:IsolationB)
 
     function isolated_node end
     add_method(method_table_a, isolated_node, (Int,), :ir_a)

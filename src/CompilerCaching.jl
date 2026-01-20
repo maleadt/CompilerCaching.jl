@@ -42,29 +42,29 @@ The hook is called even for fully cached calls that don't re-link.
 compile_hook!(f) = _COMPILE_HOOK[] = f
 
 #==============================================================================#
-# CacheOwner - identifies a cache partition
+# CacheHandle - main entry point and cache owner token
 #==============================================================================#
 
 """
-    CacheOwner{K}
+    CacheHandle{K}
 
-Identifies a cache partition. Constructed internally from a tag and optional keys.
+A handle to a cache partition. Serves as both configuration and cache owner token.
 
 - `tag::Symbol` - Base identifier (e.g., `:SynchJulia`, `:GPUCompiler`)
-- `keys::K` - Additional sharding keys (e.g., device capability, optimization level)
+- `keys::K` - Additional sharding keys (e.g., device capability, optimization level, method table)
 """
-struct CacheOwner{K}
+struct CacheHandle{K}
     tag::Symbol
     keys::K
+    CacheHandle{K}(tag::Symbol, keys::K) where K = new{K}(tag, keys)
 end
 
-function Base.hash(o::CacheOwner, h::UInt)
-    h = hash(o.tag, h)
-    h = hash(o.keys, h)
-    return h
-end
+# Convenience constructor for simple usage without sharding keys
+CacheHandle(tag::Symbol) = CacheHandle{Nothing}(tag, nothing)
 
-Base.:(==)(a::CacheOwner, b::CacheOwner) = a.tag == b.tag && a.keys == b.keys
+# hash/== implemented so it can be used directly as cache owner token
+Base.hash(h::CacheHandle, x::UInt) = hash(h.tag, hash(h.keys, x))
+Base.:(==)(a::CacheHandle, b::CacheHandle) = a.tag == b.tag && a.keys == b.keys
 
 #==============================================================================#
 # CachedCompilationResult - wrapper for analysis_results storage
@@ -124,35 +124,14 @@ function set_result!(ci::Core.CodeInstance, result)
     return
 end
 
-#==============================================================================#
-# CompilerCache - main entry point
-#==============================================================================#
-
-export CompilerCache, @setup_caching, cached_inference, cached_compilation
+export CacheHandle, @setup_caching, cached_inference, cached_compilation
 
 """
-    CompilerCache{K}
+    cache_owner(cache::CacheHandle) -> CacheHandle
 
-A compilation cache instance, parameterized by key type K.
-
-- `tag::Symbol` - Base tag for cache owner
-- `keys::K` - Sharding keys (e.g., device capability, optimization level)
+Returns the handle itself. The CacheHandle can be used directly as the cache owner token.
 """
-struct CompilerCache{K}
-    tag::Symbol
-    keys::K
-end
-
-# Non-parameterized constructor for K=Nothing
-CompilerCache(tag::Symbol) = CompilerCache{Nothing}(tag, nothing)
-
-"""
-    cache_owner(cache::CompilerCache) -> CacheOwner
-
-Get the CacheOwner for a cache. Use this as your interpreter's cache token
-with `CC.cache_owner(interp)`.
-"""
-cache_owner(cache::CompilerCache{K}) where K = CacheOwner{K}(cache.tag, cache.keys)
+cache_owner(cache::CacheHandle) = cache
 
 """
     @setup_caching InterpreterType.cache_field
@@ -243,6 +222,7 @@ function add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source)
     return m
 end
 
+
 #==============================================================================#
 # Method lookup
 #==============================================================================#
@@ -296,7 +276,7 @@ Returns a vector of (CodeInstance, IR) pairs where:
 
 The root CI is always the first entry: `first(result)[1]`
 """
-function populate!(cache::CompilerCache, interp::CC.AbstractInterpreter,
+function populate!(cache::CacheHandle, interp::CC.AbstractInterpreter,
                    mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
         # Modern API: returns CodeInstance, use SOURCE_MODE to control caching
@@ -397,21 +377,20 @@ end
 #==============================================================================#
 
 @static if VERSION >= v"1.14-"
-    function code_cache(owner::CacheOwner, world::UInt)
+    function code_cache(cache::CacheHandle, world::UInt)
         world_range = CC.WorldRange(world)
-        return CC.InternalCodeCache(owner, world_range)
+        return CC.InternalCodeCache(cache, world_range)
     end
 else
-    function code_cache(owner::CacheOwner, world::UInt)
-        cache = CC.InternalCodeCache(owner)
-        return CC.WorldView(cache, world)
+    function code_cache(cache::CacheHandle, world::UInt)
+        cc = CC.InternalCodeCache(cache)
+        return CC.WorldView(cc, world)
     end
 end
 
-function lookup(cache::CompilerCache, mi::Core.MethodInstance;
+function lookup(cache::CacheHandle, mi::Core.MethodInstance;
                 world::UInt=Base.get_world_counter())
-    owner = cache_owner(cache)
-    cc = code_cache(owner, world)
+    cc = code_cache(cache, world)
     return CC.get(cc, mi, nothing)
 end
 
@@ -453,26 +432,25 @@ Used for foreign mode where inference doesn't run. The CI participates in
 Julia's invalidation mechanism via backedges registered from `deps`.
 
 # Arguments
-- `cache::CompilerCache` - The compiler cache instance
+- `cache::CacheHandle` - The cache handle
 - `mi::MethodInstance` - The method instance to cache
 - `world::UInt` - World age for the CI
 - `deps::Vector{MethodInstance}` - Dependencies to register as backedges
 """
-function cache!(cache::CompilerCache, mi::Core.MethodInstance;
+function cache!(cache::CacheHandle, mi::Core.MethodInstance;
                 world::UInt=Base.get_world_counter(),
                 deps::Vector{Core.MethodInstance}=Core.MethodInstance[])
-    owner = cache_owner(cache)
-    cc = code_cache(owner, world)
+    cc = code_cache(cache, world)
     edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
 
     # Create empty wrapper for later population via `set_result!`
     ar = CC.AnalysisResults(CachedCompilationResult(), CC.NULL_ANALYSIS_RESULTS)
 
     @static if VERSION >= v"1.12-"
-        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
+        ci = Core.CodeInstance(mi, cache, Any, Any, nothing, nothing,
             Int32(0), UInt(world), typemax(UInt), UInt32(0), ar, nothing, edges)
     else
-        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
+        ci = Core.CodeInstance(mi, cache, Any, Any, nothing, nothing,
             Int32(0), UInt(world), typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
     end
     CC.setindex!(cc, ci, mi)
@@ -505,7 +483,7 @@ The `infer` callback must:
 Returns `(ci, result)` where `result` is from the infer callback,
 or `nothing` if the CI was already cached without a stored result.
 """
-function cached_inference(cache::CompilerCache, mi::Core.MethodInstance,
+function cached_inference(cache::CacheHandle, mi::Core.MethodInstance,
                           world::UInt; infer)
     ci = lookup(cache, mi; world)
     if ci !== nothing
@@ -543,7 +521,7 @@ end
 
 Three-phase cached compilation with automatic invalidation.
 """
-function cached_compilation(cache::CompilerCache, mi::Core.MethodInstance,
+function cached_compilation(cache::CacheHandle, mi::Core.MethodInstance,
                             world::UInt; infer, codegen, link)
     # Call compile hook if set (even on cache hit)
     hook = compile_hook()
