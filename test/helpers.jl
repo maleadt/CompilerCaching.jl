@@ -21,11 +21,11 @@ function precompile_test_harness(@nospecialize(f), separate::Bool)
 end
 
 function check_presence(mi, token)
-    found = false
+    found = nothing
     ci = isdefined(mi, :cache) ? mi.cache : nothing
     while ci !== nothing
         if ci.owner === token && ci.max_world == typemax(UInt)
-            found = true
+            found = ci
             break
         end
         ci = isdefined(ci, :next) ? ci.next : nothing

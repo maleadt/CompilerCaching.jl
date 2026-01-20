@@ -2,11 +2,10 @@ using Test
 include("helpers.jl")
 
 precompile_test_harness("Inference caching") do load_path
-    write(joinpath(load_path, "ExampleCompiler.jl"), :(
-        module ExampleCompiler
-            using CompilerCaching
+    write(joinpath(load_path, "ExampleCompiler.jl"), :(module ExampleCompiler
+        using CompilerCaching
 
-            const CC = Core.Compiler
+        const CC = Core.Compiler
 
         struct ExampleInterpreter <: CC.AbstractInterpreter
             world::UInt
@@ -28,14 +27,15 @@ precompile_test_harness("Inference caching") do load_path
         CC.unlock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
         @setup_caching ExampleInterpreter.cache
 
+        codegen_count = Ref(0)
         function infer(cache, mi, world)
             interp = ExampleInterpreter(cache, world)
             populate!(cache, interp, mi)
         end
-        codegen(cache, mi, world, codeinfos) = (:codegen_result)
+        codegen(cache, mi, world, codeinfos) = (codegen_count[] += 1; :codegen_result)
         link(cache, mi, world, ir_data) = (ir_data)
 
-        function my_precompile(f, tt)
+        function precompile(f, tt)
             world = Base.get_world_counter()
             mi = method_instance(f, tt; world)
             cache = CacheHandle(:ExampleCompiler)
@@ -48,8 +48,7 @@ precompile_test_harness("Inference caching") do load_path
     ) |> string)
     Base.compilecache(Base.PkgId("ExampleCompiler"), stderr, stdout)
 
-    write(joinpath(load_path, "ExampleUser.jl"), :(
-        module ExampleUser
+    write(joinpath(load_path, "ExampleUser.jl"), :(module ExampleUser
         import ExampleCompiler
         using PrecompileTools
 
@@ -57,12 +56,12 @@ precompile_test_harness("Inference caching") do load_path
             return x*x
         end
 
-        ExampleCompiler.my_precompile(square, (Float64,))
+        ExampleCompiler.precompile(square, (Float64,))
 
         # identity is foreign
         @setup_workload begin
             @compile_workload begin
-                ExampleCompiler.my_precompile(identity, (Int64,))
+                ExampleCompiler.precompile(identity, (Int64,))
             end
         end
         end# module
@@ -72,23 +71,26 @@ precompile_test_harness("Inference caching") do load_path
     @eval let
         using CompilerCaching
         import ExampleCompiler
+        @test ExampleCompiler.codegen_count[] == 0
 
         cache = CacheHandle(:ExampleCompiler)
 
         # Check that no cached entry is present
         identity_mi = method_instance(identity, (Int,))
-        @test !check_presence(identity_mi, cache)
+        @test check_presence(identity_mi, cache) === nothing
 
         using ExampleUser
+        @test ExampleCompiler.codegen_count[] == 0
 
         # Check that kernel survived
         square_mi = method_instance(ExampleUser.square, (Float64,))
-        @test check_presence(square_mi, cache)
+        @test check_presence(square_mi, cache) !== nothing
+        ExampleCompiler.precompile(ExampleUser.square, (Float64,))
+        @test ExampleCompiler.codegen_count[] == 0
 
         # check that identity survived
-        # TODO:
-        @test check_presence(identity_mi, cache) broken=VERSION>=v"1.12.0-DEV.1268"
-
-        # TODO: Check that result survived
+        @test check_presence(identity_mi, cache) !== nothing broken=VERSION>=v"1.12.0-DEV.1268"
+        ExampleCompiler.precompile(ExampleUser.square, (Float64,))
+        @test ExampleCompiler.codegen_count[] == 0 broken=VERSION>=v"1.12.0-DEV.1268"
     end
 end
