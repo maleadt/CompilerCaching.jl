@@ -10,10 +10,10 @@ precompile_test_harness("Inference caching") do load_path
 
         struct ExampleInterpreter <: CC.AbstractInterpreter
             world::UInt
-            cache::CompilerCache
+            cache::CacheHandle
             inf_cache::Vector{CC.InferenceResult}
         end
-        ExampleInterpreter(cache::CompilerCache, world::UInt) =
+        ExampleInterpreter(cache::CacheHandle, world::UInt) =
             ExampleInterpreter(world, cache, CC.InferenceResult[])
 
         CC.InferenceParams(::ExampleInterpreter) = CC.InferenceParams()
@@ -38,7 +38,7 @@ precompile_test_harness("Inference caching") do load_path
         function my_precompile(f, tt)
             world = Base.get_world_counter()
             mi = method_instance(f, tt; world)
-            cache = CompilerCache(:ExampleCompiler)
+            cache = CacheHandle(:ExampleCompiler)
             result = cached_compilation(cache, mi, world;
                 infer=infer, codegen=codegen, link=link)
             @assert result === :codegen_result
@@ -73,22 +73,21 @@ precompile_test_harness("Inference caching") do load_path
         using CompilerCaching
         import ExampleCompiler
 
+        cache = CacheHandle(:ExampleCompiler)
+
         # Check that no cached entry is present
         identity_mi = method_instance(identity, (Int,))
-
-        token = cache_owner(CompilerCache(:ExampleCompiler))
-
-        @test !check_presence(identity_mi, token)
+        @test !check_presence(identity_mi, cache)
 
         using ExampleUser
 
         # Check that kernel survived
         square_mi = method_instance(ExampleUser.square, (Float64,))
-        @test check_presence(square_mi, token)
+        @test check_presence(square_mi, cache)
 
         # check that identity survived
         # TODO:
-        @test check_presence(identity_mi, token) broken=VERSION>=v"1.12.0-DEV.1268"
+        @test check_presence(identity_mi, cache) broken=VERSION>=v"1.12.0-DEV.1268"
 
         # TODO: Check that result survived
     end
