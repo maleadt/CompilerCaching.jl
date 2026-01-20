@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags: ["*"]
+  pull_request_target:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.11'
+          - '1.12'
+          #- '1.13-nightly' # awaiting backports
+          - 'nightly'
+        os:
+          - Linux
+          - Windows
+          - macOS
+        arch:
+          - x64
+          - aarch64
+        exclude:
+          - os: Windows
+            arch: aarch64
+          - os: macOS
+            arch: x64
+        include:
+          - os: Linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: Linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+          - os: Windows
+            arch: x64
+            runner: windows-latest
+          - os: macOS
+            arch: aarch64
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+          arch: ${{ matrix.arch }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+
+  # fetching builds from Buildkite
+  assert_test:
+    name: Julia ${{ matrix.branch }} (assert) - Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ['master']
+        pipeline: ['julia-master']
+        build: ['x86_64-linux-gnuassert']
+        include:
+          - branch: 'release-1.11'
+            pipeline: 'julia-release-1-dot-11'
+            build: 'x86_64-linux-gnuassert'
+          - branch: 'release-1.12'
+            pipeline: 'julia-release-1-dot-12'
+            build: 'x86_64-linux-gnuassert'
+    steps:
+      # First checkout base branch to get trusted download script
+      - uses: actions/checkout@v6
+
+      - name: Download Julia
+        env:
+          BUILDKITE_TOKEN: ${{ secrets.BUILDKITE_TOKEN }}
+        run: |
+          ./.github/download_build.sh ${{ matrix.pipeline }} ${{ matrix.branch }} build_${{ matrix.build }} julia.tar.gz
+          tar -xf julia.tar.gz -C ../
+          rm julia.tar.gz
+          echo $PWD/../julia-*/bin >> $GITHUB_PATH
+
+      # Now checkout PR code for testing
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          clean: false
+
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
