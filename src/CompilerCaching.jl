@@ -57,7 +57,7 @@ A handle to a cache partition. Serves as both configuration and cache owner toke
 struct CacheHandle{K}
     tag::Symbol
     keys::K
-    CacheHandle{K}(tag::Symbol, keys::K) where K = new{K}(tag, keys)
+    CacheHandle{K}(tag::Symbol, keys) where K = new{K}(tag, convert(K, keys))
 end
 
 # Convenience constructor for simple usage without sharding keys
