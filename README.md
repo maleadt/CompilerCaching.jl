@@ -16,9 +16,9 @@ Pkg.add(url="path/to/CompilerCaching")
 
 The basic usage pattern is to create a `CacheHandle` handle and invoke `cached_compilation`
 with three callbacks:
-- `infer`: Perform type inference, store a `CodeInstance` in the cache (via `populate!` or `cache!`), and return the data for codegen
-- `codegen`: Generate serializable code that can be cached across sessions
-- `link`: Generate a session-specific representation (e.g., JIT-compiled function pointer)
+- `emit_ir`: Perform type inference, store a `CodeInstance` in the cache (via `populate!` or `cache!`), and return the IR for code generation
+- `emit_code`: Generate serializable code that can be cached across sessions
+- `emit_executable`: Generate a session-specific representation (e.g., JIT-compiled function pointer)
 
 A `CacheHandle` is a lightweight handle to Julia's global `InternalCodeCache`. Creating
 cache handles is cheap, so they can be constructed on-the-fly right before compilation.
@@ -34,17 +34,17 @@ struct CustomInterpreter <: CC.AbstractInterpreter
 end
 @setup_caching CustomInterpreter.cache
 
-function infer(cache, mi, world)
-    # Let Julia populate the cache and return codeinfos for codegen
+function emit_ir(cache, mi, world)
+    # Let Julia populate the cache and return codeinfos for emit_code
     interp = CustomInterpreter(cache, world)
     return CompilerCaching.populate!(cache, interp, mi)
 end
 
-# generate some IR representation
-function codegen(cache, mi, world, codeinfos) end
+# generate some code representation
+function emit_code(cache, mi, world, ir) end
 
-# compile IR to function pointer
-function link(cache, mi, world, result) end
+# compile code to function pointer
+function emit_executable(cache, mi, world, code) end
 
 function call(f, args...)
     tt = map(Core.Typeof, args)
@@ -53,7 +53,7 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheHandle(:MyCompiler)
-    cached_compilation(cache, mi, world; infer, codegen, link)
+    cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable)
 end
 
 my_function(x::Int) = x + 100
@@ -78,7 +78,7 @@ function call(f, args...; opt_level=1)
                     throw(MethodError(f, args)))
 
     cache = CacheHandle{CacheKey}(:MyCompiler, (; opt_level))
-    cached_compilation(cache, mi, world; infer, codegen, link)
+    cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable)
 end
 ```
 
@@ -111,7 +111,7 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheHandle(:MyCompiler)
-    cached_compilation(cache, mi, world; infer, codegen, link)
+    cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable)
 end
 ```
 
@@ -127,21 +127,21 @@ function really_special end
 add_method(method_table, really_special, (Int,), MyCustomIR([:a, :b]))
 
 # Since we're not relying on Julia's inference, we need to create and cache our own CIs
-function infer(cache, mi, world)
+function emit_ir(cache, mi, world)
     ir = mi.def.source::MyCustomIR
     deps = Core.MethodInstance[]
     for callee in ir.callees
         callee_mi = method_instance(callee.f, callee.tt; world, method_table)
-        cached_inference(cache, callee_mi, world; infer)
+        get_ir(cache, callee_mi, world; emit_ir)
         push!(deps, callee_mi)
     end
     cache!(cache, mi; world, deps)
     return ir
 end
 
-function codegen(cache, mi, world, codeinfos) end
+function emit_code(cache, mi, world, ir) end
 
-function link(cache, mi, world, result) end
+function emit_executable(cache, mi, world, code) end
 
 function call(f, args...)
     tt = Tuple{map(Core.Typeof, args)...}
@@ -150,7 +150,7 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheHandle(:MyCompiler)
-    cached_compilation(cache, mi, world; infer, codegen, link)
+    cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable)
 end
 ```
 

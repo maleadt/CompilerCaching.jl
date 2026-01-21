@@ -58,17 +58,17 @@ CC.method_table(interp::CustomInterpreter) = interp.method_table
 
 ## high-level API
 
-# Inference phase: returns codeinfos, CI is in cache via populate!
-function julia_infer(cache::CacheHandle, mi::Core.MethodInstance, world::UInt)
+# emit_ir phase: returns codeinfos, CI is in cache via populate!
+function julia_emit_ir(cache::CacheHandle, mi::Core.MethodInstance, world::UInt)
     interp = CustomInterpreter(cache, world)
     return CompilerCaching.populate!(cache, interp, mi)
 end
 
-# Codegen phase wrapper: counts compilations for testing
+# emit_code phase wrapper: counts compilations for testing
 const compilations = Ref(0) # for testing
-function julia_codegen_counted(cache::CacheHandle, mi::Core.MethodInstance, world::UInt, codeinfos)
+function julia_emit_code_counted(cache::CacheHandle, mi::Core.MethodInstance, world::UInt, ir)
     compilations[] += 1
-    julia_codegen(cache, mi, world, codeinfos)
+    julia_codegen(cache, mi, world, ir)
 end
 
 """
@@ -109,9 +109,9 @@ end
 end
 function _call_compile(cache, mi, world)
     cached_compilation(cache, mi, world;
-        infer = julia_infer,
-        codegen = julia_codegen_counted,
-        link = julia_jit
+        emit_ir = julia_emit_ir,
+        emit_code = julia_emit_code_counted,
+        emit_executable = julia_jit
     )
 end
 

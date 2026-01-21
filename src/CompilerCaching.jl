@@ -34,10 +34,11 @@ compile_hook() = _COMPILE_HOOK[]
     compile_hook!(f)
     compile_hook!(nothing)
 
-Set the global compile hook. Called at the start of every `cached_compilation`
-invocation with `(cache, mi, world)`. Return value ignored.
+Set the global compile hook. Called at the start of every `cached_inference`,
+`cached_codegen`, or `cached_compilation` invocation with `(cache, mi, world)`.
+Return value ignored.
 
-The hook is called even for fully cached calls that don't re-link.
+The hook is called even for fully cached calls.
 """
 compile_hook!(f) = _COMPILE_HOOK[] = f
 
@@ -77,54 +78,34 @@ Mutable wrapper type to identify our compilation results in the `analysis_result
 This allows multiple compiler plugins to store results on the same CodeInstance.
 
 Fields:
-- `inferred::Any` - Result from inference phase (e.g., codeinfos vector)
-- `linked::Any` - Result from link phase (e.g., function pointer)
+- `ir::Any` - Result from emit_ir phase (e.g., codeinfos vector)
+- `code::Any` - Result from emit_code phase (e.g., CUBIN binary)
+- `executable::Any` - Result from emit_executable phase (e.g., function pointer)
 
 The wrapper is created empty during `cache!` and populated via direct field access.
 """
 mutable struct CachedCompilationResult
-    inferred::Any
-    linked::Any
+    ir::Any
+    code::Any
+    executable::Any
 end
-CachedCompilationResult() = CachedCompilationResult(nothing, nothing)
+CachedCompilationResult() = CachedCompilationResult(nothing, nothing, nothing)
 
 """
-    initialize_result!(caller::CC.InferenceResult)
-
-Create an empty `CachedCompilationResult` wrapper during inference.
-The wrapper will be transferred to the CodeInstance and can later be
-populated via direct field access after the link phase.
-"""
-function initialize_result!(caller::CC.InferenceResult)
-    CC.stack_analysis_result!(caller, CachedCompilationResult())
-end
-
-"""
-    get_result(ci::CodeInstance) -> Union{CachedCompilationResult, Nothing}
+    results(ci::CodeInstance) -> CachedCompilationResult
 
 Retrieve the `CachedCompilationResult` wrapper from a CodeInstance's `analysis_results` chain.
-Returns `nothing` if no wrapper is found.
+Throws if no wrapper is found - this indicates @setup_caching wasn't used correctly.
 """
-function get_result(ci::Core.CodeInstance)
-    CC.traverse_analysis_results(ci) do @nospecialize result
+function results(ci::Core.CodeInstance)
+    result = CC.traverse_analysis_results(ci) do @nospecialize result
         result isa CachedCompilationResult ? result : nothing
     end
+    @assert result !== nothing "CodeInstance missing CachedCompilationResult - ensure @setup_caching is used"
+    return result
 end
 
-"""
-    set_result!(ci::CodeInstance, result)
-
-Populate the `CachedCompilationResult` wrapper's `.linked` field with the compilation result.
-The wrapper must have been created during `cache!`.
-"""
-function set_result!(ci::Core.CodeInstance, result)
-    wrapper = get_result(ci)
-    @assert wrapper !== nothing "CodeInstance without CachedCompilationResult wrapper; Please use `@setup_caching`."
-    wrapper.linked = result
-    return
-end
-
-export CacheHandle, @setup_caching, cached_inference, cached_compilation
+export CacheHandle, @setup_caching, get_ir, get_code, get_executable, cached_compilation
 
 """
     cache_owner(cache::CacheHandle) -> CacheHandle
@@ -155,7 +136,7 @@ macro setup_caching(expr)
         quote
             function $CC.ipo_dataflow_analysis!(interp::$InterpType, opt::$CC.OptimizationState,
                                                 ir::$CC.IRCode, caller::$CC.InferenceResult)
-                $initialize_result!(caller)
+                $CC.stack_analysis_result!(caller, $CachedCompilationResult())
                 @invoke $CC.ipo_dataflow_analysis!(interp::$CC.AbstractInterpreter, opt::$CC.OptimizationState,
                                                    ir::$CC.IRCode, caller::$CC.InferenceResult)
             end
@@ -165,7 +146,7 @@ macro setup_caching(expr)
         quote
             function $CC.ipo_dataflow_analysis!(interp::$InterpType, ir::$CC.IRCode,
                                                 caller::$CC.InferenceResult)
-                $initialize_result!(caller)
+                $CC.stack_analysis_result!(caller, $CachedCompilationResult())
                 @invoke $CC.ipo_dataflow_analysis!(interp::$CC.AbstractInterpreter, ir::$CC.IRCode,
                                                    caller::$CC.InferenceResult)
             end
@@ -443,7 +424,7 @@ function cache!(cache::CacheHandle, mi::Core.MethodInstance;
     cc = code_cache(cache, world)
     edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
 
-    # Create empty wrapper for later population via `set_result!`
+    # Create empty wrapper for later population via `results(ci).field = value`
     ar = CC.AnalysisResults(CachedCompilationResult(), CC.NULL_ANALYSIS_RESULTS)
 
     @static if VERSION >= v"1.12-"
@@ -464,93 +445,123 @@ function cache!(cache::CacheHandle, mi::Core.MethodInstance;
 end
 
 #==============================================================================#
-# Cached inference - dependency discovery without full compilation
+# get_ir - IR generation phase
 #==============================================================================#
 
 """
-    cached_inference(cache, mi, world; infer) -> (CodeInstance, result_or_nothing)
+    get_ir(cache, mi, world; emit_ir) -> (CodeInstance, ir)
 
-Run only the inference phase for a method instance without codegen or link.
+Run only the IR generation phase for a method instance.
 
-This is useful when recursively processing dependencies during the infer phase:
+This is useful when recursively processing dependencies during the emit_ir phase:
 you want to establish the dependency tracking (creating CodeInstances with backedges)
-without running codegen/link for each callee.
+without running emit_code/emit_executable for each callee.
 
-The `infer` callback must:
-1. Return the inference result (opaque to the caching layer)
+The `emit_ir` callback must:
+1. Return the IR result (opaque to the caching layer)
 2. Ensure a CodeInstance is stored in the cache via `cache!` or `populate!`
 
-Returns `(ci, result)` where `result` is from the infer callback,
-or `nothing` if the CI was already cached without a stored result.
+Returns `(ci, ir)` where `ir` is from the emit_ir callback or the cached result.
 """
-function cached_inference(cache::CacheHandle, mi::Core.MethodInstance,
-                          world::UInt; infer)
-    ci = lookup(cache, mi; world)
-    if ci !== nothing
-        # Check if we have cached infer result
-        wrapper = get_result(ci)
-        if wrapper !== nothing && wrapper.inferred !== nothing
-            return ci, wrapper.inferred
-        end
-        # CI exists but no cached infer result (e.g., Julia-created CI)
-        return ci, nothing
-    end
-
-    # Run infer - it must create CI via populate! or cache!
-    result = infer(cache, mi, world)
-
-    # Look up the CI that was created during infer
-    ci = lookup(cache, mi; world)
-    @assert ci !== nothing "infer must create a CodeInstance via cache! or populate!"
-
-    # Store infer result for cache hit retrieval
-    wrapper = get_result(ci)
-    if wrapper !== nothing
-        wrapper.inferred = result
-    end
-
-    return ci, result
-end
-
-#==============================================================================#
-# Cached compilation - main API
-#==============================================================================#
-
-"""
-    cached_compilation(cache, mi, world; infer, codegen, link) -> result
-
-Three-phase cached compilation with automatic invalidation.
-"""
-function cached_compilation(cache::CacheHandle, mi::Core.MethodInstance,
-                            world::UInt; infer, codegen, link)
+function get_ir(cache::CacheHandle, mi::Core.MethodInstance,
+                world::UInt; emit_ir)
     # Call compile hook if set (even on cache hit)
     hook = compile_hook()
     if hook !== nothing
         hook(cache, mi, world)
     end
 
-    # 1. Run inference phase (checks cache internally, returns early if CI exists)
-    ci, inferred = cached_inference(cache, mi, world; infer)
-
-    # 2. Check for cached linked result
-    wrapper = get_result(ci)
-    if wrapper !== nothing && wrapper.linked !== nothing
-        return wrapper.linked
+    ci = lookup(cache, mi; world)
+    if ci !== nothing
+        wrapper = results(ci)
+        if wrapper.ir !== nothing
+            return ci, wrapper.ir
+        end
     end
 
-    # 3. Run codegen
-    # Need inferred result for codegen - re-run infer if we had a cache hit on CI
-    if inferred === nothing
-        inferred = infer(cache, mi, world)
+    # Run emit_ir - it must create CI via populate! or cache!
+    ir = emit_ir(cache, mi, world)
+
+    ci = lookup(cache, mi; world)
+    @assert ci !== nothing "emit_ir must create a CodeInstance via cache! or populate!"
+
+    results(ci).ir = ir
+    return ci, ir
+end
+
+#==============================================================================#
+# get_code - code generation phase
+#==============================================================================#
+
+"""
+    get_code(cache, mi, world; emit_ir, emit_code) -> (CodeInstance, code)
+
+Run IR and code generation phases for a method instance.
+
+Useful for reflection tools (e.g., `code_cubin`) that need the generated code
+but don't need to load it into memory/GPU.
+
+Returns the cached `code` result if available, otherwise runs `emit_ir` and `emit_code`.
+"""
+function get_code(cache::CacheHandle, mi::Core.MethodInstance,
+                  world::UInt; emit_ir, emit_code)
+    ci, ir = get_ir(cache, mi, world; emit_ir)
+
+    wrapper = results(ci)
+    if wrapper.code !== nothing
+        return ci, wrapper.code
     end
 
-    compiled = codegen(cache, mi, world, inferred)
+    code = emit_code(cache, mi, world, ir)
+    wrapper.code = code
+    return ci, code
+end
 
-    # 4. Link and store result
-    linked = link(cache, mi, world, compiled)
-    set_result!(ci, linked)
+#==============================================================================#
+# get_executable - executable generation phase
+#==============================================================================#
 
-    return linked
+"""
+    get_executable(cache, mi, world; emit_ir, emit_code, emit_executable) -> (CodeInstance, executable)
+
+Run all three phases (IR, code, executable) for a method instance.
+
+Returns `(ci, executable)` where `executable` is the final linked/loaded result.
+"""
+function get_executable(cache::CacheHandle, mi::Core.MethodInstance,
+                        world::UInt; emit_ir, emit_code, emit_executable)
+    # Run emit_ir + emit_code (cached internally, hook fires in get_ir)
+    ci, code = get_code(cache, mi, world; emit_ir, emit_code)
+
+    # Check for cached executable result
+    wrapper = results(ci)
+    if wrapper.executable !== nothing
+        return ci, wrapper.executable
+    end
+
+    # Generate executable and store result
+    executable = emit_executable(cache, mi, world, code)
+    wrapper.executable = executable
+
+    return ci, executable
+end
+
+#==============================================================================#
+# cached_compilation - convenience API
+#==============================================================================#
+
+"""
+    cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable) -> executable
+
+Three-phase cached compilation with automatic invalidation.
+
+This is a convenience wrapper around `get_executable` that returns only the
+executable result (not the CodeInstance).
+"""
+function cached_compilation(cache::CacheHandle, mi::Core.MethodInstance,
+                            world::UInt; emit_ir, emit_code, emit_executable)
+    _, executable = get_executable(cache, mi, world; emit_ir, emit_code, emit_executable)
+    return executable
 end
 
 end # module CompilerCaching

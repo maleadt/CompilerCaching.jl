@@ -4,7 +4,7 @@
 # - Demonstrates: caching, redefinition, multiple dispatch
 
 using CompilerCaching: CacheHandle, add_method, method_instance, cache!,
-                       cached_inference, cached_compilation
+                       get_ir, cached_compilation
 
 
 Base.Experimental.@MethodTable method_table
@@ -36,14 +36,14 @@ function interpret(cache, world, expr, deps)
             return interpret(cache, world, base, deps) ^ interpret(cache, world, exp, deps)
         end
 
-        # Call to function in our method table. This triggers recursive inference.
+        # Call to function in our method table. This triggers recursive IR generation.
         if head === :call
             f = only(args)::Function
             mi = @something(method_instance(f, (); world, method_table),
                             error("Unknown function: $f"))
-            _, result = cached_inference(cache, mi, world; infer)
+            _, ir = get_ir(cache, mi, world; emit_ir)
             push!(deps, mi)
-            return result
+            return ir
         end
 
         error("Unknown expression head: $head")
@@ -53,19 +53,19 @@ function interpret(cache, world, expr, deps)
 end
 
 const compilations = Ref(0)
-function infer(cache, mi, world)
-    ir = mi.def.source::Expr
+function emit_ir(cache, mi, world)
+    source_ir = mi.def.source::Expr
     deps = Core.MethodInstance[]
     compilations[] += 1
 
-    result = interpret(cache, world, ir, deps)
+    result = interpret(cache, world, source_ir, deps)
     cache!(cache, mi; world, deps)
     return result
 end
 
 # simple pass-through
-codegen(cache, mi, world, result) = result
-link(cache, mi, world, result) = result
+emit_code(cache, mi, world, ir) = ir
+emit_executable(cache, mi, world, code) = code
 
 
 ## high-level API
@@ -77,7 +77,7 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheHandle(:ForeignExample)
-    cached_compilation(cache, mi, world; infer, codegen, link)
+    cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable)
 end
 
 

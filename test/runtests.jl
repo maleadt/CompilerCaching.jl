@@ -5,15 +5,15 @@ using Base.Experimental: @MethodTable
 # Test helper: wraps simple compile functions in three-phase API
 function simple_cached_compilation(compile_fn, cache::CacheHandle, mi, world)
     cached_compilation(cache, mi, world;
-        infer = (c, m, w) -> begin
+        emit_ir = (c, m, w) -> begin
             result = compile_fn(m)
             CompilerCaching.cache!(c, m; world=w)
             result
         end,
 
         # passthrough
-        codegen = (c, m, w, result) -> result,
-        link = (c, m, w, result) -> result
+        emit_code = (c, m, w, ir) -> ir,
+        emit_executable = (c, m, w, code) -> code
     )
 end
 
@@ -169,28 +169,28 @@ end
     @test mi !== nothing
 
     # Minimal callbacks for cached_compilation
-    infer_fn = (cache, mi, world) -> begin
+    emit_ir_fn = (cache, mi, world) -> begin
         CompilerCaching.cache!(cache, mi; world)
         nothing
     end
-    codegen_fn = (cache, mi, world, result) -> :ir_data
-    link_fn = (cache, mi, world, ir_data) -> :result
+    emit_code_fn = (cache, mi, world, ir) -> :code_data
+    emit_executable_fn = (cache, mi, world, code) -> :result
 
     # Test 1: Hook called on cache miss
     compile_hook!() do cache, mi, world
         push!(calls, :called)
     end
 
-    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    cached_compilation(cache, mi, world; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
     @test length(calls) == 1
 
     # Test 2: Hook called on cache hit (key behavior!)
-    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    cached_compilation(cache, mi, world; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
     @test length(calls) == 2  # Called again even though cached
 
     # Test 3: No hook when disabled
     compile_hook!(nothing)
-    cached_compilation(cache, mi, world; infer=infer_fn, codegen=codegen_fn, link=link_fn)
+    cached_compilation(cache, mi, world; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
     @test length(calls) == 2  # No new call
 
     # Test 4: Getter returns current hook
@@ -319,23 +319,23 @@ end
     child_compile_count = Ref(0)
     parent_compile_count = Ref(0)
 
-    # Child infer: creates CI with no deps
-    function child_infer(c, m, w)
+    # Child emit_ir: creates CI with no deps
+    function child_emit_ir(c, m, w)
         child_compile_count[] += 1
         cache!(c, m; world=w)
-        :child_compiled
+        :child_ir
     end
 
-    # Parent infer: creates CI with dependency on child
-    function parent_infer(c, m, w)
+    # Parent emit_ir: creates CI with dependency on child
+    function parent_emit_ir(c, m, w)
         parent_compile_count[] += 1
         child_mi = method_instance(child_node, (Int,); world=w, method_table)
         cache!(c, m; world=w, deps=[child_mi])
-        :parent_compiled
+        :parent_ir
     end
 
-    passthrough_codegen(c, m, w, result) = result
-    passthrough_link(c, m, w, r) = r
+    passthrough_emit_code(c, m, w, ir) = ir
+    passthrough_emit_executable(c, m, w, code) = code
 
     world = Base.get_world_counter()
     child_mi = method_instance(child_node, (Int,); world, method_table)
@@ -343,19 +343,19 @@ end
 
     # Compile child first
     cached_compilation(cache, child_mi, world;
-        infer = child_infer, codegen = passthrough_codegen, link = passthrough_link)
+        emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test child_compile_count[] == 1
 
     # Compile parent (depends on child)
     cached_compilation(cache, parent_mi, world;
-        infer = parent_infer, codegen = passthrough_codegen, link = passthrough_link)
+        emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test parent_compile_count[] == 1
 
     # Cache hits
     cached_compilation(cache, child_mi, world;
-        infer = child_infer, codegen = passthrough_codegen, link = passthrough_link)
+        emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     cached_compilation(cache, parent_mi, world;
-        infer = parent_infer, codegen = passthrough_codegen, link = passthrough_link)
+        emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test child_compile_count[] == 1
     @test parent_compile_count[] == 1
 
@@ -364,13 +364,13 @@ end
     world = Base.get_world_counter()
     child_mi = method_instance(child_node, (Int,); world, method_table)
     cached_compilation(cache, child_mi, world;
-        infer = child_infer, codegen = passthrough_codegen, link = passthrough_link)
+        emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test child_compile_count[] == 2
 
     # Parent should also recompile due to dependency
     parent_mi = method_instance(parent_node, (Int,); world, method_table)
     cached_compilation(cache, parent_mi, world;
-        infer = parent_infer, codegen = passthrough_codegen, link = passthrough_link)
+        emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test parent_compile_count[] == 2
 end
 
