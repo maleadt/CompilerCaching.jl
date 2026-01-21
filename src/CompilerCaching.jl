@@ -130,32 +130,27 @@ macro setup_caching(expr)
         cache_field = cache_field.value
     end
 
-    # Generate the appropriate ipo_dataflow_analysis! signature based on Julia version
-    ipo_method = if hasmethod(CC.ipo_dataflow_analysis!, Tuple{CC.AbstractInterpreter, CC.OptimizationState, CC.IRCode, CC.InferenceResult})
-        # Julia 1.12+: (interp, opt, ir, result)
+    finish_method = if hasmethod(CC.finish!, Tuple{CC.AbstractInterpreter, CC.InferenceState, UInt, UInt64})
         quote
-            function $CC.ipo_dataflow_analysis!(interp::$InterpType, opt::$CC.OptimizationState,
-                                                ir::$CC.IRCode, caller::$CC.InferenceResult)
-                $CC.stack_analysis_result!(caller, $CachedCompilationResult())
-                @invoke $CC.ipo_dataflow_analysis!(interp::$CC.AbstractInterpreter, opt::$CC.OptimizationState,
-                                                   ir::$CC.IRCode, caller::$CC.InferenceResult)
+            function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState,
+                                 validation_world::UInt, time_before::UInt64)
+                $CC.stack_analysis_result!(caller.result, $CachedCompilationResult())
+                @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState,
+                                    validation_world::UInt, time_before::UInt64)
             end
         end
     else
-        # Julia 1.11: (interp, ir, result)
         quote
-            function $CC.ipo_dataflow_analysis!(interp::$InterpType, ir::$CC.IRCode,
-                                                caller::$CC.InferenceResult)
-                $CC.stack_analysis_result!(caller, $CachedCompilationResult())
-                @invoke $CC.ipo_dataflow_analysis!(interp::$CC.AbstractInterpreter, ir::$CC.IRCode,
-                                                   caller::$CC.InferenceResult)
+            function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState)
+                $CC.stack_analysis_result!(caller.result, $CachedCompilationResult())
+                @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState)
             end
         end
     end
 
     quote
         $CC.cache_owner(interp::$InterpType) = $cache_owner(interp.$cache_field)
-        $ipo_method
+        $finish_method
     end |> esc
 end
 
