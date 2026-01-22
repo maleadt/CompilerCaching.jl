@@ -17,16 +17,16 @@ using Base.Experimental: @MethodTable, @overlay
 
 struct CustomInterpreter <: CC.AbstractInterpreter
     world::UInt
-    view::CacheView
+    cache::CacheView
     method_table::CC.OverlayMethodTable
     inf_cache::Vector{CC.InferenceResult}
     inf_params::CC.InferenceParams
     opt_params::CC.OptimizationParams
 
-    function CustomInterpreter(view::CacheView)
-        @assert view.world <= get_world_counter()
-        new(view.world, view,
-            CC.OverlayMethodTable(view.world, CUSTOM_MT),
+    function CustomInterpreter(cache::CacheView)
+        @assert cache.world <= get_world_counter()
+        new(cache.world, cache,
+            CC.OverlayMethodTable(cache.world, CUSTOM_MT),
             Vector{CC.InferenceResult}(),
             CC.InferenceParams(),
             CC.OptimizationParams()
@@ -50,22 +50,22 @@ CC.unlock_mi_inference(::CustomInterpreter, ::Core.MethodInstance) = nothing
 CC.method_table(interp::CustomInterpreter) = interp.method_table
 
 # integration with CompilerCaching.jl
-@setup_caching CustomInterpreter.view
+@setup_caching CustomInterpreter.cache
 
 
 ## high-level API
 
 # emit_ir phase: returns codeinfos, CI is in cache via populate!
-function julia_emit_ir(view::CacheView, mi::Core.MethodInstance)
-    interp = CustomInterpreter(view)
-    return CompilerCaching.populate!(view, interp, mi)
+function julia_emit_ir(cache::CacheView, mi::Core.MethodInstance)
+    interp = CustomInterpreter(cache)
+    return CompilerCaching.populate!(cache, interp, mi)
 end
 
 # emit_code phase wrapper: counts compilations for testing
 const compilations = Ref(0) # for testing
-function julia_emit_code_counted(view::CacheView, mi::Core.MethodInstance, ir)
+function julia_emit_code_counted(cache::CacheView, mi::Core.MethodInstance, ir)
     compilations[] += 1
-    julia_codegen(view, mi, ir)
+    julia_codegen(cache, mi, ir)
 end
 
 """
@@ -99,13 +99,13 @@ end
                         method_instance(f, $argtypes; world),
                         throw(MethodError(f, $argtypes)))
 
-        view = CacheView(:NativeExample, world)
-        ptr = _call_compile(view, mi)
+        cache = CacheView(:NativeExample, world)
+        ptr = _call_compile(cache, mi)
         ccall(ptr, R, $ccall_types, $(argexprs...))
     end
 end
-function _call_compile(view, mi)
-    cached_compilation(view, mi;
+function _call_compile(cache, mi)
+    cached_compilation(cache, mi;
         emit_ir = julia_emit_ir,
         emit_code = julia_emit_code_counted,
         emit_executable = julia_jit

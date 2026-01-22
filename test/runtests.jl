@@ -153,7 +153,7 @@ end
         @test ir === nothing  # 1.11 uses callback-based codegen
     end
 
-    # Test const-return functions get CachedCompilationResult wrapper
+    # Test const-return functions get CompilationResult wrapper
     # These functions return a constant and skip optimization, but finish! should still be called
     const_return_fn(x::Int) = nothing  # Returns constant `nothing`
     world2 = Base.get_world_counter()
@@ -170,7 +170,7 @@ end
     @test Core.Compiler.use_const_api(ci2) skip=(Base.JLOptions().code_coverage > 0)
     # The key test: finish! hook should have stacked our wrapper even for const-return
     wrapper = CompilerCaching.results(ci2)
-    @test wrapper isa CompilerCaching.CachedCompilationResult
+    @test wrapper isa CompilerCaching.CompilationResult
 end
 
 @testset "compilation hook" begin

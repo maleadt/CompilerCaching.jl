@@ -30,11 +30,11 @@ precompile_test_harness("Inference caching") do load_path
 
         struct ExampleInterpreter <: CC.AbstractInterpreter
             world::UInt
-            view::CacheView
+            cache::CacheView
             inf_cache::Vector{CC.InferenceResult}
         end
-        ExampleInterpreter(view::CacheView) =
-            ExampleInterpreter(view.world, view, CC.InferenceResult[])
+        ExampleInterpreter(cache::CacheView) =
+            ExampleInterpreter(cache.world, cache, CC.InferenceResult[])
 
         CC.InferenceParams(::ExampleInterpreter) = CC.InferenceParams()
         CC.OptimizationParams(::ExampleInterpreter) = CC.OptimizationParams()
@@ -46,21 +46,21 @@ precompile_test_harness("Inference caching") do load_path
         end
         CC.lock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
         CC.unlock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
-        @setup_caching ExampleInterpreter.view
+        @setup_caching ExampleInterpreter.cache
 
         emit_code_count = Ref(0)
-        function emit_ir(view, mi)
-            interp = ExampleInterpreter(view)
-            populate!(view, interp, mi)
+        function emit_ir(cache, mi)
+            interp = ExampleInterpreter(cache)
+            populate!(cache, interp, mi)
         end
-        emit_code(view, mi, ir) = (emit_code_count[] += 1; :code_result)
-        emit_executable(view, mi, code) = code
+        emit_code(cache, mi, ir) = (emit_code_count[] += 1; :code_result)
+        emit_executable(cache, mi, code) = code
 
         function precompile(f, tt)
             world = Base.get_world_counter()
             mi = method_instance(f, tt; world)
-            view = CacheView(:ExampleCompiler, world)
-            result = cached_compilation(view, mi;
+            cache = CacheView(:ExampleCompiler, world)
+            result = cached_compilation(cache, mi;
                 emit_ir=emit_ir, emit_code=emit_code, emit_executable=emit_executable)
             @assert result === :code_result
         end

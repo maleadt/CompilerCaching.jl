@@ -35,7 +35,7 @@ compile_hook() = _COMPILE_HOOK[]
     compile_hook!(nothing)
 
 Set the global compile hook. Called at the start of every `cached_inference`,
-`cached_codegen`, or `cached_compilation` invocation with `(view, mi)`.
+`cached_codegen`, or `cached_compilation` invocation with `(cache, mi)`.
 Return value ignored.
 
 The hook is called even for fully cached calls.
@@ -43,13 +43,15 @@ The hook is called even for fully cached calls.
 compile_hook!(f) = _COMPILE_HOOK[] = f
 
 #==============================================================================#
-# CacheView - main entry point with bundled world age
+# CacheView structure
 #==============================================================================#
+
+export CacheView, @setup_caching
 
 """
     CacheView{K}
 
-A view into a cache partition at a specific world age. Serves as the main entry point
+A cache into a cache partition at a specific world age. Serves as the main entry point
 for cached compilation.
 
 - `tag::Symbol` - Base identifier (e.g., `:SynchJulia`, `:GPUCompiler`)
@@ -65,53 +67,6 @@ end
 
 # Convenience constructor for simple usage without sharding keys
 CacheView(tag::Symbol, world::UInt) = CacheView{Nothing}(tag, world, nothing)
-
-#==============================================================================#
-# CachedCompilationResult - wrapper for analysis_results storage
-#==============================================================================#
-
-"""
-    CachedCompilationResult
-
-Mutable wrapper type to identify our compilation results in the `analysis_results` chain.
-This allows multiple compiler plugins to store results on the same CodeInstance.
-
-Fields:
-- `ir::Any` - Result from emit_ir phase (e.g., codeinfos vector)
-- `code::Any` - Result from emit_code phase (e.g., CUBIN binary)
-- `executable::Any` - Result from emit_executable phase (e.g., function pointer)
-
-The wrapper is created empty during `create_ci` and populated via direct field access.
-"""
-mutable struct CachedCompilationResult
-    ir::Any
-    code::Any
-    executable::Any
-end
-CachedCompilationResult() = CachedCompilationResult(nothing, nothing, nothing)
-
-"""
-    results(ci::CodeInstance) -> CachedCompilationResult
-
-Retrieve the `CachedCompilationResult` wrapper from a CodeInstance's `analysis_results` chain.
-Throws if no wrapper is found - this indicates @setup_caching wasn't used correctly.
-"""
-function results(ci::Core.CodeInstance)
-    result = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CachedCompilationResult ? result : nothing
-    end
-    @assert result !== nothing "CodeInstance missing CachedCompilationResult - ensure @setup_caching is used"
-    return result
-end
-
-export CacheView, @setup_caching, get_ir, get_code, get_executable, cached_compilation
-
-"""
-    cache_owner(view::CacheView)
-
-Returns a token for use as CodeInstance.owner.
-"""
-cache_owner(view::CacheView) = (view.tag, view.keys)
 
 """
     @setup_caching InterpreterType.cache_field
@@ -133,7 +88,7 @@ macro setup_caching(expr)
         quote
             function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState,
                                  validation_world::UInt, time_before::UInt64)
-                $CC.stack_analysis_result!(caller.result, $CachedCompilationResult())
+                $CC.stack_analysis_result!(caller.result, $CompilationResult())
                 @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState,
                                     validation_world::UInt, time_before::UInt64)
             end
@@ -141,7 +96,7 @@ macro setup_caching(expr)
     else
         quote
             function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState)
-                $CC.stack_analysis_result!(caller.result, $CachedCompilationResult())
+                $CC.stack_analysis_result!(caller.result, $CompilationResult())
                 @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState)
             end
         end
@@ -153,9 +108,73 @@ macro setup_caching(expr)
     end |> esc
 end
 
+"""
+    cache_owner(cache::CacheView)
+
+Returns a token for use as CodeInstance.owner.
+"""
+cache_owner(cache::CacheView) = (cache.tag, cache.keys)
+
+@static if VERSION >= v"1.14-"
+    function code_cache(cache::CacheView)
+        world_range = CC.WorldRange(cache.world)
+        return CC.InternalCodeCache(cache_owner(cache), world_range)
+    end
+else
+    function code_cache(cache::CacheView)
+        cc = CC.InternalCodeCache(cache_owner(cache))
+        return CC.WorldView(cc, cache.world)
+    end
+end
+
+# Expose InternalCodeCache functionality
+Base.haskey(cache::CacheView, mi::Core.MethodInstance) = CC.haskey(code_cache(cache), mi)
+Base.get(cache::CacheView, mi::Core.MethodInstance, default) = CC.get(code_cache(cache), mi, default)
+Base.getindex(cache::CacheView, mi::Core.MethodInstance) = CC.getindex(code_cache(cache), mi)
+Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance) = CC.setindex!(code_cache(cache), ci, mi)
+
 
 #==============================================================================#
-# Method registration
+# CompilationResult - wrapper for analysis_results storage
+#==============================================================================#
+
+"""
+    CompilationResult
+
+Mutable wrapper type to identify our compilation results in the `analysis_results` chain.
+This allows multiple compiler plugins to store results on the same CodeInstance.
+
+Fields:
+- `ir::Any` - Result from emit_ir phase (e.g., codeinfos vector)
+- `code::Any` - Result from emit_code phase (e.g., CUBIN binary)
+- `executable::Any` - Result from emit_executable phase (e.g., function pointer)
+
+The wrapper is created empty during `create_ci` and populated via direct field access.
+"""
+mutable struct CompilationResult
+    ir::Any
+    code::Any
+    executable::Any
+end
+CompilationResult() = CompilationResult(nothing, nothing, nothing)
+
+"""
+    results(ci::CodeInstance) -> CompilationResult
+
+Retrieve the `CompilationResult` wrapper from a CodeInstance's `analysis_results` chain.
+Throws if no wrapper is found - this indicates @setup_caching wasn't used correctly.
+"""
+function results(ci::Core.CodeInstance)
+    result = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CompilationResult ? result : nothing
+    end
+    @assert result !== nothing "CodeInstance missing CompilationResult - ensure @setup_caching is used"
+    return result
+end
+
+
+#==============================================================================#
+# Foreign method registration
 #==============================================================================#
 
 export add_method
@@ -230,14 +249,15 @@ Returns `nothing` if no matching method is found.
 """
 method_instance
 
+
 #==============================================================================#
-# Inference helpers
+# Populating the cache
 #==============================================================================#
 
 export populate!, create_ci
 
 """
-    populate!(view, interp, mi) -> Vector{Pair{CodeInstance, Union{CodeInfo, Nothing}}}
+    populate!(cache, interp, mi) -> Vector{Pair{CodeInstance, Union{CodeInfo, Nothing}}}
 
 Populate the code cache with CodeInstances for `mi` and its callees.
 
@@ -251,7 +271,7 @@ Returns a vector of (CodeInstance, IR) pairs where:
 
 The root CI is always the first entry: `first(result)[1]`
 """
-function populate!(view::CacheView, interp::CC.AbstractInterpreter,
+function populate!(cache::CacheView, interp::CC.AbstractInterpreter,
                    mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
         # Modern API: returns CodeInstance, use SOURCE_MODE to control caching
@@ -331,7 +351,7 @@ function populate!(view::CacheView, interp::CC.AbstractInterpreter,
         src = CC.typeinf_ext_toplevel(interp, mi)
 
         # Handle const-return case where ci.inferred may be nothing
-        ci = get(view, mi, nothing)
+        ci = get(cache, mi, nothing)
         @assert ci !== nothing "Inference of $mi failed"
         if ci.inferred === nothing
             @atomic ci.inferred = src
@@ -342,27 +362,37 @@ function populate!(view::CacheView, interp::CC.AbstractInterpreter,
     end
 end
 
-#==============================================================================#
-# Internal cache helpers
-#==============================================================================#
+"""
+    create_ci(cache, mi; deps) -> CodeInstance
 
-@static if VERSION >= v"1.14-"
-    function code_cache(view::CacheView)
-        world_range = CC.WorldRange(view.world)
-        return CC.InternalCodeCache(cache_owner(view), world_range)
+Create a CodeInstance for `mi` with proper owner and backedges.
+
+Used for foreign mode where inference doesn't run. The CI participates in
+Julia's invalidation mechanism via backedges registered from `deps`.
+"""
+function create_ci(cache::CacheView, mi::Core.MethodInstance;
+                   deps::Vector{Core.MethodInstance}=Core.MethodInstance[])
+    owner = cache_owner(cache)
+    edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
+
+    # Create empty wrapper for later population via `results(ci).field = value`
+    ar = CC.AnalysisResults(CompilationResult(), CC.NULL_ANALYSIS_RESULTS)
+
+    @static if VERSION >= v"1.12-"
+        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
+            Int32(0), cache.world, typemax(UInt), UInt32(0), ar, nothing, edges)
+    else
+        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
+            Int32(0), cache.world, typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
     end
-else
-    function code_cache(view::CacheView)
-        cc = CC.InternalCodeCache(cache_owner(view))
-        return CC.WorldView(cc, view.world)
+
+    # Register backedges for automatic invalidation
+    if !isempty(deps)
+        store_backedges(mi, ci, deps)
     end
+
+    return ci
 end
-
-# Dict-like interface delegating to CC methods on code_cache(view)
-Base.haskey(view::CacheView, mi::Core.MethodInstance) = CC.haskey(code_cache(view), mi)
-Base.get(view::CacheView, mi::Core.MethodInstance, default) = CC.get(code_cache(view), mi, default)
-Base.getindex(view::CacheView, mi::Core.MethodInstance) = CC.getindex(code_cache(view), mi)
-Base.setindex!(view::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance) = CC.setindex!(code_cache(view), ci, mi)
 
 """
     store_backedges(mi::MethodInstance, ci::CodeInstance, deps::Vector{MethodInstance})
@@ -393,44 +423,14 @@ function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
     nothing
 end
 
-"""
-    create_ci(view, mi; deps) -> CodeInstance
-
-Create a CodeInstance for `mi` with proper owner and backedges.
-
-Used for foreign mode where inference doesn't run. The CI participates in
-Julia's invalidation mechanism via backedges registered from `deps`.
-"""
-function create_ci(view::CacheView, mi::Core.MethodInstance;
-                   deps::Vector{Core.MethodInstance}=Core.MethodInstance[])
-    owner = cache_owner(view)
-    edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
-
-    # Create empty wrapper for later population via `results(ci).field = value`
-    ar = CC.AnalysisResults(CachedCompilationResult(), CC.NULL_ANALYSIS_RESULTS)
-
-    @static if VERSION >= v"1.12-"
-        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), view.world, typemax(UInt), UInt32(0), ar, nothing, edges)
-    else
-        ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), view.world, typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
-    end
-
-    # Register backedges for automatic invalidation
-    if !isempty(deps)
-        store_backedges(mi, ci, deps)
-    end
-
-    return ci
-end
-
 #==============================================================================#
-# get_ir - IR generation phase
+# Compilation phases
 #==============================================================================#
 
+export get_ir, get_code, get_executable, cached_compilation
+
 """
-    get_ir(view, mi; emit_ir) -> (CodeInstance, ir)
+    get_ir(cache, mi; emit_ir) -> (CodeInstance, ir)
 
 Run only the IR generation phase for a method instance.
 
@@ -438,20 +438,20 @@ This is useful when recursively processing dependencies during the emit_ir phase
 you want to establish the dependency tracking (creating CodeInstances with backedges)
 without running emit_code/emit_executable for each callee.
 
-The `emit_ir(view, mi)` callback must:
+The `emit_ir(cache, mi)` callback must:
 1. Return the IR result (opaque to the caching layer)
-2. Store a CodeInstance in the cache via `view[mi] = create_ci(...)` or `populate!`
+2. Store a CodeInstance in the cache via `cache[mi] = create_ci(...)` or `populate!`
 
 Returns `(ci, ir)` where `ir` is from the emit_ir callback or the cached result.
 """
-function get_ir(view::CacheView, mi::Core.MethodInstance; emit_ir)
+function get_ir(cache::CacheView, mi::Core.MethodInstance; emit_ir)
     # Call compile hook if set (even on cache hit)
     hook = compile_hook()
     if hook !== nothing
-        hook(view, mi)
+        hook(cache, mi)
     end
 
-    ci = get(view, mi, nothing)
+    ci = get(cache, mi, nothing)
     if ci !== nothing
         wrapper = results(ci)
         if wrapper.ir !== nothing
@@ -459,62 +459,54 @@ function get_ir(view::CacheView, mi::Core.MethodInstance; emit_ir)
         end
     end
 
-    # Run emit_ir - it must store CI via view[mi] = create_ci(...) or populate!
-    ir = emit_ir(view, mi)
+    # Run emit_ir - it must store CI via cache[mi] = create_ci(...) or populate!
+    ir = emit_ir(cache, mi)
 
-    ci = get(view, mi, nothing)
-    @assert ci !== nothing "emit_ir must store a CodeInstance via view[mi] = create_ci(...) or populate!"
+    ci = get(cache, mi, nothing)
+    @assert ci !== nothing "emit_ir must store a CodeInstance via cache[mi] = create_ci(...) or populate!"
 
     results(ci).ir = ir
     return ci, ir
 end
 
-#==============================================================================#
-# get_code - code generation phase
-#==============================================================================#
-
 """
-    get_code(view, mi; emit_ir, emit_code) -> (CodeInstance, code)
+    get_code(cache, mi; emit_ir, emit_code) -> (CodeInstance, code)
 
 Run IR and code generation phases for a method instance.
 
 Useful for reflection tools (e.g., `code_cubin`) that need the generated code
 but don't need to load it into memory/GPU.
 
-The `emit_code(view, mi, ir)` callback receives the IR from emit_ir.
+The `emit_code(cache, mi, ir)` callback receives the IR from emit_ir.
 
 Returns the cached `code` result if available, otherwise runs `emit_ir` and `emit_code`.
 """
-function get_code(view::CacheView, mi::Core.MethodInstance; emit_ir, emit_code)
-    ci, ir = get_ir(view, mi; emit_ir)
+function get_code(cache::CacheView, mi::Core.MethodInstance; emit_ir, emit_code)
+    ci, ir = get_ir(cache, mi; emit_ir)
 
     wrapper = results(ci)
     if wrapper.code !== nothing
         return ci, wrapper.code
     end
 
-    code = emit_code(view, mi, ir)
+    code = emit_code(cache, mi, ir)
     wrapper.code = code
     return ci, code
 end
 
-#==============================================================================#
-# get_executable - executable generation phase
-#==============================================================================#
-
 """
-    get_executable(view, mi; emit_ir, emit_code, emit_executable) -> (CodeInstance, executable)
+    get_executable(cache, mi; emit_ir, emit_code, emit_executable) -> (CodeInstance, executable)
 
 Run all three phases (IR, code, executable) for a method instance.
 
-The `emit_executable(view, mi, code)` callback receives the code from emit_code.
+The `emit_executable(cache, mi, code)` callback receives the code from emit_code.
 
 Returns `(ci, executable)` where `executable` is the final linked/loaded result.
 """
-function get_executable(view::CacheView, mi::Core.MethodInstance;
+function get_executable(cache::CacheView, mi::Core.MethodInstance;
                         emit_ir, emit_code, emit_executable)
     # Run emit_ir + emit_code (cached internally, hook fires in get_ir)
-    ci, code = get_code(view, mi; emit_ir, emit_code)
+    ci, code = get_code(cache, mi; emit_ir, emit_code)
 
     # Check for cached executable result
     wrapper = results(ci)
@@ -523,32 +515,28 @@ function get_executable(view::CacheView, mi::Core.MethodInstance;
     end
 
     # Generate executable and store result
-    executable = emit_executable(view, mi, code)
+    executable = emit_executable(cache, mi, code)
     wrapper.executable = executable
 
     return ci, executable
 end
 
-#==============================================================================#
-# cached_compilation - convenience API
-#==============================================================================#
-
 """
-    cached_compilation(view, mi; emit_ir, emit_code, emit_executable) -> executable
+    cached_compilation(cache, mi; emit_ir, emit_code, emit_executable) -> executable
 
 Three-phase cached compilation with automatic invalidation.
 
 Callbacks:
-- `emit_ir(view, mi)` - Generate IR, must store CI via `view[mi] = create_ci(...)` or `populate!`
-- `emit_code(view, mi, ir)` - Generate code from IR
-- `emit_executable(view, mi, code)` - Generate executable from code
+- `emit_ir(cache, mi)` - Generate IR, must store CI via `cache[mi] = create_ci(...)` or `populate!`
+- `emit_code(cache, mi, ir)` - Generate code from IR
+- `emit_executable(cache, mi, code)` - Generate executable from code
 
 This is a convenience wrapper around `get_executable` that returns only the
 executable result (not the CodeInstance).
 """
-function cached_compilation(view::CacheView, mi::Core.MethodInstance;
+function cached_compilation(cache::CacheView, mi::Core.MethodInstance;
                             emit_ir, emit_code, emit_executable)
-    _, executable = get_executable(view, mi; emit_ir, emit_code, emit_executable)
+    _, executable = get_executable(cache, mi; emit_ir, emit_code, emit_executable)
     return executable
 end
 

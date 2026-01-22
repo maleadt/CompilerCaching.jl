@@ -18,7 +18,7 @@ Base.Experimental.@MethodTable method_table
 #   Expr(:+, 1, Expr(:*, 2, 3)) → 1 + (2 * 3)
 #   Expr(:call, myfunc)         → call myfunc()
 
-function interpret(view, expr, deps)
+function interpret(cache, expr, deps)
     # Literals
     expr isa Number && return expr
 
@@ -28,20 +28,20 @@ function interpret(view, expr, deps)
 
         # Arithmetic operations
         if head === :+
-            return sum(interpret(view, a, deps) for a in args)
+            return sum(interpret(cache, a, deps) for a in args)
         elseif head === :*
-            return prod(interpret(view, a, deps) for a in args)
+            return prod(interpret(cache, a, deps) for a in args)
         elseif head === :^
             base, exp = args
-            return interpret(view, base, deps) ^ interpret(view, exp, deps)
+            return interpret(cache, base, deps) ^ interpret(cache, exp, deps)
         end
 
         # Call to function in our method table. This triggers recursive IR generation.
         if head === :call
             f = only(args)::Function
-            mi = @something(method_instance(f, (); world=view.world, method_table),
+            mi = @something(method_instance(f, (); world=cache.world, method_table),
                             error("Unknown function: $f"))
-            _, ir = get_ir(view, mi; emit_ir)
+            _, ir = get_ir(cache, mi; emit_ir)
             push!(deps, mi)
             return ir
         end
@@ -53,19 +53,19 @@ function interpret(view, expr, deps)
 end
 
 const compilations = Ref(0)
-function emit_ir(view, mi)
+function emit_ir(cache, mi)
     source_ir = mi.def.source::Expr
     deps = Core.MethodInstance[]
     compilations[] += 1
 
-    result = interpret(view, source_ir, deps)
-    view[mi] = create_ci(view, mi; deps)
+    result = interpret(cache, source_ir, deps)
+    cache[mi] = create_ci(cache, mi; deps)
     return result
 end
 
 # simple pass-through
-emit_code(view, mi, ir) = ir
-emit_executable(view, mi, code) = code
+emit_code(cache, mi, ir) = ir
+emit_executable(cache, mi, code) = code
 
 
 ## high-level API
@@ -76,8 +76,8 @@ function call(f, args...)
     mi = @something(method_instance(f, tt; world, method_table),
                     throw(MethodError(f, args)))
 
-    view = CacheView(:ForeignExample, world)
-    cached_compilation(view, mi; emit_ir, emit_code, emit_executable)
+    cache = CacheView(:ForeignExample, world)
+    cached_compilation(cache, mi; emit_ir, emit_code, emit_executable)
 end
 
 
