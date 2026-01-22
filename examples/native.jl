@@ -55,17 +55,24 @@ CC.method_table(interp::CustomInterpreter) = interp.method_table
 
 ## high-level API
 
-# emit_ir phase: returns codeinfos, CI is in cache via populate!
-function julia_emit_ir(cache::CacheView, mi::Core.MethodInstance)
+# returns codeinfos, CI is in cache via typeinf!
+function emit_ir(cache::CacheView, mi::Core.MethodInstance)
     interp = CustomInterpreter(cache)
-    return CompilerCaching.populate!(cache, interp, mi)
+    return CompilerCaching.typeinf!(cache, interp, mi)
 end
 
-# emit_code phase wrapper: counts compilations for testing
+# depends on ir, counts compilations for testing
 const compilations = Ref(0) # for testing
-function julia_emit_code_counted(cache::CacheView, mi::Core.MethodInstance, ir)
+function emit_code(cache::CacheView, mi::Core.MethodInstance)
+    ir = get!(emit_ir, cache, mi, :ir)
     compilations[] += 1
     julia_codegen(cache, mi, ir)
+end
+
+# depends on code
+function emit_executable(cache::CacheView, mi::Core.MethodInstance)
+    code = get!(emit_code, cache, mi, :code)
+    julia_jit(cache, mi, code)
 end
 
 """
@@ -100,16 +107,9 @@ end
                         throw(MethodError(f, $argtypes)))
 
         cache = CacheView(:NativeExample, world)
-        ptr = _call_compile(cache, mi)
+        ptr = get!(emit_executable, cache, mi, :executable)
         ccall(ptr, R, $ccall_types, $(argexprs...))
     end
-end
-function _call_compile(cache, mi)
-    cached_compilation(cache, mi;
-        emit_ir = julia_emit_ir,
-        emit_code = julia_emit_code_counted,
-        emit_executable = julia_jit
-    )
 end
 
 

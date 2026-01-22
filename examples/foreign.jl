@@ -3,8 +3,7 @@
 # - Cache views created on-the-fly before compilation
 # - Demonstrates: caching, redefinition, multiple dispatch
 
-using CompilerCaching: CacheView, add_method, method_instance, create_ci,
-                       get_ir, cached_compilation
+using CompilerCaching: CacheView, add_method, method_instance, create_ci
 
 
 Base.Experimental.@MethodTable method_table
@@ -41,7 +40,7 @@ function interpret(cache, expr, deps)
             f = only(args)::Function
             mi = @something(method_instance(f, (); world=cache.world, method_table),
                             error("Unknown function: $f"))
-            ir = get_ir(cache, mi; emit_ir)
+            ir = get!(emit_ir, cache, mi, :ir)
             push!(deps, mi)
             return ir
         end
@@ -63,11 +62,6 @@ function emit_ir(cache, mi)
     return result
 end
 
-# simple pass-through
-emit_code(cache, mi, ir) = ir
-emit_executable(cache, mi, code) = code
-
-
 ## high-level API
 
 function call(f, args...)
@@ -77,7 +71,7 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheView(:ForeignExample, world)
-    cached_compilation(cache, mi; emit_ir, emit_code, emit_executable)
+    get!(emit_ir, cache, mi, :ir)
 end
 
 

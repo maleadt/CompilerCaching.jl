@@ -15,6 +15,7 @@ const CC = Core.Compiler
 
 include("utils.jl")
 
+
 #==============================================================================#
 # Global compile hook for debugging/inspection/reflection
 #==============================================================================#
@@ -34,13 +35,13 @@ compile_hook() = _COMPILE_HOOK[]
     compile_hook!(f)
     compile_hook!(nothing)
 
-Set the global compile hook. Called at the start of every `cached_inference`,
-`cached_codegen`, or `cached_compilation` invocation with `(cache, mi)`.
-Return value ignored.
+Set the global compile hook. Called at the start of every `get!(f, cache, mi, key)`
+invocation with `(cache, mi)`. Return value ignored.
 
 The hook is called even for fully cached calls.
 """
 compile_hook!(f) = _COMPILE_HOOK[] = f
+
 
 #==============================================================================#
 # CacheView structure
@@ -88,7 +89,7 @@ macro setup_caching(expr)
         quote
             function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState,
                                  validation_world::UInt, time_before::UInt64)
-                $CC.stack_analysis_result!(caller.result, $CompilationResult())
+                $CC.stack_analysis_result!(caller.result, Dict{Symbol,Any}())
                 @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState,
                                     validation_world::UInt, time_before::UInt64)
             end
@@ -96,7 +97,7 @@ macro setup_caching(expr)
     else
         quote
             function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState)
-                $CC.stack_analysis_result!(caller.result, $CompilationResult())
+                $CC.stack_analysis_result!(caller.result, Dict{Symbol,Any}())
                 @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState)
             end
         end
@@ -135,41 +136,52 @@ Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance)
 
 
 #==============================================================================#
-# CompilationResult - wrapper for analysis_results storage
+# Cached compilation results
 #==============================================================================#
 
 """
-    CompilationResult
+    cached_results(ci::CodeInstance) -> Dict{Symbol, Any}
 
-Mutable wrapper type to identify our compilation results in the `analysis_results` chain.
-This allows multiple compiler plugins to store results on the same CodeInstance.
-
-Fields:
-- `ir::Any` - Result from emit_ir phase (e.g., codeinfos vector)
-- `code::Any` - Result from emit_code phase (e.g., CUBIN binary)
-- `executable::Any` - Result from emit_executable phase (e.g., function pointer)
-
-The wrapper is created empty during `create_ci` and populated via direct field access.
+Retrieve the compilation results dict from a CodeInstance's `analysis_results` chain.
+Throws if no dict is found - this indicates @setup_caching wasn't used correctly
+or create_ci wasn't called.
 """
-mutable struct CompilationResult
-    ir::Any
-    code::Any
-    executable::Any
-end
-CompilationResult() = CompilationResult(nothing, nothing, nothing)
-
-"""
-    results(ci::CodeInstance) -> CompilationResult
-
-Retrieve the `CompilationResult` wrapper from a CodeInstance's `analysis_results` chain.
-Throws if no wrapper is found - this indicates @setup_caching wasn't used correctly.
-"""
-function results(ci::Core.CodeInstance)
+function cached_results(ci::Core.CodeInstance)
     result = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CompilationResult ? result : nothing
+        result isa Dict{Symbol,Any} ? result : nothing
     end
-    @assert result !== nothing "CodeInstance missing CompilationResult - ensure @setup_caching is used"
+    @assert result !== nothing "CodeInstance missing results Dict - ensure @setup_caching is used or create_ci was called"
     return result
+end
+
+"""
+    Base.get!(f, cache::CacheView, mi::MethodInstance, key::Symbol)
+
+Get a cached value or compute and store it.
+"""
+function Base.get!(f, cache::CacheView, mi::Core.MethodInstance, key::Symbol)
+    # Call compile hook if set (even for cached calls)
+    hook = compile_hook()
+    if hook !== nothing
+        hook(cache, mi)
+    end
+
+    # Check for cached value
+    ci = get(cache, mi, nothing)
+    if ci !== nothing
+        cr = cached_results(ci)
+        val = get(cr, key, nothing)
+        val !== nothing && return val
+    end
+
+    # Compute value - callback must create CI if it doesn't exist
+    value = f(cache, mi)
+
+    # Store the value
+    ci = get(cache, mi, nothing)
+    @assert ci !== nothing "Callback must store a CodeInstance via cache[mi] = create_ci(...) or typeinf!"
+    cached_results(ci)[key] = value
+    return value
 end
 
 
@@ -254,24 +266,38 @@ method_instance
 # Populating the cache
 #==============================================================================#
 
-export populate!, create_ci
+export typeinf!, create_ci
 
 """
-    populate!(cache, interp, mi) -> Vector{Pair{CodeInstance, Union{CodeInfo, Nothing}}}
+    typeinf!(cache, interp, mi) -> Vector{Pair{CodeInstance, CodeInfo}}
 
-Populate the code cache with CodeInstances for `mi` and its callees.
+Run type inference on `mi` and store the resulting CodeInstances in the cache.
 
-Runs type inference on `mi` using the provided interpreter, which must implement
-the `CC.AbstractInterpreter` interface. The resulting CodeInstances are stored
-in the cache for later retrieval.
+Uses the provided interpreter, which must implement the `CC.AbstractInterpreter`
+interface. The resulting CodeInstances are stored in the cache for later retrieval.
 
-Returns a vector of (CodeInstance, IR) pairs where:
-- Native 1.12+: `[ci => CodeInfo, ...]` for root + callees
-- Native 1.11: `[ci => nothing]` (codegen uses callback-based path)
+Returns a vector of (CodeInstance, CodeInfo) pairs:
+- **Julia 1.12+**: `[ci => CodeInfo, ...]` - root + callees in topological order
+- **Julia 1.11**: `[ci => CodeInfo]` - only root entry
 
-The root CI is always the first entry: `first(result)[1]`
+The root CI is always the first entry: `first(result)`.
+
+# Consumer Patterns
+
+For native codegen (uses full vector on 1.12+, callback on 1.11):
+```julia
+codeinfos = typeinf!(cache, interp, mi)
+julia_codegen(cache, mi, codeinfos)  # handles version differences internally
+```
+
+For IR transformation (uses first entry, inflates to IRCode):
+```julia
+codeinfos = typeinf!(cache, interp, mi)
+ci, src = first(codeinfos)
+ir = CC.inflate_ir(src, CC.get_ci_mi(ci))
+```
 """
-function populate!(cache::CacheView, interp::CC.AbstractInterpreter,
+function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
                    mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
         # Modern API: returns CodeInstance, use SOURCE_MODE to control caching
@@ -303,6 +329,14 @@ function populate!(cache::CacheView, interp::CC.AbstractInterpreter,
                             callee.edges, callee.rettype_const)
                     else
                         src = CC.codeinfo_for_const(interp, callee_mi, callee.rettype_const)
+                        # Work around 1.12/1.13 not setting nargs/isva in `codeinfo_for_const`
+                        # This is fixed by JuliaLang/julia#59413, and will be backported.
+                        @static if v"1.12-" <= VERSION < v"1.14.0-DEV.60"
+                            if src.nargs == 0 && callee_mi.def isa Method
+                                src.nargs = callee_mi.def.nargs
+                                src.isva = callee_mi.def.isva
+                            end
+                        end
                     end
                 else
                     src = CC.typeinf_code(interp, callee_mi, true)
@@ -325,6 +359,14 @@ function populate!(cache::CacheView, interp::CC.AbstractInterpreter,
                 callee_mi = CC.get_ci_mi(callee)
                 if CC.use_const_api(callee)
                     src = CC.codeinfo_for_const(interp, callee_mi, callee.rettype_const)
+                    # Work around 1.12/1.13 not setting nargs/isva in `codeinfo_for_const`
+                    # This is fixed by JuliaLang/julia#59413, and will be backported.
+                    @static if v"1.12-" <= VERSION < v"1.14.0-DEV.60"
+                        if src.nargs == 0 && callee_mi.def isa Method
+                            src.nargs = callee_mi.def.nargs
+                            src.isva = callee_mi.def.isva
+                        end
+                    end
                 else
                     src = CC.typeinf_code(interp, callee_mi, true)
                 end
@@ -357,8 +399,7 @@ function populate!(cache::CacheView, interp::CC.AbstractInterpreter,
             @atomic ci.inferred = src
         end
 
-        # Return consistent type: [ci => nothing] (codegen uses callback path)
-        return Pair{Core.CodeInstance, Union{Core.CodeInfo, Nothing}}[ci => nothing]
+        return Pair{Core.CodeInstance, Core.CodeInfo}[ci => src]
     end
 end
 
@@ -375,8 +416,8 @@ function create_ci(cache::CacheView, mi::Core.MethodInstance;
     owner = cache_owner(cache)
     edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
 
-    # Create empty wrapper for later population via `results(ci).field = value`
-    ar = CC.AnalysisResults(CompilationResult(), CC.NULL_ANALYSIS_RESULTS)
+    # Create empty dict for later population via `cached_results(ci)[key] = value`
+    ar = CC.AnalysisResults(Dict{Symbol,Any}(), CC.NULL_ANALYSIS_RESULTS)
 
     @static if VERSION >= v"1.12-"
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
@@ -400,10 +441,6 @@ end
 Register backedges so Julia automatically invalidates cached code when dependencies change.
 This enables Julia's built-in invalidation mechanism - when any dependency MI is
 invalidated, the caller MI's CodeInstances will have their max_world reduced.
-
-Note: The API changed between Julia versions:
-- Julia 1.11: jl_method_instance_add_backedge takes MethodInstance as caller
-- Julia 1.12+: jl_method_instance_add_backedge takes CodeInstance as caller
 """
 function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
                          deps::Vector{Core.MethodInstance})
@@ -421,126 +458,6 @@ function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
         end
     end
     nothing
-end
-
-#==============================================================================#
-# Compilation phases
-#==============================================================================#
-
-export get_ir, get_code, get_executable, cached_compilation
-
-"""
-    get_ir(cache, mi; emit_ir) -> ir
-
-Run only the IR generation phase for a method instance.
-
-This is useful when recursively processing dependencies during the emit_ir phase:
-you want to establish the dependency tracking (creating CodeInstances with backedges)
-without running emit_code/emit_executable for each callee.
-
-The `emit_ir(cache, mi)` callback must:
-1. Return the IR result (opaque to the caching layer)
-2. Store a CodeInstance in the cache via `cache[mi] = create_ci(...)` or `populate!`
-
-Returns `ir` from the emit_ir callback or the cached result.
-If you need the CodeInstance, use `cache[mi]` after calling this function.
-"""
-function get_ir(cache::CacheView, mi::Core.MethodInstance; emit_ir)
-    # Call compile hook if set (even on cache hit)
-    hook = compile_hook()
-    if hook !== nothing
-        hook(cache, mi)
-    end
-
-    ci = get(cache, mi, nothing)
-    if ci !== nothing
-        wrapper = results(ci)
-        if wrapper.ir !== nothing
-            return wrapper.ir
-        end
-    end
-
-    # Run emit_ir - it must store CI via cache[mi] = create_ci(...) or populate!
-    ir = emit_ir(cache, mi)
-
-    ci = get(cache, mi, nothing)
-    @assert ci !== nothing "emit_ir must store a CodeInstance via cache[mi] = create_ci(...) or populate!"
-
-    results(ci).ir = ir
-    return ir
-end
-
-"""
-    get_code(cache, mi; emit_ir, emit_code) -> code
-
-Run IR and code generation phases for a method instance.
-
-Useful for reflection tools (e.g., `code_cubin`) that need the generated code
-but don't need to load it into memory/GPU.
-
-The `emit_code(cache, mi, ir)` callback receives the IR from emit_ir.
-
-Returns the cached `code` result if available, otherwise runs `emit_ir` and `emit_code`.
-If you need the CodeInstance, use `cache[mi]` after calling this function.
-"""
-function get_code(cache::CacheView, mi::Core.MethodInstance; emit_ir, emit_code)
-    ir = get_ir(cache, mi; emit_ir)
-
-    ci = cache[mi]
-    wrapper = results(ci)
-    if wrapper.code !== nothing
-        return wrapper.code
-    end
-
-    code = emit_code(cache, mi, ir)
-    wrapper.code = code
-    return code
-end
-
-"""
-    get_executable(cache, mi; emit_ir, emit_code, emit_executable) -> executable
-
-Run all three phases (IR, code, executable) for a method instance.
-
-The `emit_executable(cache, mi, code)` callback receives the code from emit_code.
-
-Returns the final linked/loaded executable result.
-If you need the CodeInstance, use `cache[mi]` after calling this function.
-"""
-function get_executable(cache::CacheView, mi::Core.MethodInstance;
-                        emit_ir, emit_code, emit_executable)
-    # Run emit_ir + emit_code (cached internally, hook fires in get_ir)
-    code = get_code(cache, mi; emit_ir, emit_code)
-
-    # Check for cached executable result
-    ci = cache[mi]
-    wrapper = results(ci)
-    if wrapper.executable !== nothing
-        return wrapper.executable
-    end
-
-    # Generate executable and store result
-    executable = emit_executable(cache, mi, code)
-    wrapper.executable = executable
-
-    return executable
-end
-
-"""
-    cached_compilation(cache, mi; emit_ir, emit_code, emit_executable) -> executable
-
-Three-phase cached compilation with automatic invalidation.
-
-Callbacks:
-- `emit_ir(cache, mi)` - Generate IR, must store CI via `cache[mi] = create_ci(...)` or `populate!`
-- `emit_code(cache, mi, ir)` - Generate code from IR
-- `emit_executable(cache, mi, code)` - Generate executable from code
-
-This is a convenience wrapper around `get_executable`.
-"""
-function cached_compilation(cache::CacheView, mi::Core.MethodInstance;
-                            emit_ir, emit_code, emit_executable)
-    return get_executable(cache, mi; emit_ir, emit_code, emit_executable)
 end
 
 end # module CompilerCaching

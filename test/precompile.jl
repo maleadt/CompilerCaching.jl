@@ -51,7 +51,7 @@ precompile_test_harness("Inference caching") do load_path
         emit_code_count = Ref(0)
         function emit_ir(cache, mi)
             interp = ExampleInterpreter(cache)
-            populate!(cache, interp, mi)
+            typeinf!(cache, interp, mi)
         end
         emit_code(cache, mi, ir) = (emit_code_count[] += 1; :code_result)
         emit_executable(cache, mi, code) = code
@@ -60,8 +60,13 @@ precompile_test_harness("Inference caching") do load_path
             world = Base.get_world_counter()
             mi = method_instance(f, tt; world)
             cache = CacheView(:ExampleCompiler, world)
-            result = cached_compilation(cache, mi;
-                emit_ir=emit_ir, emit_code=emit_code, emit_executable=emit_executable)
+            result = get!(cache, mi, :executable) do cache, mi
+                ir = get!(emit_ir, cache, mi, :ir)
+                code = get!(cache, mi, :code) do cache, mi
+                    emit_code(cache, mi, ir)
+                end
+                emit_executable(cache, mi, code)
+            end
             @assert result === :code_result
         end
 

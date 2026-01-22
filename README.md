@@ -12,16 +12,26 @@ using Pkg
 Pkg.add(url="path/to/CompilerCaching")
 ```
 
+## Basic usage
 
-## Usage
+The basic usage pattern is to create a `CacheView` and invoke `get!` on it with a method
+instance and a symbol-valued key representing what you want to cache. For example:
 
-The basic usage pattern is to create a `CacheView` and invoke `cached_compilation`
-with a method instance and three callbacks:
-- `emit_ir`: Analyze source code and emit high-level IR, populating the cache with code instances.
-- `emit_code`: Generate serializable code that can be cached across sessions (e.g. LLVM IR).
-- `emit_executable`: Generate a session-specific representation (e.g., a function pointer).
+```julia
+world = Base.get_world_counter()
+mi = method_instance(f, tt; world)
+cache = CacheView(:MyCompiler, world)
+results = get!(callback, cache, mi, :something)
+```
 
-Or, in code:
+The `callback` function will be invoked when the requested item is not found in the cache.
+If this is the first time this method instance is being compiled, your callback is also
+responsible for populating the cache with a code instance used to store the cached items,
+as well as to keep track of dependent method instances for invalidation purposes.
+
+Most users will want to rely on Julia's type inference to populate the cache, for which
+a `typeinf!` function is provided:
+
 ```julia
 using CompilerCaching
 
@@ -30,20 +40,20 @@ struct CustomInterpreter <: CC.AbstractInterpreter
     cache::CacheView
     ...
 end
-CustomInterpreter(cache::CacheView) = ...
 @setup_caching CustomInterpreter.cache
 
-# Let Julia populate the cache and return codeinfos for emit_code
+# Rely on Julia's type inference to populate the cache and provide inferred SSA IR
 function emit_ir(cache, mi)
     interp = CustomInterpreter(cache)
-    return CompilerCaching.populate!(cache, interp, mi)
+    return CompilerCaching.typeinf!(cache, interp, mi)
 end
 
 # generate some code representation
-function emit_code(cache, mi, ir) end
-
-# compile code to function pointer
-function emit_executable(cache, mi, code) end
+function emit_executable(cache, mi)
+    ir = get!(emit_ir, cache, mi, :ir)
+    # do something with the Julia IR
+    return executable
+end
 
 function call(f, args...)
     tt = map(Core.Typeof, args)
@@ -52,8 +62,8 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheView(:MyCompiler, world)
-    ptr = cached_compilation(cache, mi; emit_ir, emit_code, emit_executable)
-    ccall(ptr, ...)
+    exe = get!(emit_executable, cache, mi, :executable)
+    ccall(exe, ...)
 end
 
 my_function(x::Int) = x + 100
@@ -64,7 +74,7 @@ The `@setup_caching` macro defines the necessary methods to connect the interpre
 to the cache, and can be customized further if needed.
 
 
-### Cache sharding
+## Cache sharding
 
 It is possible to partition the cache by additional parameters by storing `keys` in the
 cache view, e.g., encoding the optimization level or target device:
@@ -79,14 +89,15 @@ function call(f, args...; opt_level=1)
                     throw(MethodError(f, args)))
 
     cache = CacheView{CacheKey}(:MyCompiler, world, (; opt_level))
-    cached_compilation(cache, mi; emit_ir, emit_code, emit_executable)
+    exe = get!(emit_executable, cache, mi, :executable)
+    ccall(exe, ...)
 end
 ```
 
 Different calls with the same `(tag, keys)` will hit the same cache partition.
 
 
-### Overlay methods
+## Overlay methods
 
 It is often useful to redefine existing methods for use with the custom compiler.
 This can be accomplished using overlay methods in a custom method table:
@@ -112,7 +123,8 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheView(:MyCompiler, world)
-    cached_compilation(cache, mi; emit_ir, emit_code, emit_executable)
+    exe = get!(emit_executable, cache, mi, :executable)
+    ccall(exe, ...)
 end
 ```
 
@@ -129,10 +141,10 @@ CC.method_table(interp::CustomInterpreter) = MyMethodTableStack(interp.world)
 ```
 
 
-### Foreign IR
+## Foreign IR
 
 For compilers that define their own IR format that Julia doesn't know about, we cannot rely
-on inference to populate the cache. Instead of calling `populate!`, we need to create our
+on inference to populate the cache. Instead of calling `typeinf!`, we need to create our
 own CodeInstances with `create_ci` and store them in the cache, providing dependencies to
 ensure backedges are correctly set-up:
 
@@ -145,13 +157,13 @@ function really_special end
 add_method(method_table, really_special, (Int,), MyCustomIR([:a, :b]))
 
 # Since we're not relying on Julia's inference, we need to create and cache our own CIs.
-# Recursive invocation of the underlying `get_ir` ensures dependencies are cached too.
+# Recursive invocation via `get!` ensures dependencies are cached too.
 function emit_ir(cache, mi)
     ir = mi.def.source::MyCustomIR
     deps = Core.MethodInstance[]
     for callee in ir.callees
         callee_mi = method_instance(callee.f, callee.tt; world=cache.world, method_table)
-        callee_ir = get_ir(cache, callee_mi; emit_ir)
+        callee_ir = get!(emit_ir, cache, callee_mi, :ir)
         # do something with the callee's IR if needed
         push!(deps, callee_mi)
     end
@@ -159,9 +171,17 @@ function emit_ir(cache, mi)
     return ir
 end
 
-function emit_code(cache, mi, ir) end
+function emit_code(cache, mi)
+    ir = get!(emit_ir, cache, mi, :ir)
+    # do something with the IR
+    return code
+end
 
-function emit_executable(cache, mi, code) end
+function emit_executable(cache, mi)
+    code = get!(emit_code, cache, mi, :code)
+    # do something with the code
+    return executable
+end
 
 function call(f, args...)
     tt = Tuple{map(Core.Typeof, args)...}
@@ -170,6 +190,7 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheView(:MyCompiler, world)
-    cached_compilation(cache, mi; emit_ir, emit_code, emit_executable)
+    exe = get!(emit_executable, cache, mi, :executable)
+    ccall(exe, ...)
 end
 ```

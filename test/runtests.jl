@@ -2,19 +2,13 @@ using CompilerCaching
 using Test
 using Base.Experimental: @MethodTable
 
-# Test helper: wraps simple compile functions in three-phase API
+# Test helper: wraps simple compile functions in get! API
 function simple_cached_compilation(compile_fn, cache::CacheView, mi)
-    cached_compilation(cache, mi;
-        emit_ir = (c, m) -> begin
-            result = compile_fn(m)
-            c[m] = CompilerCaching.create_ci(c, m)
-            result
-        end,
-
-        # passthrough
-        emit_code = (c, m, ir) -> ir,
-        emit_executable = (c, m, code) -> code
-    )
+    get!(cache, mi, :result) do cache, mi
+        result = compile_fn(mi)
+        cache[mi] = CompilerCaching.create_ci(cache, mi)
+        result
+    end
 end
 
 @testset "CompilerCaching" verbose=true begin
@@ -140,18 +134,14 @@ end
     mi = method_instance(test_fn, (Int,); world)
 
     interp = TestInterpreter(cache)
-    result = populate!(cache, interp, mi)
+    result = typeinf!(cache, interp, mi)
 
-    # populate! now always returns Vector{Pair{CI, IR}}
+    # typeinf! now always returns Vector{Pair{CI, IR}}
     @test result isa Vector
     @test length(result) >= 1
     ci, ir = first(result)
     @test ci isa Core.CodeInstance
-    @static if VERSION >= v"1.12.0-DEV.15"
-        @test ir isa Core.CodeInfo
-    else
-        @test ir === nothing  # 1.11 uses callback-based codegen
-    end
+    @test ir isa Core.CodeInfo
 
     # Test const-return functions get CompilationResult wrapper
     # These functions return a constant and skip optimization, but finish! should still be called
@@ -161,16 +151,15 @@ end
     mi2 = method_instance(const_return_fn, (Int,); world=world2)
 
     interp2 = TestInterpreter(cache2)
-    result2 = populate!(cache2, interp2, mi2)
+    result2 = typeinf!(cache2, interp2, mi2)
 
     @test length(result2) >= 1
     ci2, _ = first(result2)
     @test ci2 isa Core.CodeInstance
     # Verify it's actually a const-return CI (skip under coverage as it disables const-return)
     @test Core.Compiler.use_const_api(ci2) skip=(Base.JLOptions().code_coverage > 0)
-    # The key test: finish! hook should have stacked our wrapper even for const-return
-    wrapper = CompilerCaching.results(ci2)
-    @test wrapper isa CompilerCaching.CompilationResult
+    # The key test: finish! hook should have stacked our dict even for const-return
+    @test CompilerCaching.cached_results(ci2) isa Dict{Symbol,Any}
 end
 
 @testset "compilation hook" begin
@@ -183,29 +172,30 @@ end
     mi = method_instance(test_func_hook, (Int,); world)
     @test mi !== nothing
 
-    # Minimal callbacks for cached_compilation
-    emit_ir_fn = (c, m) -> begin
-        c[m] = CompilerCaching.create_ci(c, m)
-        nothing
-    end
-    emit_code_fn = (c, m, ir) -> :code_data
-    emit_executable_fn = (c, m, code) -> :result
-
     # Test 1: Hook called on cache miss
     compile_hook!() do c, m
         push!(calls, :called)
     end
 
-    cached_compilation(cache, mi; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
+    get!(cache, mi, :result) do cache, mi
+        cache[mi] = CompilerCaching.create_ci(cache, mi)
+        :result
+    end
     @test length(calls) == 1
 
-    # Test 2: Hook called on cache hit (key behavior!)
-    cached_compilation(cache, mi; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
+    # Test 2: Hook called even on cache hit
+    get!(cache, mi, :result) do cache, mi
+        cache[mi] = CompilerCaching.create_ci(cache, mi)
+        :result
+    end
     @test length(calls) == 2  # Called again even though cached
 
     # Test 3: No hook when disabled
     compile_hook!(nothing)
-    cached_compilation(cache, mi; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
+    # Use different key to trigger miss
+    get!(cache, mi, :other) do cache, mi
+        :other_result
+    end
     @test length(calls) == 2  # No new call
 
     # Test 4: Getter returns current hook
@@ -350,29 +340,22 @@ end
         :parent_ir
     end
 
-    passthrough_emit_code(c, m, ir) = ir
-    passthrough_emit_executable(c, m, code) = code
-
     world = Base.get_world_counter()
     cache = CacheView(:DepTest, world)
     child_mi = method_instance(child_node, (Int,); world, method_table)
     parent_mi = method_instance(parent_node, (Int,); world, method_table)
 
     # Compile child first
-    cached_compilation(cache, child_mi;
-        emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
+    get!(child_emit_ir, cache, child_mi, :result)
     @test child_compile_count[] == 1
 
     # Compile parent (depends on child)
-    cached_compilation(cache, parent_mi;
-        emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
+    get!(parent_emit_ir, cache, parent_mi, :result)
     @test parent_compile_count[] == 1
 
     # Cache hits
-    cached_compilation(cache, child_mi;
-        emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
-    cached_compilation(cache, parent_mi;
-        emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
+    get!(child_emit_ir, cache, child_mi, :result)
+    get!(parent_emit_ir, cache, parent_mi, :result)
     @test child_compile_count[] == 1
     @test parent_compile_count[] == 1
 
@@ -381,14 +364,12 @@ end
     world = Base.get_world_counter()
     cache = CacheView(:DepTest, world)
     child_mi = method_instance(child_node, (Int,); world, method_table)
-    cached_compilation(cache, child_mi;
-        emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
+    get!(child_emit_ir, cache, child_mi, :result)
     @test child_compile_count[] == 2
 
     # Parent should also recompile due to dependency
     parent_mi = method_instance(parent_node, (Int,); world, method_table)
-    cached_compilation(cache, parent_mi;
-        emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
+    get!(parent_emit_ir, cache, parent_mi, :result)
     @test parent_compile_count[] == 2
 end
 
