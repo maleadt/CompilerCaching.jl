@@ -3,26 +3,23 @@ using Test
 using Base.Experimental: @MethodTable
 
 # Test helper: wraps simple compile functions in three-phase API
-function simple_cached_compilation(compile_fn, cache::CacheHandle, mi, world)
-    cached_compilation(cache, mi, world;
-        emit_ir = (c, m, w) -> begin
+function simple_cached_compilation(compile_fn, cache::CacheView, mi)
+    cached_compilation(cache, mi;
+        emit_ir = (c, m) -> begin
             result = compile_fn(m)
-            CompilerCaching.cache!(c, m; world=w)
+            c[m] = CompilerCaching.create_ci(c, m)
             result
         end,
 
         # passthrough
-        emit_code = (c, m, w, ir) -> ir,
-        emit_executable = (c, m, w, code) -> code
+        emit_code = (c, m, ir) -> ir,
+        emit_executable = (c, m, code) -> code
     )
 end
 
 @testset "CompilerCaching" verbose=true begin
 
 @testset "basic caching" begin
-    # Use Compiler without method table = global MT
-    cache = CacheHandle(:GlobalTest)
-
     # Define a regular Julia function (in global MT)
     global_test_fn(x::Int) = x + 100
 
@@ -36,14 +33,15 @@ end
     end
 
     world = Base.get_world_counter()
+    cache = CacheView(:GlobalTest, world)
     mi = method_instance(global_test_fn, (Int,); world)
 
-    result = simple_cached_compilation(my_compile, cache, mi, world)
+    result = simple_cached_compilation(my_compile, cache, mi)
     @test result === :global_test_fn
     @test compile_count[] == 1
 
     # Cache hit
-    result2 = simple_cached_compilation(my_compile, cache, mi, world)
+    result2 = simple_cached_compilation(my_compile, cache, mi)
     @test result2 === :global_test_fn
     @test compile_count[] == 1  # unchanged
 end
@@ -51,10 +49,6 @@ end
 @testset "cache partitioning" begin
     # Global MT with sharding keys (e.g., for GPUCompiler-style usage)
     # Different caches for different key combinations
-    ShardKeys = @NamedTuple{opt_level::Int}
-    cache1 = CacheHandle{ShardKeys}(:GlobalShardTest, (opt_level=1,))
-    cache2 = CacheHandle{ShardKeys}(:GlobalShardTest, (opt_level=2,))
-
     global_sharded_fn(x::Float64) = x * 2.0
 
     compile_count = Ref(0)
@@ -64,18 +58,21 @@ end
     end
 
     world = Base.get_world_counter()
+    ShardKeys = @NamedTuple{opt_level::Int}
+    cache1 = CacheView{ShardKeys}(:GlobalShardTest, world, (opt_level=1,))
+    cache2 = CacheView{ShardKeys}(:GlobalShardTest, world, (opt_level=2,))
     mi = method_instance(global_sharded_fn, (Float64,); world)
 
     # Different sharding keys = different cache entries
-    r1 = simple_cached_compilation(my_compile, cache1, mi, world)
+    r1 = simple_cached_compilation(my_compile, cache1, mi)
     @test r1 === :global_sharded_fn
     @test compile_count[] == 1
 
-    r2 = simple_cached_compilation(my_compile, cache2, mi, world)
+    r2 = simple_cached_compilation(my_compile, cache2, mi)
     @test r2 === :global_sharded_fn
     @test compile_count[] == 2  # different shard
 
-    r3 = simple_cached_compilation(my_compile, cache1, mi, world)
+    r3 = simple_cached_compilation(my_compile, cache1, mi)
     @test r3 === :global_sharded_fn
     @test compile_count[] == 2  # cache hit
 end
@@ -91,7 +88,6 @@ end
         end
         $overlay_double_name
     end
-    cache = CacheHandle(:OverlayTest)
 
     compile_count = Ref(0)
     function my_compile(mi)
@@ -102,30 +98,29 @@ end
     end
 
     world = Base.get_world_counter()
+    cache = CacheView(:OverlayTest, world)
     mi = method_instance(overlay_double, (Int,); world, method_table)
 
-    result = simple_cached_compilation(my_compile, cache, mi, world)
+    result = simple_cached_compilation(my_compile, cache, mi)
     # Overlay methods may have gensym'd names like "#overlay_double"
     @test occursin("overlay_double", string(result))
     @test compile_count[] == 1
 
     # Cache hit
-    result2 = simple_cached_compilation(my_compile, cache, mi, world)
+    result2 = simple_cached_compilation(my_compile, cache, mi)
     @test occursin("overlay_double", string(result2))
     @test compile_count[] == 1  # unchanged
 end
 
 @testset "inference integration" begin
-    cache = CacheHandle(:InferenceTest)
-
     # Test interpreter that properly integrates with cache
     struct TestInterpreter <: Core.Compiler.AbstractInterpreter
         world::UInt
-        cache::CacheHandle
+        cache::CacheView
         inf_cache::Vector{Core.Compiler.InferenceResult}
     end
-    TestInterpreter(cache::CacheHandle, world::UInt) =
-        TestInterpreter(world, cache, Core.Compiler.InferenceResult[])
+    TestInterpreter(cache::CacheView) =
+        TestInterpreter(cache.world, cache, Core.Compiler.InferenceResult[])
     @setup_caching TestInterpreter.cache
 
     Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
@@ -141,9 +136,10 @@ end
 
     test_fn(x::Int) = x + 1
     world = Base.get_world_counter()
+    cache = CacheView(:InferenceTest, world)
     mi = method_instance(test_fn, (Int,); world)
 
-    interp = TestInterpreter(cache, world)
+    interp = TestInterpreter(cache)
     result = populate!(cache, interp, mi)
 
     # populate! now always returns Vector{Pair{CI, IR}}
@@ -161,10 +157,11 @@ end
     # These functions return a constant and skip optimization, but finish! should still be called
     const_return_fn(x::Int) = nothing  # Returns constant `nothing`
     world2 = Base.get_world_counter()
+    cache2 = CacheView(:InferenceTest, world2)
     mi2 = method_instance(const_return_fn, (Int,); world=world2)
 
-    interp2 = TestInterpreter(cache, world2)
-    result2 = populate!(cache, interp2, mi2)
+    interp2 = TestInterpreter(cache2)
+    result2 = populate!(cache2, interp2, mi2)
 
     @test length(result2) >= 1
     ci2, _ = first(result2)
@@ -177,42 +174,42 @@ end
 end
 
 @testset "compilation hook" begin
-    cache = CacheHandle(:HookTest)
     calls = []
 
     # Define function and get world counter after definition
     test_func_hook(x::Int) = x + 1
     world = Base.get_world_counter()
+    cache = CacheView(:HookTest, world)
     mi = method_instance(test_func_hook, (Int,); world)
     @test mi !== nothing
 
     # Minimal callbacks for cached_compilation
-    emit_ir_fn = (cache, mi, world) -> begin
-        CompilerCaching.cache!(cache, mi; world)
+    emit_ir_fn = (c, m) -> begin
+        c[m] = CompilerCaching.create_ci(c, m)
         nothing
     end
-    emit_code_fn = (cache, mi, world, ir) -> :code_data
-    emit_executable_fn = (cache, mi, world, code) -> :result
+    emit_code_fn = (c, m, ir) -> :code_data
+    emit_executable_fn = (c, m, code) -> :result
 
     # Test 1: Hook called on cache miss
-    compile_hook!() do cache, mi, world
+    compile_hook!() do c, m
         push!(calls, :called)
     end
 
-    cached_compilation(cache, mi, world; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
+    cached_compilation(cache, mi; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
     @test length(calls) == 1
 
     # Test 2: Hook called on cache hit (key behavior!)
-    cached_compilation(cache, mi, world; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
+    cached_compilation(cache, mi; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
     @test length(calls) == 2  # Called again even though cached
 
     # Test 3: No hook when disabled
     compile_hook!(nothing)
-    cached_compilation(cache, mi, world; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
+    cached_compilation(cache, mi; emit_ir=emit_ir_fn, emit_code=emit_code_fn, emit_executable=emit_executable_fn)
     @test length(calls) == 2  # No new call
 
     # Test 4: Getter returns current hook
-    f = (cache, mi, world) -> nothing
+    f = (c, m) -> nothing
     compile_hook!(f)
     @test compile_hook() === f
     compile_hook!(nothing)
@@ -227,7 +224,6 @@ end
 
 @testset "basic caching" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
-    cache = CacheHandle(:BasicTest)
 
     function basic_node end
     add_method(method_table, basic_node, (Int,), 10)
@@ -240,30 +236,31 @@ end
     end
 
     world = Base.get_world_counter()
+    cache = CacheView(:BasicTest, world)
     mi = method_instance(basic_node, (Int,); world, method_table)
 
     # First call: cache miss, compile_fn invoked
-    r1 = simple_cached_compilation(my_compile, cache, mi, world)
+    r1 = simple_cached_compilation(my_compile, cache, mi)
     @test r1 == 20  # 10 * 2
     @test compile_count[] == 1
 
     # Second call: cache hit, compile_fn NOT invoked
-    r2 = simple_cached_compilation(my_compile, cache, mi, world)
+    r2 = simple_cached_compilation(my_compile, cache, mi)
     @test r2 == 20
     @test compile_count[] == 1  # still 1
 
     # Redefine method → invalidates cache, recompile
     add_method(method_table, basic_node, (Int,), 30)
     world = Base.get_world_counter()
+    cache = CacheView(:BasicTest, world)
     mi = method_instance(basic_node, (Int,); world, method_table)
-    r3 = simple_cached_compilation(my_compile, cache, mi, world)
+    r3 = simple_cached_compilation(my_compile, cache, mi)
     @test r3 == 60  # 30 * 2
     @test compile_count[] == 2  # incremented
 end
 
 @testset "multiple dispatch" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
-    cache = CacheHandle(:DispatchTest)
 
     function dispatch_node end
     add_method(method_table, dispatch_node, (Int,), 100)
@@ -277,38 +274,40 @@ end
     end
 
     world = Base.get_world_counter()
+    cache = CacheView(:DispatchTest, world)
     mi_int = method_instance(dispatch_node, (Int,); world, method_table)
     mi_float = method_instance(dispatch_node, (Float64,); world, method_table)
 
     # Different types → different cache entries, each compiles once
-    r_int = simple_cached_compilation(my_compile, cache, mi_int, world)
+    r_int = simple_cached_compilation(my_compile, cache, mi_int)
     @test r_int == 101
     @test compile_count[] == 1
 
-    r_float = simple_cached_compilation(my_compile, cache, mi_float, world)
+    r_float = simple_cached_compilation(my_compile, cache, mi_float)
     @test r_float == 201
     @test compile_count[] == 2
 
     # Cache hits - no recompilation
-    r_int2 = simple_cached_compilation(my_compile, cache, mi_int, world)
+    r_int2 = simple_cached_compilation(my_compile, cache, mi_int)
     @test r_int2 == 101
     @test compile_count[] == 2  # unchanged
 
-    r_float2 = simple_cached_compilation(my_compile, cache, mi_float, world)
+    r_float2 = simple_cached_compilation(my_compile, cache, mi_float)
     @test r_float2 == 201
     @test compile_count[] == 2  # unchanged
 
     # Redefine only Int method → only Int recompiles
     add_method(method_table, dispatch_node, (Int,), 50)
     world = Base.get_world_counter()
+    cache = CacheView(:DispatchTest, world)
     mi_int = method_instance(dispatch_node, (Int,); world, method_table)
-    r_int3 = simple_cached_compilation(my_compile, cache, mi_int, world)
+    r_int3 = simple_cached_compilation(my_compile, cache, mi_int)
     @test r_int3 == 51
     @test compile_count[] == 3
 
     # Float64 still uses cached version (need to re-lookup mi after world change)
     mi_float = method_instance(dispatch_node, (Float64,); world, method_table)
-    r_float3 = simple_cached_compilation(my_compile, cache, mi_float, world)
+    r_float3 = simple_cached_compilation(my_compile, cache, mi_float)
     @test r_float3 == 201
     @test compile_count[] == 3  # unchanged
 end
@@ -327,7 +326,6 @@ end
 
 @testset "dependency invalidation" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
-    cache = CacheHandle(:DepTest)
 
     function parent_node end
     function child_node end
@@ -338,41 +336,42 @@ end
     parent_compile_count = Ref(0)
 
     # Child emit_ir: creates CI with no deps
-    function child_emit_ir(c, m, w)
+    function child_emit_ir(c, m)
         child_compile_count[] += 1
-        cache!(c, m; world=w)
+        c[m] = create_ci(c, m)
         :child_ir
     end
 
     # Parent emit_ir: creates CI with dependency on child
-    function parent_emit_ir(c, m, w)
+    function parent_emit_ir(c, m)
         parent_compile_count[] += 1
-        child_mi = method_instance(child_node, (Int,); world=w, method_table)
-        cache!(c, m; world=w, deps=[child_mi])
+        child_mi = method_instance(child_node, (Int,); world=c.world, method_table)
+        c[m] = create_ci(c, m; deps=[child_mi])
         :parent_ir
     end
 
-    passthrough_emit_code(c, m, w, ir) = ir
-    passthrough_emit_executable(c, m, w, code) = code
+    passthrough_emit_code(c, m, ir) = ir
+    passthrough_emit_executable(c, m, code) = code
 
     world = Base.get_world_counter()
+    cache = CacheView(:DepTest, world)
     child_mi = method_instance(child_node, (Int,); world, method_table)
     parent_mi = method_instance(parent_node, (Int,); world, method_table)
 
     # Compile child first
-    cached_compilation(cache, child_mi, world;
+    cached_compilation(cache, child_mi;
         emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test child_compile_count[] == 1
 
     # Compile parent (depends on child)
-    cached_compilation(cache, parent_mi, world;
+    cached_compilation(cache, parent_mi;
         emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test parent_compile_count[] == 1
 
     # Cache hits
-    cached_compilation(cache, child_mi, world;
+    cached_compilation(cache, child_mi;
         emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
-    cached_compilation(cache, parent_mi, world;
+    cached_compilation(cache, parent_mi;
         emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test child_compile_count[] == 1
     @test parent_compile_count[] == 1
@@ -380,23 +379,22 @@ end
     # Redefine child → child recompiles
     add_method(method_table, child_node, (Int,), :new_child_ir)
     world = Base.get_world_counter()
+    cache = CacheView(:DepTest, world)
     child_mi = method_instance(child_node, (Int,); world, method_table)
-    cached_compilation(cache, child_mi, world;
+    cached_compilation(cache, child_mi;
         emit_ir = child_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test child_compile_count[] == 2
 
     # Parent should also recompile due to dependency
     parent_mi = method_instance(parent_node, (Int,); world, method_table)
-    cached_compilation(cache, parent_mi, world;
+    cached_compilation(cache, parent_mi;
         emit_ir = parent_emit_ir, emit_code = passthrough_emit_code, emit_executable = passthrough_emit_executable)
     @test parent_compile_count[] == 2
 end
 
 @testset "method table isolation" begin
     method_table_a = @eval @MethodTable $(gensym(:method_table_a))
-    cache_a = CacheHandle(:IsolationA)
     method_table_b = @eval @MethodTable $(gensym(:method_table_b))
-    cache_b = CacheHandle(:IsolationB)
 
     function isolated_node end
     add_method(method_table_a, isolated_node, (Int,), :ir_a)
@@ -406,6 +404,8 @@ end
     result_b = Ref{Any}(nothing)
 
     world = Base.get_world_counter()
+    cache_a = CacheView(:IsolationA, world)
+    cache_b = CacheView(:IsolationB, world)
     mi_a = method_instance(isolated_node, (Int,); world, method_table=method_table_a)
     mi_b = method_instance(isolated_node, (Int,); world, method_table=method_table_b)
 
@@ -418,8 +418,8 @@ end
         m.def.source
     end
 
-    simple_cached_compilation(compile_a, cache_a, mi_a, world)
-    simple_cached_compilation(compile_b, cache_b, mi_b, world)
+    simple_cached_compilation(compile_a, cache_a, mi_a)
+    simple_cached_compilation(compile_b, cache_b, mi_b)
 
     @test result_a[] === :ir_a
     @test result_b[] === :ir_b

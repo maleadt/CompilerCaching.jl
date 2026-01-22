@@ -26,10 +26,12 @@ function with_llvm_context(f)
 end
 
 # Callback function for codegen to look in the cache
-const _codegen_cache = Ref{Any}(nothing)
-const _codegen_world = Ref{UInt}(0)
+const _codegen_view = Ref{Any}(nothing)
 function _codegen_lookup_cb(mi, min_world, max_world)
-    ci = CompilerCaching.lookup(_codegen_cache[], mi; world=min_world)
+    # Create a view at the min_world for lookup
+    view = _codegen_view[]
+    lookup_view = CacheView(view.tag, min_world)
+    ci = get(lookup_view, mi, nothing)
     @static if VERSION < v"1.12.0-DEV.1434"
         # Refuse to return CI without source - force re-inference before codegen
         if ci !== nothing && ci.inferred === nothing
@@ -55,7 +57,7 @@ function getglobal_jljit()
 end
 
 """
-    julia_codegen(cache, mi, world, codeinfos) -> (ir_bytes, entry_name)
+    julia_codegen(view, mi, codeinfos) -> (ir_bytes, entry_name)
 
 Generate LLVM IR and return serializable intermediate result.
 Returns a tuple of (LLVM bitcode bytes, entry function name).
@@ -65,12 +67,11 @@ On Julia 1.11, `codeinfos` contains `[ci => nothing]`; uses cache lookup callbac
 
 This function handles codegen but does not JIT compile - use `julia_jit` for that.
 """
-function julia_codegen(cache::CacheHandle, mi::Core.MethodInstance,
-                       world::UInt, codeinfos::Vector{<:Pair{Core.CodeInstance}})
+function julia_codegen(view::CacheView, mi::Core.MethodInstance,
+                       codeinfos::Vector{<:Pair{Core.CodeInstance}})
 
     # Set up globals for the lookup callback
-    _codegen_cache[] = cache
-    _codegen_world[] = world
+    _codegen_view[] = view
     lookup_cfunction = @cfunction(_codegen_lookup_cb, Any, (Any, UInt, UInt))
 
     # Set up codegen parameters
@@ -112,7 +113,7 @@ function julia_codegen(cache::CacheHandle, mi::Core.MethodInstance,
                 [mi]::Vector{Core.MethodInstance},
                 ts_mod::LLVM.API.LLVMOrcThreadSafeModuleRef,
                 Ref(params)::Ptr{CodegenParams},
-                1::Cint, 0::Cint, 0::Cint, world::Csize_t,
+                1::Cint, 0::Cint, 0::Cint, view.world::Csize_t,
                 lookup_cfunction::Ptr{Cvoid}
             )::Ptr{Cvoid}
         else
@@ -120,7 +121,7 @@ function julia_codegen(cache::CacheHandle, mi::Core.MethodInstance,
                 [mi]::Vector{Core.MethodInstance},
                 ts_mod::LLVM.API.LLVMOrcThreadSafeModuleRef,
                 Ref(params)::Ptr{CodegenParams},
-                1::Cint, 0::Cint, 0::Cint, world::Csize_t
+                1::Cint, 0::Cint, 0::Cint, view.world::Csize_t
             )::Ptr{Cvoid}
         end
 
@@ -135,7 +136,7 @@ function julia_codegen(cache::CacheHandle, mi::Core.MethodInstance,
         llvm_ts_mod = ThreadSafeModule(llvm_mod_ref)
 
         # Get function name from CodeInstance
-        ci = CompilerCaching.lookup(cache, mi; world)
+        ci = get(view, mi, nothing)
         @assert ci !== nothing "CodeInstance not found after codegen"
 
         func_idx = Ref{Int32}(-1)
@@ -172,14 +173,14 @@ function julia_codegen(cache::CacheHandle, mi::Core.MethodInstance,
 end
 
 """
-    julia_jit(cache, mi, world, ir_data) -> Ptr{Cvoid}
+    julia_jit(view, mi, ir_data) -> Ptr{Cvoid}
 
 JIT compile LLVM bitcode to a function pointer.
 
 Takes a tuple of (LLVM bitcode bytes, entry function name) as returned by `julia_codegen`.
-The `cache`, `mi`, and `world` arguments are ignored but included for use as a `link` callback.
+The `view` and `mi` arguments are ignored but included for use as an `emit_executable` callback.
 """
-function julia_jit(cache, mi, world, ir_data)
+function julia_jit(view, mi, ir_data)
     ir_bytes, entry_name = ir_data
 
     jljit = getglobal_jljit()

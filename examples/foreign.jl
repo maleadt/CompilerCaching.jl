@@ -1,9 +1,9 @@
 # Foreign IR example - bypasses Julia's inference/compiler stack entirely
 # - Methods registered with add_method storing custom IR
-# - Cache handles created on-the-fly before compilation
+# - Cache views created on-the-fly before compilation
 # - Demonstrates: caching, redefinition, multiple dispatch
 
-using CompilerCaching: CacheHandle, add_method, method_instance, cache!,
+using CompilerCaching: CacheView, add_method, method_instance, create_ci,
                        get_ir, cached_compilation
 
 
@@ -18,7 +18,7 @@ Base.Experimental.@MethodTable method_table
 #   Expr(:+, 1, Expr(:*, 2, 3)) → 1 + (2 * 3)
 #   Expr(:call, myfunc)         → call myfunc()
 
-function interpret(cache, world, expr, deps)
+function interpret(view, expr, deps)
     # Literals
     expr isa Number && return expr
 
@@ -28,20 +28,20 @@ function interpret(cache, world, expr, deps)
 
         # Arithmetic operations
         if head === :+
-            return sum(interpret(cache, world, a, deps) for a in args)
+            return sum(interpret(view, a, deps) for a in args)
         elseif head === :*
-            return prod(interpret(cache, world, a, deps) for a in args)
+            return prod(interpret(view, a, deps) for a in args)
         elseif head === :^
             base, exp = args
-            return interpret(cache, world, base, deps) ^ interpret(cache, world, exp, deps)
+            return interpret(view, base, deps) ^ interpret(view, exp, deps)
         end
 
         # Call to function in our method table. This triggers recursive IR generation.
         if head === :call
             f = only(args)::Function
-            mi = @something(method_instance(f, (); world, method_table),
+            mi = @something(method_instance(f, (); world=view.world, method_table),
                             error("Unknown function: $f"))
-            _, ir = get_ir(cache, mi, world; emit_ir)
+            _, ir = get_ir(view, mi; emit_ir)
             push!(deps, mi)
             return ir
         end
@@ -53,19 +53,19 @@ function interpret(cache, world, expr, deps)
 end
 
 const compilations = Ref(0)
-function emit_ir(cache, mi, world)
+function emit_ir(view, mi)
     source_ir = mi.def.source::Expr
     deps = Core.MethodInstance[]
     compilations[] += 1
 
-    result = interpret(cache, world, source_ir, deps)
-    cache!(cache, mi; world, deps)
+    result = interpret(view, source_ir, deps)
+    view[mi] = create_ci(view, mi; deps)
     return result
 end
 
 # simple pass-through
-emit_code(cache, mi, world, ir) = ir
-emit_executable(cache, mi, world, code) = code
+emit_code(view, mi, ir) = ir
+emit_executable(view, mi, code) = code
 
 
 ## high-level API
@@ -76,8 +76,8 @@ function call(f, args...)
     mi = @something(method_instance(f, tt; world, method_table),
                     throw(MethodError(f, args)))
 
-    cache = CacheHandle(:ForeignExample)
-    cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable)
+    view = CacheView(:ForeignExample, world)
+    cached_compilation(view, mi; emit_ir, emit_code, emit_executable)
 end
 
 
