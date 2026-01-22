@@ -15,14 +15,12 @@ Pkg.add(url="path/to/CompilerCaching")
 ## Usage
 
 The basic usage pattern is to create a `CacheHandle` handle and invoke `cached_compilation`
-with three callbacks:
-- `emit_ir`: Perform type inference, store a `CodeInstance` in the cache (via `populate!` or `cache!`), and return the IR for code generation
-- `emit_code`: Generate serializable code that can be cached across sessions
-- `emit_executable`: Generate a session-specific representation (e.g., JIT-compiled function pointer)
+with a method instance and three callbacks:
+- `emit_ir`: Analyze source code and emit high-level IR, while populating the cache with any dependent code instances. Often this boils down to invoking Julia's inference engine.
+- `emit_code`: Generate serializable code that can be cached across sessions (e.g. LLVM IR).
+- `emit_executable`: Generate a session-specific representation (e.g., a function pointer).
 
-A `CacheHandle` is a lightweight handle to Julia's global `InternalCodeCache`. Creating
-cache handles is cheap, so they can be constructed on-the-fly right before compilation.
-
+Or, in code:
 ```julia
 using CompilerCaching
 
@@ -34,8 +32,8 @@ struct CustomInterpreter <: CC.AbstractInterpreter
 end
 @setup_caching CustomInterpreter.cache
 
+# Let Julia populate the cache and return codeinfos for emit_code
 function emit_ir(cache, mi, world)
-    # Let Julia populate the cache and return codeinfos for emit_code
     interp = CustomInterpreter(cache, world)
     return CompilerCaching.populate!(cache, interp, mi)
 end
@@ -53,7 +51,8 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheHandle(:MyCompiler)
-    cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable)
+    ptr = cached_compilation(cache, mi, world; emit_ir, emit_code, emit_executable)
+    ccall(ptr, ...)
 end
 
 my_function(x::Int) = x + 100
@@ -107,7 +106,7 @@ function call(f, args...)
     tt = map(Core.Typeof, args)
     world = Base.get_world_counter()
     mi = @something(method_instance(f, tt; world, method_table),
-                    # if relevant, look for global methods too
+                    # if needed, look for global methods too
                     throw(MethodError(f, args)))
 
     cache = CacheHandle(:MyCompiler)
@@ -117,22 +116,28 @@ end
 
 ### Foreign IR
 
-For compilers that define their own IR format that Julia doesn't know about:
+For compilers that define their own IR format that Julia doesn't know about, we cannot rely
+on inference to populate the cache. Instead of calling `populate!`, we need to analyze our
+IR and call `cache!` for each method instance, providing an array of dependencies to ensure
+backedges are correctly set-up:
 
 ```julia
 Base.Experimental.@MethodTable method_table
 
-# Add a method to the method table, providing a custom IR source
+# Only define our special functions in the overlay method table,
+# providing our custom IR as the source.
 function really_special end
 add_method(method_table, really_special, (Int,), MyCustomIR([:a, :b]))
 
-# Since we're not relying on Julia's inference, we need to create and cache our own CIs
+# Since we're not relying on Julia's inference, we need to create and cache our own CIs.
+# Recursive invocation of the underlying `get_ir` ensures dependencies are cached too.
 function emit_ir(cache, mi, world)
     ir = mi.def.source::MyCustomIR
     deps = Core.MethodInstance[]
     for callee in ir.callees
         callee_mi = method_instance(callee.f, callee.tt; world, method_table)
-        get_ir(cache, callee_mi, world; emit_ir)
+        callee_ci, callee_ir = get_ir(cache, callee_mi, world; emit_ir)
+        # do something with the callee's IR if needed
         push!(deps, callee_mi)
     end
     cache!(cache, mi; world, deps)

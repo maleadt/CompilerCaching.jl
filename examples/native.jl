@@ -12,9 +12,6 @@ using Base: get_world_counter
 using Base.Experimental: @MethodTable, @overlay
 @MethodTable CUSTOM_MT
 
-# Helper to create cache handles on-the-fly
-custom_cache() = CacheHandle(:NativeExample)
-
 
 ## abstract interpreter
 
@@ -102,7 +99,7 @@ end
                         method_instance(f, $argtypes; world),
                         throw(MethodError(f, $argtypes)))
 
-        cache = custom_cache()
+        cache = CacheHandle(:NativeExample)
         ptr = _call_compile(cache, mi, world)
         ccall(ptr, R, $ccall_types, $(argexprs...))
     end
