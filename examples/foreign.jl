@@ -41,7 +41,7 @@ function interpret(cache, expr, deps)
             f = only(args)::Function
             mi = @something(method_instance(f, (); world=cache.world, method_table),
                             error("Unknown function: $f"))
-            _, ir = get_ir(cache, mi; emit_ir)
+            ir = get_ir(cache, mi; emit_ir)
             push!(deps, mi)
             return ir
         end

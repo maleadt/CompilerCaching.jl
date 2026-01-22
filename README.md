@@ -151,7 +151,7 @@ function emit_ir(cache, mi)
     deps = Core.MethodInstance[]
     for callee in ir.callees
         callee_mi = method_instance(callee.f, callee.tt; world=cache.world, method_table)
-        callee_ci, callee_ir = get_ir(cache, callee_mi; emit_ir)
+        callee_ir = get_ir(cache, callee_mi; emit_ir)
         # do something with the callee's IR if needed
         push!(deps, callee_mi)
     end

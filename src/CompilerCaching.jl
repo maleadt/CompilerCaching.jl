@@ -430,7 +430,7 @@ end
 export get_ir, get_code, get_executable, cached_compilation
 
 """
-    get_ir(cache, mi; emit_ir) -> (CodeInstance, ir)
+    get_ir(cache, mi; emit_ir) -> ir
 
 Run only the IR generation phase for a method instance.
 
@@ -442,7 +442,8 @@ The `emit_ir(cache, mi)` callback must:
 1. Return the IR result (opaque to the caching layer)
 2. Store a CodeInstance in the cache via `cache[mi] = create_ci(...)` or `populate!`
 
-Returns `(ci, ir)` where `ir` is from the emit_ir callback or the cached result.
+Returns `ir` from the emit_ir callback or the cached result.
+If you need the CodeInstance, use `cache[mi]` after calling this function.
 """
 function get_ir(cache::CacheView, mi::Core.MethodInstance; emit_ir)
     # Call compile hook if set (even on cache hit)
@@ -455,7 +456,7 @@ function get_ir(cache::CacheView, mi::Core.MethodInstance; emit_ir)
     if ci !== nothing
         wrapper = results(ci)
         if wrapper.ir !== nothing
-            return ci, wrapper.ir
+            return wrapper.ir
         end
     end
 
@@ -466,11 +467,11 @@ function get_ir(cache::CacheView, mi::Core.MethodInstance; emit_ir)
     @assert ci !== nothing "emit_ir must store a CodeInstance via cache[mi] = create_ci(...) or populate!"
 
     results(ci).ir = ir
-    return ci, ir
+    return ir
 end
 
 """
-    get_code(cache, mi; emit_ir, emit_code) -> (CodeInstance, code)
+    get_code(cache, mi; emit_ir, emit_code) -> code
 
 Run IR and code generation phases for a method instance.
 
@@ -480,45 +481,49 @@ but don't need to load it into memory/GPU.
 The `emit_code(cache, mi, ir)` callback receives the IR from emit_ir.
 
 Returns the cached `code` result if available, otherwise runs `emit_ir` and `emit_code`.
+If you need the CodeInstance, use `cache[mi]` after calling this function.
 """
 function get_code(cache::CacheView, mi::Core.MethodInstance; emit_ir, emit_code)
-    ci, ir = get_ir(cache, mi; emit_ir)
+    ir = get_ir(cache, mi; emit_ir)
 
+    ci = cache[mi]
     wrapper = results(ci)
     if wrapper.code !== nothing
-        return ci, wrapper.code
+        return wrapper.code
     end
 
     code = emit_code(cache, mi, ir)
     wrapper.code = code
-    return ci, code
+    return code
 end
 
 """
-    get_executable(cache, mi; emit_ir, emit_code, emit_executable) -> (CodeInstance, executable)
+    get_executable(cache, mi; emit_ir, emit_code, emit_executable) -> executable
 
 Run all three phases (IR, code, executable) for a method instance.
 
 The `emit_executable(cache, mi, code)` callback receives the code from emit_code.
 
-Returns `(ci, executable)` where `executable` is the final linked/loaded result.
+Returns the final linked/loaded executable result.
+If you need the CodeInstance, use `cache[mi]` after calling this function.
 """
 function get_executable(cache::CacheView, mi::Core.MethodInstance;
                         emit_ir, emit_code, emit_executable)
     # Run emit_ir + emit_code (cached internally, hook fires in get_ir)
-    ci, code = get_code(cache, mi; emit_ir, emit_code)
+    code = get_code(cache, mi; emit_ir, emit_code)
 
     # Check for cached executable result
+    ci = cache[mi]
     wrapper = results(ci)
     if wrapper.executable !== nothing
-        return ci, wrapper.executable
+        return wrapper.executable
     end
 
     # Generate executable and store result
     executable = emit_executable(cache, mi, code)
     wrapper.executable = executable
 
-    return ci, executable
+    return executable
 end
 
 """
@@ -531,13 +536,11 @@ Callbacks:
 - `emit_code(cache, mi, ir)` - Generate code from IR
 - `emit_executable(cache, mi, code)` - Generate executable from code
 
-This is a convenience wrapper around `get_executable` that returns only the
-executable result (not the CodeInstance).
+This is a convenience wrapper around `get_executable`.
 """
 function cached_compilation(cache::CacheView, mi::Core.MethodInstance;
                             emit_ir, emit_code, emit_executable)
-    _, executable = get_executable(cache, mi; emit_ir, emit_code, emit_executable)
-    return executable
+    return get_executable(cache, mi; emit_ir, emit_code, emit_executable)
 end
 
 end # module CompilerCaching
