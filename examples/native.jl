@@ -92,44 +92,64 @@ function compile!(cache::CacheView, mi::Core.MethodInstance)
         res.executable = julia_jit(cache, mi, res.code)
     end
 
-    return res.executable
+    return res.executable::Ptr{Cvoid}
 end
 
-"""
-    call(f, args...) -> result
+function call_generator(world::UInt, source, self, f, args)
+    @nospecialize
 
-Compile (if needed) and call function `f` with the given arguments.
-"""
-@inline function call(f, args...)
-    argtypes = Tuple{map(Core.Typeof, args)...}
-    rettyp = Base.infer_return_type(f, argtypes)
-    _call_impl(rettyp, f, args...)
-end
-@generated function _call_impl(::Type{R}, f, args::Vararg{Any,N}) where {R,N}
-    argtypes = Tuple{args...}
+    stub = Core.GeneratedFunctionStub(identity, Core.svec(:call, :f, :args), Core.svec())
+    sig = Tuple{f, args...}
+
+    # TODO: Use findsup and StackedMethodTable?
+    mi = @ccall jl_method_lookup_by_tt(sig::Any, world::Csize_t, CUSTOM_MT::Any)::Any
+    if mi === nothing
+        mi = @ccall jl_method_lookup_by_tt(sig::Any, world::Csize_t, nothing::Any)::Any
+    end
+    if mi === nothing
+        return stub(world, source, :(throw(MethodError(f, args, $world))))
+    end
+    mi = mi::Core.MethodInstance
+
+    cache = CacheView{NativeResults}(:NativeExample, world)
+    ci = get(cache, mi, nothing)
+    if ci === nothing
+        interp = CustomInterpreter(cache)
+        CompilerCaching.typeinf!(cache, interp, mi)
+        ci = get(cache, mi)
+    end
+    rettype = ci.rettype
 
     # Build tuple expression for ccall: (T1, T2, ...)
     ccall_types = Expr(:tuple)
-    for i in 1:N
+    for i in 1:length(args)
         push!(ccall_types.args, args[i])
     end
 
     # Build argument expressions
     argexprs = Expr[]
-    for i in 1:N
+    for i in 1:length(args)
         push!(argexprs, :(args[$i]))
     end
 
-    quote
-        world = get_world_counter()
-        mi = @something(method_instance(f, $argtypes; world, method_table=CUSTOM_MT),
-                        method_instance(f, $argtypes; world),
-                        throw(MethodError(f, $argtypes)))
-
-        cache = CacheView{NativeResults}(:NativeExample, world)
-        ptr = compile!(cache, mi)
-        ccall(ptr, R, $ccall_types, $(argexprs...))
+    ir = quote
+        cache = CacheView{NativeResults}(:NativeExample, get_world_counter())
+        ptr = compile!(cache, $mi)
+        ccall(ptr, $rettype, $ccall_types, $(argexprs...))
     end
+    # TODO: On v1.11/v1.10 stub() returns an expr and not a CodeInfo
+    # see create_fresh_codeinfo in Enzyme.jl, but we must lower the ir above
+    # ourselves...
+    code_info = stub(world, source, ir)
+    if code_info isa CC.CodeInfo
+        code_info.edges = Any[mi]
+    end
+    return code_info
+end
+
+@eval function call(f, args...)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, call_generator))
 end
 
 
