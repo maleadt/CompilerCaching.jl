@@ -2,6 +2,7 @@
 # examples/julia.jl - Julia native code compilation helpers
 
 using CompilerCaching
+using CompilerCaching: get_source, get_codeinfos
 using LLVM
 using LLVM.Interop
 
@@ -57,19 +58,18 @@ function getglobal_jljit()
 end
 
 """
-    julia_codegen(cache, mi, codeinfos) -> (ir_bytes, entry_name)
+    julia_codegen(cache, mi, ci) -> (ir_bytes, entry_name)
 
 Generate LLVM IR and return serializable intermediate result.
 Returns a tuple of (LLVM bitcode bytes, entry function name).
 
-On Julia 1.12+, uses `codeinfos` (CodeInstance/CodeInfo pairs) for codegen.
-On Julia 1.11, `codeinfos` contains `[ci => nothing]`; uses cache lookup callback instead.
+Uses `get_codeinfos(ci)` to collect CodeInfos by walking :invoke statements (1.12+)
+or cache lookup callback (1.11).
 
 This function handles codegen but does not JIT compile - use `julia_jit` for that.
 """
 function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
-                       codeinfos::Vector{<:Pair{Core.CodeInstance}})
-
+                       ci::Core.CodeInstance)
     # Set up globals for the lookup callback
     _codegen_cache[] = cache
     lookup_cfunction = @cfunction(_codegen_lookup_cb, Any, (Any, UInt, UInt))
@@ -98,7 +98,7 @@ function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
         # Generate native code
         @static if VERSION >= v"1.12.0-DEV.1823"
             cis_vec = Any[]
-            for (ci, src) in codeinfos
+            for (ci, src) in get_codeinfos(ci)
                 push!(cis_vec, ci)
                 push!(cis_vec, src)
             end

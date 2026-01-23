@@ -29,34 +29,39 @@ using CompilerCaching
 
 # Define your results struct
 mutable struct MyResults
-    ir::Any
-    code::Any
     executable::Any
-    MyResults() = new(nothing, nothing, nothing)
+    MyResults() = new(nothing)
 end
 
 # Compile a method instance
-function compile(f, tt)
-    world = Base.get_world_counter()
-    mi = method_instance(f, tt; world)
-    cache = CacheView{MyResults}(:MyCompiler, world)
-
+function compile!(cache, mi)
+    # Get or create code instance
     ci = get!(cache, mi) do
         create_ci(cache, mi)
     end
-    res = results(cache, ci)
 
+    # Check for cache hit
+    res = results(cache, ci)
+    res.executable !== nothing && return res.executable
+
+    # Generate an executable.
+    # Use multiple steps (e.g. IR generation, machine code generation, linking) if needed.
     if res.executable === nothing
-        if res.ir === nothing
-            res.ir = emit_ir(cache, mi)
-        end
-        if res.code === nothing
-            res.code = emit_code(cache, mi, res.ir)
-        end
         res.executable = emit_executable(cache, mi, res.code)
     end
 
     return res.executable
+end
+
+function call(f, args...)
+    tt = map(Core.Typeof, args)
+    world = Base.get_world_counter()
+    mi = @something(method_instance(f, tt; world, method_table),
+                    throw(MethodError(f, args)))
+
+    cache = CacheView{MyResults}(:MyCompiler, world)
+    exe = compile!(cache, mi)
+    ccall(exe, ...)
 end
 ```
 
@@ -71,19 +76,16 @@ struct CustomInterpreter <: CC.AbstractInterpreter
 end
 @setup_caching CustomInterpreter.cache
 
-function compile(f, tt)
-    # ...
-
-    # Use typeinf! to populate the cache via inference
+function compile!(cache, mi)
+    # Get CI through inference
     ci = get(cache, mi, nothing)
     if ci === nothing
         interp = CustomInterpreter(cache)
-        ir = CompilerCaching.typeinf!(cache, interp, mi)
-        ci = ir[1][1]               # XXX: return the codeinstance
-        results(cache, ci).ir = ir  # XXX: for use by codegen
+        CompilerCaching.typeinf!(cache, interp, mi)
+        ci = get(cache, mi)
     end
 
-    # ...
+    # ... further compilation steps
 end
 ```
 
@@ -100,18 +102,11 @@ named tuple as the owner key type:
 
 ```julia
 function call(f, args...; opt_level=1)
-    tt = map(Core.Typeof, args)
-    world = Base.get_world_counter()
-    mi = @something(method_instance(f, tt; world),
-                    throw(MethodError(f, args)))
+    # ...
 
     cache = CacheView{MyResults}((:MyCompiler, opt_level), world)
 
-    ci = get!(cache, mi) do
-        create_ci(cache, mi)
-    end
-    res = results(cache, ci)
-    # ... compile if needed
+    # ...
 end
 ```
 
@@ -143,12 +138,7 @@ function call(f, args...)
                     # if needed, look for global methods too
                     throw(MethodError(f, args)))
 
-    cache = CacheView{MyResults}(:MyCompiler, world)
-    ci = get!(cache, mi) do
-        create_ci(cache, mi)
-    end
-    res = results(cache, ci)
-    # ... compile if needed
+    # ...
 end
 ```
 
@@ -187,9 +177,10 @@ add_method(method_table, really_special, (Int,), MyCustomIR([:a, :b]))
 # Compile function using get! do-block pattern
 function compile!(cache, mi)
     ci = get!(cache, mi) do
-        ir = mi.def.source::MyCustomIR
-        deps = Core.MethodInstance[]
+        source = mi.def.source::MyCustomIR
+        ir = infer(source)
 
+        deps = Core.MethodInstance[]
         for callee in ir.callees
             callee_mi = method_instance(callee.f, callee.tt; world=cache.world, method_table)
             compile!(cache, callee_mi)  # recursive compilation
@@ -197,10 +188,11 @@ function compile!(cache, mi)
         end
 
         ci = create_ci(cache, mi; deps)
-        results(cache, ci).ir = ir
+        results(cache, ci).ir = ir  # cache the inferred IR if needed
         return ci
     end
-    return results(cache, ci).ir
+
+    # ...
 end
 
 function call(f, args...)
@@ -210,6 +202,7 @@ function call(f, args...)
                     throw(MethodError(f, args)))
 
     cache = CacheView{ForeignResults}(:MyCompiler, world)
-    compile!(cache, mi)
+    exe = compile!(cache, mi)
+    ccall(exe, ...)
 end
 ```

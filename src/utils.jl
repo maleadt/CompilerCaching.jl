@@ -2,6 +2,8 @@
 # StackedMethodTable - composite method table view
 #==============================================================================#
 
+export StackedMethodTable
+
 """
     StackedMethodTable{MTV<:CC.MethodTableView} <: CC.MethodTableView
 

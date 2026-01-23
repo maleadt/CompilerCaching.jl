@@ -16,10 +16,9 @@ using Base.Experimental: @MethodTable, @overlay
 ## Results struct for native compilation
 
 mutable struct NativeResults
-    ir::Any           # Vector{Pair{CodeInstance, CodeInfo}} from typeinf!
     code::Any         # (ir_bytes, entry_name) from julia_codegen
     executable::Any   # Ptr{Cvoid} from julia_jit
-    NativeResults() = new(nothing, nothing, nothing)
+    NativeResults() = new(nothing, nothing)
 end
 
 
@@ -68,34 +67,30 @@ CC.method_table(interp::CustomInterpreter) = interp.method_table
 const compilations = Ref(0) # for testing
 
 function compile!(cache::CacheView, mi::Core.MethodInstance)
-    # For inference-based compilation, first check if CI exists
+    # Get a CI through inference
     ci = get(cache, mi, nothing)
-
-    if ci !== nothing
-        res = results(cache, ci)
-        if res.executable !== nothing
-            return res.executable
-        end
+    if ci === nothing
+        interp = CustomInterpreter(cache)
+        CompilerCaching.typeinf!(cache, interp, mi)
+        ci = get(cache, mi)
     end
 
-    # Cache miss or incomplete - need to compile
-
-    # emit_ir: runs inference (this creates the CI)
-    interp = CustomInterpreter(cache)
-    ir = CompilerCaching.typeinf!(cache, interp, mi)
-
-    # Get the CI that was created by typeinf!
-    ci = get(cache, mi, nothing)
-    @assert ci !== nothing "typeinf! should have created a CodeInstance"
+    # Check for a cache hit
     res = results(cache, ci)
-    res.ir = ir
-
-    # emit_code: generates LLVM IR
+    if res.executable !== nothing
+        return res.executable
+    end
     compilations[] += 1
-    res.code = julia_codegen(cache, mi, res.ir)
 
-    # emit_executable: JIT compiles to native code
-    res.executable = julia_jit(cache, mi, res.code)
+    # emit code: generate LLVM IR
+    if res.code === nothing
+        res.code = julia_codegen(cache, mi, ci)
+    end
+
+    # emit executable: JIT compile to function pointer
+    if res.executable === nothing
+        res.executable = julia_jit(cache, mi, res.code)
+    end
 
     return res.executable
 end

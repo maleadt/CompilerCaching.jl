@@ -128,6 +128,11 @@ end
 # Expose InternalCodeCache functionality
 Base.haskey(cache::CacheView, mi::Core.MethodInstance) = CC.haskey(code_cache(cache), mi)
 Base.get(cache::CacheView, mi::Core.MethodInstance, default) = CC.get(code_cache(cache), mi, default)
+function Base.get(cache::CacheView, mi::Core.MethodInstance)
+    ci = get(cache, mi, nothing)
+    ci === nothing && throw(KeyError(mi))
+    return ci
+end
 Base.getindex(cache::CacheView, mi::Core.MethodInstance) = CC.getindex(code_cache(cache), mi)
 Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance) = CC.setindex!(code_cache(cache), ci, mi)
 
@@ -242,141 +247,91 @@ method_instance
 # Populating the cache
 #==============================================================================#
 
-export typeinf!, create_ci
+export typeinf!, create_ci, get_source, get_codeinfos
 
 """
-    typeinf!(cache, interp, mi) -> Vector{Pair{CodeInstance, CodeInfo}}
+    typeinf!(cache, interp, mi) -> Nothing
 
-Run type inference on `mi` and store the resulting CodeInstances in the cache.
-
-Uses the provided interpreter, which must implement the `CC.AbstractInterpreter`
-interface. The resulting CodeInstances are stored in the cache for later retrieval.
-
-Returns a vector of (CodeInstance, CodeInfo) pairs:
-- **Julia 1.12+**: `[ci => CodeInfo, ...]` - root + callees in topological order
-- **Julia 1.11**: `[ci => CodeInfo]` - only root entry
-
-The root CI is always the first entry: `first(result)`.
-
-# Consumer Patterns
-
-For native codegen (uses full vector on 1.12+, callback on 1.11):
-```julia
-codeinfos = typeinf!(cache, interp, mi)
-julia_codegen(cache, mi, codeinfos)  # handles version differences internally
-```
-
-For IR transformation (uses first entry, inflates to IRCode):
-```julia
-codeinfos = typeinf!(cache, interp, mi)
-ci, src = first(codeinfos)
-ir = CC.inflate_ir(src, CC.get_ci_mi(ci))
-```
+Run type inference on `mi` and store the resulting CodeInstance in the cache.
+Eagerly compiles all callees and stores their source so `get_codeinfos` works.
+The CodeInstance can be retrieved with `get(cache, mi)`.
 """
 function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
                    mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
-        # Modern API: returns CodeInstance, use SOURCE_MODE to control caching
-        # (SOURCE_MODE_FORCE_SOURCE was renamed to SOURCE_MODE_GET_SOURCE)
-        source_mode = @static if isdefined(CC, :SOURCE_MODE_GET_SOURCE)
-            CC.SOURCE_MODE_GET_SOURCE
-        else
-            CC.SOURCE_MODE_FORCE_SOURCE
-        end
-        ci = CC.typeinf_ext(interp, mi, source_mode)
-        @assert ci !== nothing "Inference of $mi failed"
+        ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
+        ci === nothing && return nothing
 
-        # Collect all code that needs compilation (including callees)
-        codeinfos = Pair{Core.CodeInstance, Core.CodeInfo}[]
-
-        @static if VERSION >= v"1.13.0-DEV.499" || v"1.12-beta3" <= VERSION < v"1.13-"
+        # Eagerly compile all callees and store source
+        has_compilequeue = VERSION >= v"1.13.0-DEV.499" || v"1.12-beta3" <= VERSION < v"1.13-"
+        if has_compilequeue
             workqueue = CC.CompilationQueue(; interp)
             push!(workqueue, ci)
-            while !isempty(workqueue)
-                callee = pop!(workqueue)
-                CC.isinspected(workqueue, callee) && continue
-                CC.markinspected!(workqueue, callee)
-
-                callee_mi = CC.get_ci_mi(callee)
-                if CC.use_const_api(callee)
-                    @static if VERSION >= v"1.13.0-DEV.1121"
-                        src = CC.codeinfo_for_const(interp, callee_mi,
-                            CC.WorldRange(callee.min_world, callee.max_world),
-                            callee.edges, callee.rettype_const)
-                    else
-                        src = CC.codeinfo_for_const(interp, callee_mi, callee.rettype_const)
-                        # Work around 1.12/1.13 not setting nargs/isva in `codeinfo_for_const`
-                        # This is fixed by JuliaLang/julia#59413, and will be backported.
-                        @static if v"1.12-" <= VERSION < v"1.14.0-DEV.60"
-                            if src.nargs == 0 && callee_mi.def isa Method
-                                src.nargs = callee_mi.def.nargs
-                                src.isva = callee_mi.def.isva
-                            end
-                        end
-                    end
-                else
-                    src = CC.typeinf_code(interp, callee_mi, true)
-                end
-                if src isa Core.CodeInfo
-                    sptypes = CC.sptypes_from_meth_instance(callee_mi)
-                    CC.collectinvokes!(workqueue, src, sptypes)
-                    push!(codeinfos, callee => src)
-                end
-            end
         else
-            # Older 1.12 API
             workqueue = Core.CodeInstance[ci]
             inspected = IdSet{Core.CodeInstance}()
-            while !isempty(workqueue)
-                callee = pop!(workqueue)
+        end
+
+        while !isempty(workqueue)
+            callee = pop!(workqueue)
+            if has_compilequeue
+                CC.isinspected(workqueue, callee) && continue
+                CC.markinspected!(workqueue, callee)
+            else
                 callee in inspected && continue
                 push!(inspected, callee)
+            end
 
-                callee_mi = CC.get_ci_mi(callee)
-                if CC.use_const_api(callee)
-                    src = CC.codeinfo_for_const(interp, callee_mi, callee.rettype_const)
-                    # Work around 1.12/1.13 not setting nargs/isva in `codeinfo_for_const`
-                    # This is fixed by JuliaLang/julia#59413, and will be backported.
-                    @static if v"1.12-" <= VERSION < v"1.14.0-DEV.60"
-                        if src.nargs == 0 && callee_mi.def isa Method
-                            src.nargs = callee_mi.def.nargs
-                            src.isva = callee_mi.def.isva
-                        end
-                    end
-                else
-                    src = CC.typeinf_code(interp, callee_mi, true)
+            # now make sure everything has source code, if desired
+            callee_mi = CC.get_ci_mi(callee)
+            if CC.use_const_api(callee)
+                # const-return: get_source will synthesize CodeInfo, no need to store
+                continue
+            end
+
+            src = CC.typeinf_code(interp, callee_mi, true)
+            if src isa Core.CodeInfo
+                # Store source so get_codeinfos can retrieve it later
+                if (@atomic callee.inferred) === nothing
+                    @atomic callee.inferred = src
                 end
-                if src isa Core.CodeInfo
+                if has_compilequeue
+                    sptypes = CC.sptypes_from_meth_instance(callee_mi)
+                    CC.collectinvokes!(workqueue, src, sptypes)
+                else
                     CC.collectinvokes!(workqueue, src)
-                    push!(codeinfos, callee => src)
                 end
             end
         end
-
-        return codeinfos
     elseif VERSION >= v"1.12.0-DEV.15"
-        # Julia 1.12 early API
-        source_mode = @static if isdefined(CC, :SOURCE_MODE_GET_SOURCE)
-            CC.SOURCE_MODE_GET_SOURCE
-        else
-            CC.SOURCE_MODE_FORCE_SOURCE
-        end
-        ci = CC.typeinf_ext_toplevel(interp, mi, source_mode)
-        @assert ci !== nothing "Inference of $mi failed"
-        return Pair{Core.CodeInstance, Core.CodeInfo}[]
-    else
-        # Julia 1.11 API - cache populated implicitly
-        src = CC.typeinf_ext_toplevel(interp, mi)
+        inferred_ci = CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
+        @assert inferred_ci !== nothing "Inference of $mi failed"
 
-        # Handle const-return case where ci.inferred may be nothing
-        ci = get(cache, mi, nothing)
-        @assert ci !== nothing "Inference of $mi failed"
+        # inference should have populated our cache
+        ci = get(cache, mi)
+
+        # if ci is rettype_const, the inference result won't have been cached
+        # (because it is normally not supposed to be used ever again).
+        # to avoid the need to re-infer, set that field here.
+        if ci.inferred === nothing
+            cache[mi] = inferred_ci
+        end
+    else
+        # Julia 1.11: typeinf_ext_toplevel returns CodeInfo, not CI
+        src = CC.typeinf_ext_toplevel(interp, mi)
+        @assert src !== nothing "Inference of $mi failed"
+
+        # inference should have populated our cache
+        ci = get(cache, mi)
+
+        # if ci is rettype_const, the inference result won't have been cached
+        # (because it is normally not supposed to be used ever again).
+        # to avoid the need to re-infer, set that field here.
         if ci.inferred === nothing
             @atomic ci.inferred = src
         end
-
-        return Pair{Core.CodeInstance, Core.CodeInfo}[ci => src]
     end
+    return
 end
 
 """
@@ -439,6 +394,94 @@ function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
         end
     end
     nothing
+end
+
+"""
+    get_source(ci::CodeInstance) -> Union{CodeInfo, Nothing}
+
+Retrieve CodeInfo from a CodeInstance's inferred field.
+Handles decompression if stored as String, and generates synthetic
+CodeInfo for const-return functions.
+
+Returns `nothing` if CodeInfo cannot be retrieved (e.g., for runtime
+functions inferred by NativeInterpreter that don't store source).
+For the root CI from `typeinf!`, this should always return valid CodeInfo.
+"""
+function get_source(ci::Core.CodeInstance)
+    mi = @static if VERSION >= v"1.12-"
+        CC.get_ci_mi(ci)
+    else
+        ci.def::Core.MethodInstance
+    end
+
+    src = @atomic :monotonic ci.inferred
+    if src === nothing
+        # For const-return functions, generate synthetic CodeInfo
+        if CC.use_const_api(ci)
+            @static if VERSION >= v"1.13.0-DEV.1121"
+                src = CC.codeinfo_for_const(CC.NativeInterpreter(), mi,
+                    CC.WorldRange(ci.min_world, ci.max_world),
+                    ci.edges, ci.rettype_const)
+            elseif VERSION >= v"1.12-"
+                src = CC.codeinfo_for_const(CC.NativeInterpreter(), mi, ci.rettype_const)
+                # Work around 1.12/1.13 not setting nargs/isva in `codeinfo_for_const`
+                @static if v"1.12-" <= VERSION < v"1.14.0-DEV.60"
+                    if src.nargs == 0 && mi.def isa Method
+                        src.nargs = mi.def.nargs
+                        src.isva = mi.def.isva
+                    end
+                end
+            end
+        end
+    elseif src isa String
+        # Decompress if stored as compressed String
+        src = ccall(:jl_uncompress_ir, Ref{Core.CodeInfo},
+                    (Any, Any, Any), mi.def::Method, ci, src)
+    end
+    return src isa Core.CodeInfo ? src : nothing
+end
+
+"""
+    get_codeinfos(ci::CodeInstance) -> Vector{Pair{CodeInstance, CodeInfo}}
+
+Collect CodeInstance/CodeInfo pairs by walking forward edges from a root CI.
+
+On Julia 1.12+, walks `:invoke` statements to collect callees transitively.
+On Julia 1.11, returns only the root entry.
+
+Requires that `typeinf!` was called first to populate source for all callees.
+"""
+function get_codeinfos(ci::Core.CodeInstance)
+    codeinfos = Pair{Core.CodeInstance, Core.CodeInfo}[]
+    @static if VERSION >= v"1.12-"
+        visited = IdSet{Core.CodeInstance}()
+        workqueue = Core.CodeInstance[ci]
+        while !isempty(workqueue)
+            callee_ci = pop!(workqueue)
+            callee_ci in visited && continue
+            push!(visited, callee_ci)
+
+            src = get_source(callee_ci)
+            @assert src !== nothing "CodeInstance for $(CC.get_ci_mi(callee_ci)) has no source - ensure typeinf! was called"
+            push!(codeinfos, callee_ci => src)
+
+            for stmt in src.code
+                if stmt isa Expr && stmt.head === :(=)
+                    stmt = stmt.args[2]
+                end
+                if stmt isa Expr && (stmt.head === :invoke || stmt.head === :invoke_modify)
+                    callee = stmt.args[1]
+                    if callee isa Core.CodeInstance
+                        push!(workqueue, callee)
+                    end
+                end
+            end
+        end
+    else
+        src = get_source(ci)
+        src !== nothing && push!(codeinfos, ci => src)
+    end
+    return codeinfos
 end
 
 end # module CompilerCaching

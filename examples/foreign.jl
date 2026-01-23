@@ -12,7 +12,7 @@ Base.Experimental.@MethodTable method_table
 ## Results struct for foreign compilation
 
 mutable struct ForeignResults
-    ir::Any   # The evaluated IR result
+    val::Any   # The evaluated result
     ForeignResults() = new(nothing)
 end
 
@@ -65,14 +65,17 @@ function compile!(cache::CacheView, mi::Core.MethodInstance)
     ci = get!(cache, mi) do
         compilations[] += 1
         source_ir = mi.def.source::Expr
-        deps = Core.MethodInstance[]
-        result = interpret(cache, source_ir, deps)
 
+        # "infer" the IR (simple constant folding + call resolution)
+        deps = Core.MethodInstance[]
+        val = interpret(cache, source_ir, deps)
+
+        # create a code instance for dependency tracking
         ci = create_ci(cache, mi; deps)
-        results(cache, ci).ir = result
+        results(cache, ci).val = val
         return ci
     end
-    return results(cache, ci).ir
+    return results(cache, ci).val
 end
 
 ## high-level API

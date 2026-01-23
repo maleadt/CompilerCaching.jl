@@ -1,4 +1,5 @@
 using CompilerCaching
+using CompilerCaching: get_source
 using Test
 using Base.Experimental: @MethodTable
 
@@ -170,14 +171,15 @@ end
     mi = method_instance(test_fn, (Int,); world)
 
     interp = TestInterpreter(cache)
-    result = typeinf!(cache, interp, mi)
+    typeinf!(cache, interp, mi)
 
-    # typeinf! now always returns Vector{Pair{CI, IR}}
-    @test result isa Vector
-    @test length(result) >= 1
-    ci, ir = first(result)
+    # CI is stored in cache, retrieve with get
+    ci = get(cache, mi, nothing)
     @test ci isa Core.CodeInstance
-    @test ir isa Core.CodeInfo
+
+    # Get CodeInfo via get_source
+    src = get_source(ci)
+    @test src isa Core.CodeInfo
 
     # Test that results accessor works on inferred CI
     res = results(cache, ci)
@@ -191,10 +193,9 @@ end
     mi2 = method_instance(const_return_fn, (Int,); world=world2)
 
     interp2 = TestInterpreter(cache2)
-    result2 = typeinf!(cache2, interp2, mi2)
+    typeinf!(cache2, interp2, mi2)
 
-    @test length(result2) >= 1
-    ci2, _ = first(result2)
+    ci2 = get(cache2, mi2, nothing)
     @test ci2 isa Core.CodeInstance
     # Verify it's actually a const-return CI (skip under coverage as it disables const-return)
     @test Core.Compiler.use_const_api(ci2) skip=(Base.JLOptions().code_coverage > 0)
