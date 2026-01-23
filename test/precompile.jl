@@ -28,6 +28,14 @@ precompile_test_harness("Inference caching") do load_path
 
         const CC = Core.Compiler
 
+        # Results struct for this compiler
+        mutable struct CompileResults
+            ir::Any
+            code::Any
+            executable::Any
+            CompileResults() = new(nothing, nothing, nothing)
+        end
+
         struct ExampleInterpreter <: CC.AbstractInterpreter
             world::UInt
             cache::CacheView
@@ -49,25 +57,48 @@ precompile_test_harness("Inference caching") do load_path
         @setup_caching ExampleInterpreter.cache
 
         emit_code_count = Ref(0)
+
         function emit_ir(cache, mi)
             interp = ExampleInterpreter(cache)
             typeinf!(cache, interp, mi)
         end
-        emit_code(cache, mi, ir) = (emit_code_count[] += 1; :code_result)
+
+        function emit_code(cache, mi, ir)
+            emit_code_count[] += 1
+            :code_result
+        end
+
         emit_executable(cache, mi, code) = code
 
         function precompile(f, tt)
             world = Base.get_world_counter()
             mi = method_instance(f, tt; world)
-            cache = CacheView(:ExampleCompiler, world)
-            result = get!(cache, mi, :executable) do cache, mi
-                ir = get!(emit_ir, cache, mi, :ir)
-                code = get!(cache, mi, :code) do cache, mi
-                    emit_code(cache, mi, ir)
+            cache = CacheView{CompileResults}(:ExampleCompiler, world)
+
+            # For inference-based compilation, check if CI already exists
+            ci = get(cache, mi, nothing)
+            if ci !== nothing
+                res = results(cache, ci)
+                if res.executable !== nothing
+                    return res.executable
                 end
-                emit_executable(cache, mi, code)
             end
-            @assert result === :code_result
+
+            # Cache miss or incomplete - run inference (creates CI)
+            ir = emit_ir(cache, mi)
+
+            # Get the CI created by typeinf!
+            ci = get(cache, mi, nothing)
+            @assert ci !== nothing "typeinf! should have created CI"
+            res = results(cache, ci)
+            res.ir = ir
+
+            # Generate code
+            res.code = emit_code(cache, mi, res.ir)
+            res.executable = emit_executable(cache, mi, res.code)
+
+            @assert res.executable === :code_result
+            return res.executable
         end
 
         end # module
@@ -99,7 +130,7 @@ precompile_test_harness("Inference caching") do load_path
         import ExampleCompiler
         @test ExampleCompiler.emit_code_count[] == 0
 
-        cache = CacheView(:ExampleCompiler, Base.get_world_counter())
+        cache = CacheView{ExampleCompiler.CompileResults}(:ExampleCompiler, Base.get_world_counter())
 
         # Check that no cached entry is present
         identity_mi = method_instance(identity, (Int,))
@@ -109,7 +140,7 @@ precompile_test_harness("Inference caching") do load_path
         @test ExampleCompiler.emit_code_count[] == 0
 
         # importing the package bumps the world age, so get a new cache view
-        cache = CacheView(:ExampleCompiler, Base.get_world_counter())
+        cache = CacheView{ExampleCompiler.CompileResults}(:ExampleCompiler, Base.get_world_counter())
 
         # Check that kernel survived
         square_mi = method_instance(ExampleUser.square, (Float64,))

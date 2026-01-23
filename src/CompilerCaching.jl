@@ -17,62 +17,34 @@ include("utils.jl")
 
 
 #==============================================================================#
-# Global compile hook for debugging/inspection/reflection
-#==============================================================================#
-
-export compile_hook, compile_hook!
-
-const _COMPILE_HOOK = Ref{Union{Nothing, Function}}(nothing)
-
-"""
-    compile_hook() -> Union{Nothing, Function}
-
-Get the current compile hook.
-"""
-compile_hook() = _COMPILE_HOOK[]
-
-"""
-    compile_hook!(f)
-    compile_hook!(nothing)
-
-Set the global compile hook. Called at the start of every `get!(f, cache, mi, key)`
-invocation with `(cache, mi)`. Return value ignored.
-
-The hook is called even for fully cached calls.
-"""
-compile_hook!(f) = _COMPILE_HOOK[] = f
-
-
-#==============================================================================#
 # CacheView structure
 #==============================================================================#
 
-export CacheView, @setup_caching
+export CacheView, @setup_caching, results
 
 """
-    CacheView{K}
+    CacheView{K, V}
 
 A cache into a cache partition at a specific world age. Serves as the main entry point
 for cached compilation.
-
-- `tag::Symbol` - Base identifier (e.g., `:SynchJulia`, `:GPUCompiler`)
-- `world::UInt` - World age for cache validity
-- `keys::K` - Additional sharding keys (e.g., device capability, optimization level, method table)
 """
-struct CacheView{K}
-    tag::Symbol
+struct CacheView{K, V}
+    owner::K
     world::UInt
-    keys::K
-    CacheView{K}(tag::Symbol, world::UInt, keys) where K = new{K}(tag, world, convert(K, keys))
+    CacheView{K,V}(owner, world::UInt) where {K,V} = new{K,V}(convert(K, owner), world)
 end
 
-# Convenience constructor for simple usage without sharding keys
-CacheView(tag::Symbol, world::UInt) = CacheView{Nothing}(tag, world, nothing)
+CacheView{V}(owner::K, world::UInt) where {K,V} = CacheView{K,V}(owner, world)
 
 """
     @setup_caching InterpreterType.cache_field
 
 Generate the required methods for an AbstractInterpreter to work with CompilerCaching.
+
+The cache field must be a `CacheView{K, V}` where `V` is your typed results struct.
+The macro generates:
+- `CC.cache_owner(interp)` returning the cache's owner token
+- `CC.finish!(interp, caller, ...)` that stacks a new `V()` instance in analysis results
 """
 macro setup_caching(expr)
     # Parse InterpreterType.cache_field
@@ -89,7 +61,7 @@ macro setup_caching(expr)
         quote
             function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState,
                                  validation_world::UInt, time_before::UInt64)
-                $CC.stack_analysis_result!(caller.result, Dict{Symbol,Any}())
+                $CC.stack_analysis_result!(caller.result, $results_type(interp.$cache_field)())
                 @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState,
                                     validation_world::UInt, time_before::UInt64)
             end
@@ -97,7 +69,7 @@ macro setup_caching(expr)
     else
         quote
             function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState)
-                $CC.stack_analysis_result!(caller.result, Dict{Symbol,Any}())
+                $CC.stack_analysis_result!(caller.result, $results_type(interp.$cache_field)())
                 @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState)
             end
         end
@@ -112,9 +84,34 @@ end
 """
     cache_owner(cache::CacheView)
 
-Returns a token for use as CodeInstance.owner.
+Returns the owner token for use as CodeInstance.owner.
 """
-cache_owner(cache::CacheView) = (cache.tag, cache.keys)
+cache_owner(cache::CacheView) = cache.owner
+
+"""
+    results_type(cache::CacheView{K,V}) -> Type{V}
+
+Returns the results type V for a cache view.
+"""
+results_type(::CacheView{K,V}) where {K,V} = V
+
+"""
+    results(::Type{V}, ci::CodeInstance)::V
+    results(cache::CacheView{K,V}, ci::CodeInstance)::V
+
+Retrieve the typed results struct from a CodeInstance's `analysis_results` chain.
+Throws if no V is found - this indicates @setup_caching wasn't used correctly
+or create_ci wasn't called.
+"""
+function results(::Type{V}, ci::Core.CodeInstance)::V where V
+    result = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa V ? result : nothing
+    end
+    @assert result !== nothing "CodeInstance missing $V results - ensure @setup_caching is used or create_ci was called"
+    return result
+end
+
+results(::CacheView{K,V}, ci::Core.CodeInstance) where {K,V} = results(V, ci)
 
 @static if VERSION >= v"1.14-"
     function code_cache(cache::CacheView)
@@ -136,53 +133,32 @@ Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance)
 
 
 #==============================================================================#
-# Cached compilation results
+# Cache access
 #==============================================================================#
 
 """
-    cached_results(ci::CodeInstance) -> Dict{Symbol, Any}
+    Base.get!(f::Function, cache::CacheView, mi::MethodInstance) -> CodeInstance
 
-Retrieve the compilation results dict from a CodeInstance's `analysis_results` chain.
-Throws if no dict is found - this indicates @setup_caching wasn't used correctly
-or create_ci wasn't called.
+Get an existing CodeInstance or create one using `f()`.
+
+Standard dict interface: returns existing CI if found, otherwise calls `f()`
+which must return a CodeInstance, stores it, and returns it.
+
+# Example (foreign mode)
+```julia
+ci = get!(cache, mi) do
+    create_ci(cache, mi; deps)
+end
+```
 """
-function cached_results(ci::Core.CodeInstance)
-    result = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa Dict{Symbol,Any} ? result : nothing
-    end
-    @assert result !== nothing "CodeInstance missing results Dict - ensure @setup_caching is used or create_ci was called"
-    return result
+function Base.get!(f::Function, cache::CacheView, mi::Core.MethodInstance)
+    ci = get(cache, mi, nothing)
+    ci !== nothing && return ci
+    ci = f()::Core.CodeInstance
+    cache[mi] = ci
+    return ci
 end
 
-"""
-    Base.get!(f, cache::CacheView, mi::MethodInstance, key::Symbol)
-
-Get a cached value or compute and store it.
-"""
-function Base.get!(f, cache::CacheView, mi::Core.MethodInstance, key::Symbol)
-    # Call compile hook if set (even for cached calls)
-    hook = compile_hook()
-    if hook !== nothing
-        hook(cache, mi)
-    end
-
-    # Check for cached value
-    ci = get(cache, mi, nothing)
-    if ci !== nothing
-        cr = cached_results(ci)
-        val = get(cr, key, nothing)
-        val !== nothing && return val
-    end
-
-    # Compute value - callback must create CI if it doesn't exist
-    value = f(cache, mi)
-
-    # Store the value
-    ci = get(cache, mi, nothing)
-    @assert ci !== nothing "Callback must store a CodeInstance via cache[mi] = create_ci(...) or typeinf!"
-    cached_results(ci)[key] = value
-    return value
-end
 
 
 #==============================================================================#
@@ -404,20 +380,25 @@ function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
 end
 
 """
-    create_ci(cache, mi; deps) -> CodeInstance
+    create_ci(cache::CacheView{K,V}, mi; deps) -> CodeInstance
 
-Create a CodeInstance for `mi` with proper owner and backedges.
+Create a CodeInstance for `mi` with proper owner, typed results, and backedges.
+
+Creates a new CodeInstance with:
+- Owner set to `cache.owner`
+- A fresh `V()` instance in analysis_results
+- Backedges registered for all dependencies in `deps`
 
 Used for foreign mode where inference doesn't run. The CI participates in
 Julia's invalidation mechanism via backedges registered from `deps`.
 """
-function create_ci(cache::CacheView, mi::Core.MethodInstance;
-                   deps::Vector{Core.MethodInstance}=Core.MethodInstance[])
-    owner = cache_owner(cache)
+function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
+                   deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) where {K,V}
+    owner = cache.owner
     edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
 
-    # Create empty dict for later population via `cached_results(ci)[key] = value`
-    ar = CC.AnalysisResults(Dict{Symbol,Any}(), CC.NULL_ANALYSIS_RESULTS)
+    # Create typed results instance via V()
+    ar = CC.AnalysisResults(V(), CC.NULL_ANALYSIS_RESULTS)
 
     @static if VERSION >= v"1.12-"
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,

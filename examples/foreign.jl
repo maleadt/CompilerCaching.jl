@@ -3,10 +3,18 @@
 # - Cache views created on-the-fly before compilation
 # - Demonstrates: caching, redefinition, multiple dispatch
 
-using CompilerCaching: CacheView, add_method, method_instance, create_ci
+using CompilerCaching: CacheView, add_method, method_instance, create_ci, results
 
 
 Base.Experimental.@MethodTable method_table
+
+
+## Results struct for foreign compilation
+
+mutable struct ForeignResults
+    ir::Any   # The evaluated IR result
+    ForeignResults() = new(nothing)
+end
 
 
 ## Simple IR: numbers, arithmetic ops as heads, calls to foreign functions
@@ -40,7 +48,7 @@ function interpret(cache, expr, deps)
             f = only(args)::Function
             mi = @something(method_instance(f, (); world=cache.world, method_table),
                             error("Unknown function: $f"))
-            ir = get!(emit_ir, cache, mi, :ir)
+            ir = compile!(cache, mi)
             push!(deps, mi)
             return ir
         end
@@ -52,14 +60,19 @@ function interpret(cache, expr, deps)
 end
 
 const compilations = Ref(0)
-function emit_ir(cache, mi)
-    source_ir = mi.def.source::Expr
-    deps = Core.MethodInstance[]
-    compilations[] += 1
 
-    result = interpret(cache, source_ir, deps)
-    cache[mi] = create_ci(cache, mi; deps)
-    return result
+function compile!(cache::CacheView, mi::Core.MethodInstance)
+    ci = get!(cache, mi) do
+        compilations[] += 1
+        source_ir = mi.def.source::Expr
+        deps = Core.MethodInstance[]
+        result = interpret(cache, source_ir, deps)
+
+        ci = create_ci(cache, mi; deps)
+        results(cache, ci).ir = result
+        return ci
+    end
+    return results(cache, ci).ir
 end
 
 ## high-level API
@@ -70,8 +83,8 @@ function call(f, args...)
     mi = @something(method_instance(f, tt; world, method_table),
                     throw(MethodError(f, args)))
 
-    cache = CacheView(:ForeignExample, world)
-    get!(emit_ir, cache, mi, :ir)
+    cache = CacheView{ForeignResults}(:ForeignExample, world)
+    compile!(cache, mi)
 end
 
 

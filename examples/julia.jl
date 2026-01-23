@@ -30,7 +30,7 @@ const _codegen_cache = Ref{Any}(nothing)
 function _codegen_lookup_cb(mi, min_world, max_world)
     # Create a cache at the min_world for lookup
     cache = _codegen_cache[]
-    lookup_cache = CacheView(cache.tag, min_world)
+    lookup_cache = CacheView{typeof(cache).parameters[1], typeof(cache).parameters[2]}(cache.owner, min_world)
     ci = get(lookup_cache, mi, nothing)
     @static if VERSION < v"1.12.0-DEV.1434"
         # Refuse to return CI without source - force re-inference before codegen

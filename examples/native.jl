@@ -13,6 +13,16 @@ using Base.Experimental: @MethodTable, @overlay
 @MethodTable CUSTOM_MT
 
 
+## Results struct for native compilation
+
+mutable struct NativeResults
+    ir::Any           # Vector{Pair{CodeInstance, CodeInfo}} from typeinf!
+    code::Any         # (ir_bytes, entry_name) from julia_codegen
+    executable::Any   # Ptr{Cvoid} from julia_jit
+    NativeResults() = new(nothing, nothing, nothing)
+end
+
+
 ## abstract interpreter
 
 struct CustomInterpreter <: CC.AbstractInterpreter
@@ -55,24 +65,39 @@ CC.method_table(interp::CustomInterpreter) = interp.method_table
 
 ## high-level API
 
-# returns codeinfos, CI is in cache via typeinf!
-function emit_ir(cache::CacheView, mi::Core.MethodInstance)
-    interp = CustomInterpreter(cache)
-    return CompilerCaching.typeinf!(cache, interp, mi)
-end
-
-# depends on ir, counts compilations for testing
 const compilations = Ref(0) # for testing
-function emit_code(cache::CacheView, mi::Core.MethodInstance)
-    ir = get!(emit_ir, cache, mi, :ir)
-    compilations[] += 1
-    julia_codegen(cache, mi, ir)
-end
 
-# depends on code
-function emit_executable(cache::CacheView, mi::Core.MethodInstance)
-    code = get!(emit_code, cache, mi, :code)
-    julia_jit(cache, mi, code)
+function compile!(cache::CacheView, mi::Core.MethodInstance)
+    # For inference-based compilation, first check if CI exists
+    ci = get(cache, mi, nothing)
+
+    if ci !== nothing
+        res = results(cache, ci)
+        if res.executable !== nothing
+            return res.executable
+        end
+    end
+
+    # Cache miss or incomplete - need to compile
+
+    # emit_ir: runs inference (this creates the CI)
+    interp = CustomInterpreter(cache)
+    ir = CompilerCaching.typeinf!(cache, interp, mi)
+
+    # Get the CI that was created by typeinf!
+    ci = get(cache, mi, nothing)
+    @assert ci !== nothing "typeinf! should have created a CodeInstance"
+    res = results(cache, ci)
+    res.ir = ir
+
+    # emit_code: generates LLVM IR
+    compilations[] += 1
+    res.code = julia_codegen(cache, mi, res.ir)
+
+    # emit_executable: JIT compiles to native code
+    res.executable = julia_jit(cache, mi, res.code)
+
+    return res.executable
 end
 
 """
@@ -106,8 +131,8 @@ end
                         method_instance(f, $argtypes; world),
                         throw(MethodError(f, $argtypes)))
 
-        cache = CacheView(:NativeExample, world)
-        ptr = get!(emit_executable, cache, mi, :executable)
+        cache = CacheView{NativeResults}(:NativeExample, world)
+        ptr = compile!(cache, mi)
         ccall(ptr, R, $ccall_types, $(argexprs...))
     end
 end
