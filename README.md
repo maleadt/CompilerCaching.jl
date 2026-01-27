@@ -19,10 +19,10 @@ track of compilation results. Code instances are owned by a specific compiler, i
 by an owner token, and they contain a cache of results specific to that compiler.
 
 The basic usage pattern of working with the compiler cache through CompilerCaching.jl:
-1. Define a mutable results struct with a zero-arg constructor
-2. Create a `CacheView{V}(owner, world)` where `V` is your results struct type
+1. Define a mutable struct with a zero-arg constructor to hold compilation results
+2. Create a `CacheView{V}(owner_token, world)` where `V` is your results struct type
 3. Use the cache's `Dict` interface to get or create a code instance for a method instance
-4. Access compilation results via `results(cache, ci)`, populating them as needed
+4. Access cached compilation results via `results(cache, ci)`, populating them if needed
 
 ```julia
 using CompilerCaching
@@ -65,8 +65,12 @@ function call(f, args...)
 end
 ```
 
-For compilers that use Julia's type inference, you'll also need an AbstractInterpreter
-with `@setup_caching`:
+The `create_ci` function creates a bare code instance with (initially empty)
+compilation results. Most users will want to rely on Julia's type inference
+to instead populate the cache with a code instance that knows about dependent
+methods for invalidation purposes, and contains inferred source code for further.
+compilation This can be done with a custom abstract interpreter and the `typeinf!`
+function from this package:
 
 ```julia
 # Set-up a custom interpreter, and link it to the cache
