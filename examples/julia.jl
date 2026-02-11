@@ -126,12 +126,29 @@ function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
                 lookup_cfunction::Ptr{Cvoid}
             )::Ptr{Cvoid}
         else
-            native_code = @ccall jl_create_native(
-                [mi]::Vector{Core.MethodInstance},
-                ts_mod::LLVM.API.LLVMOrcThreadSafeModuleRef,
-                Ref(params)::Ptr{CodegenParams},
-                1::Cint, 0::Cint, 0::Cint, cache.world::Csize_t
-            )::Ptr{Cvoid}
+            # On 1.11, jl_create_native reads ci.inferred via the lookup callback.
+            # Temporarily swap with the const-seeded source if available.
+            saved_inferred = nothing
+            if argtypes !== nothing
+                const_src = get_source(ci, argtypes)
+                if const_src !== nothing
+                    saved_inferred = @atomic :monotonic ci.inferred
+                    @atomic :monotonic ci.inferred = const_src
+                end
+            end
+            native_code = C_NULL
+            try
+                native_code = @ccall jl_create_native(
+                    [mi]::Vector{Core.MethodInstance},
+                    ts_mod::LLVM.API.LLVMOrcThreadSafeModuleRef,
+                    Ref(params)::Ptr{CodegenParams},
+                    1::Cint, 0::Cint, 0::Cint, cache.world::Csize_t
+                )::Ptr{Cvoid}
+            finally
+                if saved_inferred !== nothing
+                    @atomic :monotonic ci.inferred = saved_inferred
+                end
+            end
         end
 
         @assert native_code != C_NULL "Code generation failed"
