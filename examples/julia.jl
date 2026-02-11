@@ -58,18 +58,20 @@ function getglobal_jljit()
 end
 
 """
-    julia_codegen(cache, mi, ci) -> (ir_bytes, entry_name)
+    julia_codegen(cache, mi, ci; argtypes=nothing) -> (ir_bytes, entry_name)
 
 Generate LLVM IR and return serializable intermediate result.
 Returns a tuple of (LLVM bitcode bytes, entry function name).
 
 Uses `get_codeinfos(ci)` to collect CodeInfos by walking :invoke statements (1.12+)
-or cache lookup callback (1.11).
+or cache lookup callback (1.11). When `argtypes` is provided, uses the const-optimized
+source for the root CI via `get_codeinfos(ci, argtypes)`.
 
 This function handles codegen but does not JIT compile - use `julia_jit` for that.
 """
 function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
-                       ci::Core.CodeInstance)
+                       ci::Core.CodeInstance;
+                       argtypes::Union{Vector{Any},Nothing}=nothing)
     # Set up globals for the lookup callback
     _codegen_cache[] = cache
     lookup_cfunction = @cfunction(_codegen_lookup_cb, Any, (Any, UInt, UInt))
@@ -98,7 +100,8 @@ function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
         # Generate native code
         @static if VERSION >= v"1.12.0-DEV.1823"
             cis_vec = Any[]
-            for (ci, src) in get_codeinfos(ci)
+            codeinfos = argtypes !== nothing ? get_codeinfos(ci, argtypes) : get_codeinfos(ci)
+            for (ci, src) in codeinfos
                 push!(cis_vec, ci)
                 push!(cis_vec, src)
             end

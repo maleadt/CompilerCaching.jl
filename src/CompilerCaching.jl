@@ -49,6 +49,55 @@ mutable struct CachedResult{V}
 end
 
 """
+    get_invoke_mi(stmt::Expr) -> Union{MethodInstance, Nothing}
+
+Version-portable extraction of the callee MethodInstance from an `:invoke` statement.
+On 1.12+ the first arg may be a CodeInstance; on 1.11 it's a MethodInstance directly.
+"""
+function get_invoke_mi(stmt::Expr)
+    target = stmt.args[1]
+    @static if VERSION >= v"1.12-"
+        target isa Core.CodeInstance && return CC.get_ci_mi(target)
+    end
+    target isa Core.MethodInstance && return target
+    return nothing
+end
+
+"""
+    extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes) -> Vector{Any}
+
+Extract inferred argument types at each position of an `:invoke` call using `CC.argextype`.
+Skips the invoke target at position 1.
+"""
+function extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes)
+    argtypes = Any[]
+    for j in 2:length(stmt.args)
+        push!(argtypes, CC.argextype(stmt.args[j], src, sptypes))
+    end
+    return argtypes
+end
+
+"""
+    extract_invoke_argtypes(stmt, src, sptypes, parent_argtypes) -> Vector{Any}
+
+Like `extract_invoke_argtypes`, but resolves `Argument(i)` nodes using the parent's
+const-enriched argtypes instead of the source's generic slot types.
+"""
+function extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes,
+                                 parent_argtypes::Vector{Any})
+    argtypes = Any[]
+    for j in 2:length(stmt.args)
+        arg = stmt.args[j]
+        if arg isa Core.Argument && checkbounds(Bool, parent_argtypes, arg.n)
+            push!(argtypes, parent_argtypes[arg.n])
+        else
+            push!(argtypes, CC.argextype(arg, src, sptypes))
+        end
+    end
+    return argtypes
+end
+
+"""
     CacheView{K, V}
 
 A cache into a cache partition at a specific world age. Serves as the main entry point
@@ -438,6 +487,12 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
     end
     CC.typeinf(interp, frame)
 
+    # Convert OptimizationState → CodeInfo (preserves :invoke stmts)
+    src = inf_result.src
+    if src isa CC.OptimizationState
+        src = CC.ir_to_codeinf!(src)
+    end
+
     # Extract V from ephemeral InferenceResult's analysis_results (stacked by finish!)
     v = CC.traverse_analysis_results(inf_result) do @nospecialize r
         r isa CachedResult{V} ? r.inner : nothing
@@ -451,8 +506,30 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
     rettype_const = rettype isa CC.Const ? rettype.val : nothing
 
     # Store const-prop entry on the mutable CachedResult
-    entry = SpecializedResult{V}(argtypes, v, inf_result.src, rettype, rettype_const)
+    # (must happen before recursive walk so the duplicate check on lines 441-443 prevents cycles)
+    entry = SpecializedResult{V}(argtypes, v, src, rettype, rettype_const)
     push!(cached.const_entries, entry)
+
+    # Recursively const-seed callees with propagated const argtypes.
+    # Walk the *generic* source (which has :invoke stmts pointing to callee CIs)
+    # to discover callees — the const-optimized source has :invoke stmts too, but
+    # the generic source gives us stable callee CIs for cache lookups.
+    generic_src = get_source(ci)
+    if generic_src isa Core.CodeInfo
+        sptypes = CC.sptypes_from_meth_instance(mi)
+        for stmt in generic_src.code
+            if stmt isa Expr && stmt.head === :(=)
+                stmt = stmt.args[2]
+            end
+            if stmt isa Expr && (stmt.head === :invoke ||
+                    (VERSION >= v"1.12-" && stmt.head === :invoke_modify))
+                callee_mi = get_invoke_mi(stmt)
+                callee_mi === nothing && continue
+                callee_argtypes = extract_invoke_argtypes(stmt, generic_src, sptypes, argtypes)
+                typeinf!(cache, interp, callee_mi, callee_argtypes)
+            end
+        end
+    end
 
     return
 end
@@ -623,6 +700,35 @@ function get_codeinfos(ci::Core.CodeInstance)
     else
         src = get_source(ci)
         src !== nothing && push!(codeinfos, ci => src)
+    end
+    return codeinfos
+end
+
+"""
+    get_codeinfos(ci::CodeInstance, argtypes::Vector{Any}) -> Vector{Pair{CodeInstance, CodeInfo}}
+
+Collect CodeInstance/CodeInfo pairs using the const-optimized source for the root CI
+and generic source for all callees.
+
+Delegates to `get_codeinfos(ci)` for the full callee walk, then swaps the root entry's
+source with the const-optimized version from `get_source(ci, argtypes)`. Extra callees
+from the generic walk are harmless (compiled but uncalled), and missing callees get
+runtime dispatch stubs from `jl_emit_native`.
+
+Falls back to `get_codeinfos(ci)` if no const entry exists for the given argtypes.
+"""
+function get_codeinfos(ci::Core.CodeInstance, argtypes::Vector{Any})
+    const_src = get_source(ci, argtypes)
+    if const_src === nothing
+        return get_codeinfos(ci)
+    end
+    codeinfos = get_codeinfos(ci)
+    # Swap root entry's source with const-optimized version
+    idx = findfirst(p -> p.first === ci, codeinfos)
+    if idx !== nothing
+        codeinfos[idx] = ci => const_src
+    else
+        pushfirst!(codeinfos, ci => const_src)
     end
     return codeinfos
 end

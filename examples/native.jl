@@ -101,6 +101,25 @@ function compile!(cache::CacheView, mi::Core.MethodInstance)
     return res.executable
 end
 
+function compile!(cache::CacheView, mi::Core.MethodInstance, argtypes::Vector{Any})
+    ci = get(cache, mi, nothing)
+    if ci === nothing
+        interp = CustomInterpreter(cache)
+        CompilerCaching.typeinf!(cache, interp, mi)
+        ci = get(cache, mi)
+    end
+
+    # Ensure const-seeded inference has run
+    if CompilerCaching.get_source(ci, argtypes) === nothing
+        interp = CustomInterpreter(cache)
+        CompilerCaching.typeinf!(cache, interp, mi, argtypes)
+    end
+
+    # codegen + JIT using const-optimized source
+    code = julia_codegen(cache, mi, ci; argtypes)
+    return julia_jit(cache, mi, code)
+end
+
 """
     call(f, args...) -> result
 
@@ -176,3 +195,23 @@ child(x) = op(x, 3)
 @assert parent(10) == 10 + 3 + 3
 @assert call(parent, 10) == 10 ^ 3 + 3
 @assert compilations[] == 4
+
+
+## const-seeded native codegen demo
+
+@noinline constdemo_add(a, b) = a + b
+constdemo_f(x) = constdemo_add(x, 10) + 2
+
+let
+    world = get_world_counter()
+    cache = CacheView{NativeResults}(:NativeExample, world)
+    mi = method_instance(constdemo_f, (Int,); world)
+
+    # Compile with const-seeded argtypes: f(42)
+    argtypes = Any[Core.Const(constdemo_f), Core.Const(42)]
+    ptr = compile!(cache, mi, argtypes)
+
+    # Call the compiled function — should produce const-folded result
+    result = ccall(ptr, Int, (Int,), 42)
+    @assert result == constdemo_f(42)
+end
