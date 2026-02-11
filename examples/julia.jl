@@ -58,10 +58,14 @@ function getglobal_jljit()
 end
 
 """
-    julia_codegen(cache, mi, ci; argtypes=nothing) -> (ir_bytes, entry_name)
+    julia_codegen(cache, mi, ci; argtypes=nothing, dump_llvm=false, dump_module=false)
+        -> (ir_bytes, entry_name, llvm_ir)
 
 Generate LLVM IR and return serializable intermediate result.
-Returns a tuple of (LLVM bitcode bytes, entry function name).
+Returns a tuple of (LLVM bitcode bytes, entry function name, LLVM IR text).
+The `llvm_ir` string is empty unless `dump_llvm` or `dump_module` is set.
+When `dump_llvm` is true, returns the IR of just the entry function.
+When `dump_module` is true, returns the IR of the entire module.
 
 Uses `get_codeinfos(ci)` to collect CodeInfos by walking :invoke statements (1.12+)
 or cache lookup callback (1.11). When `argtypes` is provided, uses the const-optimized
@@ -71,7 +75,9 @@ This function handles codegen but does not JIT compile - use `julia_jit` for tha
 """
 function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
                        ci::Core.CodeInstance;
-                       argtypes::Union{Vector{Any},Nothing}=nothing)
+                       argtypes::Union{Vector{Any},Nothing}=nothing,
+                       dump_llvm::Bool=false,
+                       dump_module::Bool=false)
     # Set up globals for the lookup callback
     _codegen_cache[] = cache
     lookup_cfunction = @cfunction(_codegen_lookup_cb, Any, (Any, UInt, UInt))
@@ -166,12 +172,25 @@ function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
 
         @assert func_name !== nothing "No compiled function found"
 
+        # Capture LLVM IR text if requested
+        llvm_ir = if dump_module
+            llvm_ts_mod() do mod
+                string(mod)
+            end
+        elseif dump_llvm
+            llvm_ts_mod() do mod
+                string(functions(mod)[func_name])
+            end
+        else
+            ""
+        end
+
         # Serialize to bitcode
         ir_bytes = llvm_ts_mod() do mod
             convert(Vector{UInt8}, mod)
         end
 
-        return (ir_bytes, func_name)
+        return (ir_bytes, func_name, llvm_ir)
     end
 end
 

@@ -158,7 +158,7 @@ end
 end
 
 
-## demo
+## demo of overlay + redefinitions
 
 # Define `op` with different implementations
 op(x, y) = x + y
@@ -197,21 +197,39 @@ child(x) = op(x, 3)
 @assert compilations[] == 4
 
 
-## const-seeded native codegen demo
+## demo of const-seeded codegen
 
-@noinline constdemo_add(a, b) = a + b
-constdemo_f(x) = constdemo_add(x, 10) + 2
+function constdemo_f(x, n)
+    if n > 0
+        return x + n
+    else
+        return x - n
+    end
+end
 
 let
     world = get_world_counter()
     cache = CacheView{NativeResults}(:NativeExample, world)
-    mi = method_instance(constdemo_f, (Int,); world)
+    mi = method_instance(constdemo_f, (Int, Int); world)
+    argtypes = Any[Core.Const(constdemo_f), Int, Core.Const(3)]
 
-    # Compile with const-seeded argtypes: f(42)
-    argtypes = Any[Core.Const(constdemo_f), Core.Const(42)]
-    ptr = compile!(cache, mi, argtypes)
+    # Ensure inference is done
+    interp = CustomInterpreter(cache)
+    CompilerCaching.typeinf!(cache, interp, mi)
+    ci = get(cache, mi)
+    CompilerCaching.typeinf!(cache, interp, mi, argtypes)
 
-    # Call the compiled function — should produce const-folded result
-    result = ccall(ptr, Int, (Int,), 42)
-    @assert result == constdemo_f(42)
+    # Generic codegen
+    (_, _, generic_ir) = julia_codegen(cache, mi, ci; dump_llvm=true)
+    println("=== Generic LLVM IR ===")
+    println(generic_ir)
+    @assert contains(generic_ir, "icmp") "Generic IR should have a comparison"
+    @assert contains(generic_ir, "sub i64") "Generic IR should have the sub branch"
+
+    # Const-seeded codegen (n=3 is a known constant)
+    (_, _, const_ir) = julia_codegen(cache, mi, ci; argtypes, dump_llvm=true)
+    println("\n=== Const-seeded LLVM IR (n=3) ===")
+    println(const_ir)
+    @assert !contains(const_ir, "icmp") "Const-seeded IR should eliminate the comparison"
+    @assert !contains(const_ir, "sub i64") "Const-seeded IR should eliminate the sub"
 end
