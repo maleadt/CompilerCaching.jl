@@ -72,7 +72,11 @@ Skips the invoke target at position 1.
 function extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes)
     argtypes = Any[]
     for j in 2:length(stmt.args)
-        push!(argtypes, CC.argextype(stmt.args[j], src, sptypes))
+        if src.slottypes !== nothing
+            push!(argtypes, CC.argextype(stmt.args[j], src, sptypes))
+        else
+            push!(argtypes, Any)
+        end
     end
     return argtypes
 end
@@ -90,8 +94,10 @@ function extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes,
         arg = stmt.args[j]
         if arg isa Core.Argument && checkbounds(Bool, parent_argtypes, arg.n)
             push!(argtypes, parent_argtypes[arg.n])
-        else
+        elseif src.slottypes !== nothing
             push!(argtypes, CC.argextype(arg, src, sptypes))
+        else
+            push!(argtypes, Any)
         end
     end
     return argtypes
