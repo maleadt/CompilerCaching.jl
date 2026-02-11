@@ -209,6 +209,73 @@ end
     @test results(cache2, ci2) isa InferenceResults
 end
 
+@testset "const-prop inference" begin
+    # Reuse the InferenceResults and TestInterpreter from the previous testset
+    mutable struct ConstPropResults
+        ir::Any
+        ConstPropResults() = new(nothing)
+    end
+
+    struct ConstPropInterpreter <: Core.Compiler.AbstractInterpreter
+        world::UInt
+        cache::CacheView
+        inf_cache::InfCacheT
+    end
+    ConstPropInterpreter(cache::CacheView) =
+        ConstPropInterpreter(cache.world, cache, InfCacheT())
+    @setup_caching ConstPropInterpreter.cache
+
+    Core.Compiler.InferenceParams(::ConstPropInterpreter) = Core.Compiler.InferenceParams()
+    Core.Compiler.OptimizationParams(::ConstPropInterpreter) = Core.Compiler.OptimizationParams()
+    Core.Compiler.get_inference_cache(interp::ConstPropInterpreter) = interp.inf_cache
+    @static if isdefined(Core.Compiler, :get_inference_world)
+        Core.Compiler.get_inference_world(interp::ConstPropInterpreter) = interp.world
+    else
+        Core.Compiler.get_world_counter(interp::ConstPropInterpreter) = interp.world
+    end
+    Core.Compiler.lock_mi_inference(::ConstPropInterpreter, ::Core.MethodInstance) = nothing
+    Core.Compiler.unlock_mi_inference(::ConstPropInterpreter, ::Core.MethodInstance) = nothing
+
+    add_fn(a, b) = a + b
+    world = Base.get_world_counter()
+    mi = method_instance(add_fn, (Int, Int); world)
+
+    cache = CacheView{ConstPropResults}(:ConstPropTest, world)
+    interp = ConstPropInterpreter(cache)
+
+    # 1. Generic inference
+    typeinf!(cache, interp, mi)
+    ci = get(cache, mi)
+    @test ci.rettype === Int
+    @test results(cache, ci) isa ConstPropResults
+
+    # 2. Const-seeded inference (same cache, same interp, same CI)
+    const_argtypes = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(1), Core.Compiler.Const(2)]
+    typeinf!(cache, interp, mi, const_argtypes)
+
+    # Results accessible via argtypes
+    res = results(cache, ci, const_argtypes)
+    @test res isa ConstPropResults
+
+    # Source accessible via argtypes
+    src = get_source(ci, const_argtypes)
+    @test src isa Core.CodeInfo || src === nothing  # nothing if constabi
+
+    # 3. Generic lookup still works
+    @test results(cache, ci) isa ConstPropResults
+    @test get_source(ci) isa Core.CodeInfo
+
+    # 4. Cache hit on second call (no error, no duplicate)
+    typeinf!(cache, interp, mi, const_argtypes)
+
+    # 5. Different constants → separate entry on same CI
+    argtypes2 = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(10), Core.Compiler.Const(20)]
+    typeinf!(cache, interp, mi, argtypes2)
+    res2 = results(cache, ci, argtypes2)
+    @test res2 isa ConstPropResults
+    @test res2 !== res  # different V instance
+end
+
 #==============================================================================#
 # Custom IR
 #==============================================================================#
