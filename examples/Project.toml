@@ -1,0 +1,6 @@
+[deps]
+LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
+CompilerCaching = "9db33cc3-5358-4881-8759-fa4194144afd"
+
+[sources]
+CompilerCaching = {path = ".."}
