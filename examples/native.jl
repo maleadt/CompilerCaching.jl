@@ -157,6 +157,10 @@ end
     end
 end
 
+@static if VERSION >= v"1.14.0-DEV.1794"
+@warn "Native example is broken on Julia 1.14"
+else
+
 
 ## demo of overlay + redefinitions
 
@@ -232,4 +236,7 @@ let
     println(const_ir)
     @assert !contains(const_ir, "icmp") "Const-seeded IR should eliminate the comparison"
     @assert !contains(const_ir, "sub i64") "Const-seeded IR should eliminate the sub"
+end
+
+
 end
