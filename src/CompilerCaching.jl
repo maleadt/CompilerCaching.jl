@@ -316,21 +316,50 @@ end
 # Method lookup
 #==============================================================================#
 
-export method_instance
+export method_instance, match_method_instance
+
+"""
+    match_method_instance(f, tt; world, method_table) -> Union{MethodInstance, Nothing}
+
+Look up the MethodInstance for function `f` with argument types `tt` using
+method matching instead of cached dispatch lookup.
+
+Unlike `method_instance`, this function accepts non-dispatch tuples (abstract
+argument types) without crashing. Use this for compile-time analysis where
+argument types may not be fully concrete.
+
+Returns `nothing` if no unique matching method is found.
+"""
+function match_method_instance(@nospecialize(f), @nospecialize(tt);
+                               world::UInt=Base.get_world_counter(),
+                               method_table::Union{Core.MethodTable,Nothing}=nothing)
+    sig = Base.signature_type(f, tt)
+    matches = Base._methods_by_ftype(sig, method_table, 1, world)
+    matches === nothing && return nothing
+    length(matches) != 1 && return nothing
+    if VERSION >= v"1.12-"
+        return Base.specialize_method(matches[1]::Core.MethodMatch)
+    else
+        return CC.specialize_method(matches[1]::Core.MethodMatch)
+    end
+end
 
 # Before JuliaLang/julia#60718, `jl_method_lookup_by_tt` did not correctly cache overlay
 # methods, causing lookups to fail or return stale global entries, so don't use the cache.
 @static if VERSION >= v"1.14.0-DEV.1581"
     # NOTE: is being backported
-    using Base: method_instance
+    @inline function method_instance(@nospecialize(f), @nospecialize(tt);
+                                     world::UInt=Base.get_world_counter(),
+                                     method_table::Union{Core.MethodTable,Nothing}=nothing)
+        Base.method_instance(f, tt; world, method_table)
+    end
 else
-    function method_instance(@nospecialize(f), @nospecialize(tt);
-                             world::UInt=Base.get_world_counter(),
-                             method_table::Union{Core.MethodTable,Nothing}=nothing)
+    @inline function method_instance(@nospecialize(f), @nospecialize(tt);
+                                     world::UInt=Base.get_world_counter(),
+                                     method_table::Union{Core.MethodTable,Nothing}=nothing)
         sig = Base.signature_type(f, tt)
-        match, _ = CC._findsup(sig, method_table, world)
-        match === nothing && return nothing
-        CC.specialize_method(match)::Core.MethodInstance
+        @assert isdispatchtuple(sig)
+        return match_method_instance(f, tt; world, method_table)
     end
 end
 
@@ -340,6 +369,10 @@ end
 Look up the MethodInstance for function `f` with argument types `tt`.
 
 Uses Julia's cached method lookup (`jl_method_lookup_by_tt`) for fast lookups.
+Requires `tt` to be a dispatch tuple (fully concrete argument types).
+Use [`match_method_instance`](@ref) for compile-time lookups where types
+may not be fully resolved.
+
 Returns `nothing` if no matching method is found.
 """
 method_instance
