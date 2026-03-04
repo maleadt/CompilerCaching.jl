@@ -410,6 +410,27 @@ end
     @test compile_count[] == 3  # unchanged
 end
 
+@testset "Function-subtype specialization" begin
+    # jl_compilation_sig() despecializes Function-subtype arguments to Function when
+    # the method's `called` bitmask says the arg is not used in call position.
+    # For foreign methods (no Julia source to scan), add_method must preserve the
+    # conservative default (0xff) so that specialization is not lost.
+    method_table = @eval @MethodTable $(gensym(:method_table))
+
+    struct MyCallable <: Function end
+    @test MyCallable <: Function
+    @test isconcretetype(MyCallable)
+
+    function callable_node end
+    add_method(method_table, callable_node, (Any, Int), :callable_ir)
+
+    world = Base.get_world_counter()
+    mi = method_instance(callable_node, (MyCallable, Int); world, method_table)
+    @test mi !== nothing
+    # specTypes must preserve the concrete MyCallable, not widen to Function
+    @test mi.specTypes === Tuple{typeof(callable_node), MyCallable, Int}
+end
+
 @testset "missing method" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
 

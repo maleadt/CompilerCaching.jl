@@ -301,7 +301,6 @@ function add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source)
     m.sig = sig
     m.nargs = Int32(1 + length(arg_types))
     m.isva = false
-    m.called = UInt32(0)
     m.nospecialize = UInt32(0)
     m.external_mt = mt
     m.slot_syms = ""
