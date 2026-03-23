@@ -1,6 +1,6 @@
 name = "CompilerCaching"
 uuid = "9db33cc3-5358-4881-8759-fa4194144afd"
-version = "0.2.1"
+version = "0.2.2"
 
 [workspace]
 projects = ["test", "examples"]

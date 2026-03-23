@@ -376,8 +376,11 @@ end
 # methods, causing lookups to fail or return stale global entries, so don't use the cache.
 # Use jl_get_specialization1 instead, which uses jl_matching_methods (not cached dispatch)
 # and returns compileable signatures (with proper vararg widening).
-@static if VERSION >= v"1.14.0-DEV.1581"
-    # NOTE: is being backported
+# Fixed in 1.14.0-DEV.1581, backported to 1.13.0-beta2, 1.12.5, and 1.11.9.
+@static if (VERSION >= v"1.14.0-DEV.1581" ||
+            v"1.13.0-beta2" <= VERSION < v"1.14-" ||
+            v"1.12.5" <= VERSION < v"1.13-" ||
+            v"1.11.9" <= VERSION < v"1.12-")
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
