@@ -510,6 +510,10 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
             overridden[i] = !CC.is_lattice_equal(𝕃, argtypes[i], default_argtypes[i])
         end
     else
+        # Pack varargs: on 1.11 matching_cache_argtypes packs trailing
+        # args into a Tuple (returning nargs elements), but invoke stmts
+        # list them individually, so we must pack argtypes to match.
+        argtypes = CC.va_process_argtypes(𝕃, argtypes, mi)
         default_argtypes, _ = CC.matching_cache_argtypes(𝕃, mi)
         overridden = CC.BitVector(undef, length(argtypes))
         for i in eachindex(argtypes)

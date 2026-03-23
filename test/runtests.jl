@@ -274,6 +274,19 @@ end
     res2 = results(cache, ci, argtypes2)
     @test res2 isa ConstPropResults
     @test res2 !== res  # different V instance
+
+    # 6. Varargs method: invoke stmts list args individually, but on Julia 1.11
+    #    matching_cache_argtypes packs them into nargs elements. When more args
+    #    are passed than nargs, argtypes must be packed to match.
+    va_fn(a, b...) = +(a, b...)
+    world_va = Base.get_world_counter()
+    cache_va = CacheView{ConstPropResults}(:ConstPropVarargs, world_va)
+    mi_va = method_instance(va_fn, (Int, Int, Int); world=world_va)
+    interp_va = ConstPropInterpreter(cache_va)
+    # Provide unpacked argtypes (4 elements for nargs=3, as an invoke would)
+    va_argtypes = Any[Core.Compiler.Const(va_fn), Core.Compiler.Const(1),
+                      Core.Compiler.Const(2), Core.Compiler.Const(3)]
+    typeinf!(cache_va, interp_va, mi_va, va_argtypes)
 end
 
 #==============================================================================#
