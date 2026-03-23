@@ -344,8 +344,38 @@ function match_method_instance(@nospecialize(f), @nospecialize(tt);
     end
 end
 
+# jl_get_specialization1 doesn't support custom method tables (hardcodes jl_nothing).
+# Reimplement its pipeline (match → normalize → specialize) with method table support.
+function _specialization1(@nospecialize(sig), world::UInt, method_table::Core.MethodTable)
+    matches = Base._methods_by_ftype(sig, method_table, 1, world)
+    matches === nothing && return nothing
+    length(matches) != 1 && return nothing
+    match = matches[1]::Core.MethodMatch
+    m = match.method
+    ti = match.spec_types
+    env = match.sparams
+    @static if VERSION >= v"1.12-"
+        tt = ccall(:jl_normalize_to_compilable_sig, Any, (Any, Any, Any, Cint),
+                   ti, env, m, Cint(1))
+    else # 1.11: extra jl_methtable_t* first param
+        mt = ccall(:jl_method_get_table, Any, (Any,), m)
+        tt = ccall(:jl_normalize_to_compilable_sig, Any, (Any, Any, Any, Any, Cint),
+                   mt, ti, env, m, Cint(1))
+    end
+    tt === nothing && return nothing
+    if tt !== ti
+        pair = ccall(:jl_type_intersection_with_env, Any, (Any, Any),
+                     tt, m.sig)::Core.SimpleVector
+        env = pair[2]::Core.SimpleVector
+    end
+    return ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance},
+                 (Any, Any, Any), m, tt, env)
+end
+
 # Before JuliaLang/julia#60718, `jl_method_lookup_by_tt` did not correctly cache overlay
 # methods, causing lookups to fail or return stale global entries, so don't use the cache.
+# Use jl_get_specialization1 instead, which uses jl_matching_methods (not cached dispatch)
+# and returns compileable signatures (with proper vararg widening).
 @static if VERSION >= v"1.14.0-DEV.1581"
     # NOTE: is being backported
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
@@ -353,22 +383,62 @@ end
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
         Base.method_instance(f, tt; world, method_table)
     end
-else
+elseif VERSION >= v"1.13-"
+    # 3-arg jl_get_specialization1, returns jl_nothing on failure
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
         sig = Base.signature_type(f, tt)
         @assert isdispatchtuple(sig)
-        return match_method_instance(f, tt; world, method_table)
+        if method_table === nothing
+            mi = ccall(:jl_get_specialization1, Any, (Any, Csize_t, Cint),
+                       sig, world, Cint(0))
+            return mi === nothing ? nothing : mi::Core.MethodInstance
+        else
+            return _specialization1(sig, world, method_table)
+        end
+    end
+elseif VERSION >= v"1.12-"
+    # 3-arg jl_get_specialization1, returns NULL on failure
+    @inline function method_instance(@nospecialize(f), @nospecialize(tt);
+                                     world::UInt=Base.get_world_counter(),
+                                     method_table::Union{Core.MethodTable,Nothing}=nothing)
+        sig = Base.signature_type(f, tt)
+        @assert isdispatchtuple(sig)
+        if method_table === nothing
+            ptr = ccall(:jl_get_specialization1, Ptr{Cvoid}, (Any, Csize_t, Cint),
+                        sig, world, Cint(0))
+            return ptr == C_NULL ? nothing : unsafe_pointer_to_objref(ptr)::Core.MethodInstance
+        else
+            return _specialization1(sig, world, method_table)
+        end
+    end
+else # 1.11: 5-arg jl_get_specialization1 (extra min_valid/max_valid out-params), returns NULL
+    @inline function method_instance(@nospecialize(f), @nospecialize(tt);
+                                     world::UInt=Base.get_world_counter(),
+                                     method_table::Union{Core.MethodTable,Nothing}=nothing)
+        sig = Base.signature_type(f, tt)
+        @assert isdispatchtuple(sig)
+        if method_table === nothing
+            min_valid = Ref{Csize_t}(1)
+            max_valid = Ref{Csize_t}(typemax(Csize_t))
+            ptr = ccall(:jl_get_specialization1, Ptr{Cvoid},
+                        (Any, Csize_t, Ref{Csize_t}, Ref{Csize_t}, Cint),
+                        sig, world, min_valid, max_valid, Cint(0))
+            return ptr == C_NULL ? nothing : unsafe_pointer_to_objref(ptr)::Core.MethodInstance
+        else
+            return _specialization1(sig, world, method_table)
+        end
     end
 end
 
 """
     method_instance(f, tt; world, method_table) -> Union{MethodInstance, Nothing}
 
-Look up the MethodInstance for function `f` with argument types `tt`.
+Look up the compileable MethodInstance for function `f` with argument types `tt`.
 
-Uses Julia's cached method lookup (`jl_method_lookup_by_tt`) for fast lookups.
+Uses `jl_get_specialization1` (or `Base.method_instance` on Julia ≥ 1.14) to return
+a compileable specialization with proper vararg widening.
 Requires `tt` to be a dispatch tuple (fully concrete argument types).
 Use [`match_method_instance`](@ref) for compile-time lookups where types
 may not be fully resolved.

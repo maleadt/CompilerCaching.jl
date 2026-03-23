@@ -55,6 +55,32 @@ end
     @test compile_count[] == 1  # unchanged
 end
 
+@testset "compileable signatures" begin
+    # method_instance should return compileable MIs (with vararg widening),
+    # not exact-type MIs like method_instances (plural) does.
+    world = Base.get_world_counter()
+    mi = method_instance(println, (Int, Int, Int, Int); world)
+    @test mi !== nothing
+    # jl_get_specialization1 is the ground truth for compileable signatures
+    sig = Base.signature_type(println, (Int, Int, Int, Int))
+    @static if VERSION >= v"1.13-"
+        expected = ccall(:jl_get_specialization1, Any, (Any, Csize_t, Cint),
+                         sig, world, Cint(0))::Core.MethodInstance
+    elseif VERSION >= v"1.12-"
+        ptr = ccall(:jl_get_specialization1, Ptr{Cvoid}, (Any, Csize_t, Cint),
+                    sig, world, Cint(0))
+        expected = unsafe_pointer_to_objref(ptr)::Core.MethodInstance
+    else
+        min_valid = Ref{Csize_t}(1)
+        max_valid = Ref{Csize_t}(typemax(Csize_t))
+        ptr = ccall(:jl_get_specialization1, Ptr{Cvoid},
+                    (Any, Csize_t, Ref{Csize_t}, Ref{Csize_t}, Cint),
+                    sig, world, min_valid, max_valid, Cint(0))
+        expected = unsafe_pointer_to_objref(ptr)::Core.MethodInstance
+    end
+    @test mi === expected
+end
+
 @testset "cache partitioning" begin
     # Global MT with sharding keys (e.g., for GPUCompiler-style usage)
     # Different caches for different key combinations
