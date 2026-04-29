@@ -559,19 +559,19 @@ end
 end
 
 @testset "binding edges" begin
-    # add_method and create_ci consult bindings(source) to pick up the global
-    # bindings a foreign IR captures, so they participate in invalidation. The
-    # mechanism exists on 1.12+; on 1.11 it's a no-op.
+    # add_method and create_ci consult globalrefs(source) to pick up the
+    # GlobalRefs a foreign IR captures, so they participate in invalidation.
+    # The mechanism exists on 1.12+; on 1.11 it's a no-op.
 
     binding_mod = Module()
     Core.eval(binding_mod, :(const trait_const = 1))
     gr = GlobalRef(binding_mod, :trait_const)
 
-    # Custom IR carrying its captured bindings; override the hook for it.
+    # Custom IR carrying its captured GlobalRefs; override the hook for it.
     struct TraitIR
         grefs::Vector{GlobalRef}
     end
-    CompilerCaching.bindings(ir::TraitIR) = ir.grefs
+    CompilerCaching.globalrefs(ir::TraitIR) = ir.grefs
 
     method_table = @eval @MethodTable $(gensym(:method_table))
     function trait_node end
