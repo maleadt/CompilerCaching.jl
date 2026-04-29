@@ -559,7 +559,7 @@ end
 end
 
 @testset "binding edges" begin
-    # add_method and create_ci consult globalrefs(source) to pick up the
+    # create_ci consults captured_globals(source) to pick up the
     # GlobalRefs a foreign IR captures, so they participate in invalidation.
     # The mechanism exists on 1.12+; on 1.11 it's a no-op.
 
@@ -571,32 +571,49 @@ end
     struct TraitIR
         grefs::Vector{GlobalRef}
     end
-    CompilerCaching.globalrefs(ir::TraitIR) = ir.grefs
+    CompilerCaching.captured_globals(ir::TraitIR) = ir.grefs
 
     method_table = @eval @MethodTable $(gensym(:method_table))
     function trait_node end
     m = add_method(method_table, trait_node, (Int,), TraitIR([gr]))
 
     @static if VERSION >= v"1.12-"
-        # add_method should have consulted the hook automatically.
+        # Foreign source: did_scan_source is set so Julia's CodeInfo-only
+        # scan never tries to uncompress our IR.
         @test (m.did_scan_source & 0x1) != 0x0
-        b = convert(Core.Binding, gr)
-        method_in_backedges = isdefined(b, :backedges) &&
-            any(i -> isassigned(b.backedges, i) && b.backedges[i] === m,
-                eachindex(b.backedges))
-        flag_set = (b.flags & Base.BINDING_FLAG_ANY_IMPLICIT_EDGES) != 0
-        @test method_in_backedges || flag_set
 
-        # create_ci should likewise consult the hook automatically.
+        # create_ci registers the captured bindings as CI-level edges.
         world = Base.get_world_counter()
         cache = CacheView{TestResults}(:TraitBindingTest, world)
         mi = method_instance(trait_node, (Int,); world, method_table)
         ci = get!(cache, mi) do
             create_ci(cache, mi)
         end
+        b = convert(Core.Binding, gr)
         @test isdefined(ci, :edges)
         @test any(i -> isassigned(ci.edges, i) && ci.edges[i] === b,
                   eachindex(ci.edges))
+
+        # The CI is also a direct edge of the binding, so invalidation
+        # reaches it without going through method-level scanning.
+        @test isdefined(b, :backedges)
+        @test any(i -> isassigned(b.backedges, i) && b.backedges[i] === ci,
+                  eachindex(b.backedges))
+
+        # End-to-end: replacing the const should drive ci.max_world down.
+        @test ci.max_world == typemax(UInt)
+        Core.eval(binding_mod, :(const trait_const = 2))
+        @test ci.max_world < typemax(UInt)
+    end
+
+    # CodeInfo source: must NOT pre-set did_scan_source, so Julia's own
+    # scan still runs to discover GlobalRefs in the lowered IR.
+    @static if VERSION >= v"1.12-"
+        plain_method_table = @eval @MethodTable $(gensym(:method_table))
+        function plain_node end
+        ci_obj = code_lowered(identity, Tuple{Int})[1]
+        plain_method = add_method(plain_method_table, plain_node, (Int,), ci_obj)
+        @test (plain_method.did_scan_source & 0x1) == 0x0
     end
 end
 
