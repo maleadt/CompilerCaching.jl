@@ -273,7 +273,7 @@ end
 # Foreign method registration
 #==============================================================================#
 
-export add_method
+export add_method, register_binding_edges!
 
 """
     add_method(mt, f, arg_types, source) -> Method
@@ -309,6 +309,32 @@ function add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source)
     ccall(:jl_method_table_insert, Cvoid, (Any, Any, Any), mt, m, nothing)
 
     return m
+end
+
+"""
+    register_binding_edges!(method::Method, globalrefs) -> Method
+
+Register each `GlobalRef` in `globalrefs` as a binding `method` depends on,
+so that `method`'s cached code is invalidated whenever one of those bindings
+is replaced.
+
+Use this after [`add_method`](@ref) when the foreign IR stored as
+`method.source` captures global bindings: the runtime cannot discover those
+dependencies on its own from a non-standard source.
+
+Pair with [`create_ci`](@ref)'s `binding_edges` keyword to also tag each
+resulting `CodeInstance` with the bindings it depends on.
+"""
+function register_binding_edges!(method::Core.Method, globalrefs)
+    @static if VERSION >= v"1.12-"
+        for gr in globalrefs
+            b = convert(Core.Binding, gr::GlobalRef)
+            ccall(:jl_maybe_add_binding_backedge, Cint,
+                  (Any, Any, Any), b, method, method)
+        end
+        @atomic method.did_scan_source |= 0x1
+    end
+    return method
 end
 
 
@@ -650,7 +676,7 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
 end
 
 """
-    create_ci(cache::CacheView{K,V}, mi; deps) -> CodeInstance
+    create_ci(cache::CacheView{K,V}, mi; deps, binding_edges) -> CodeInstance
 
 Create a CodeInstance for `mi` with proper owner, typed results, and backedges.
 
@@ -658,14 +684,34 @@ Creates a new CodeInstance with:
 - Owner set to `cache.owner`
 - A fresh `V()` instance in analysis_results
 - Backedges registered for all dependencies in `deps`
+- Per-CI binding edges, so that the resulting CodeInstance is invalidated
+  whenever any binding listed in `binding_edges` (a `GlobalRef` or
+  `Core.Binding`) is replaced.
 
 Used for foreign mode where inference doesn't run. The CI participates in
-Julia's invalidation mechanism via backedges registered from `deps`.
+Julia's invalidation mechanism via backedges registered from `deps` (callee
+methods) and `binding_edges` (referenced global bindings).
+
+When a foreign-source method captures global bindings, the method itself
+must also be tagged with those bindings via [`register_binding_edges!`](@ref);
+`binding_edges` here only covers this individual `CodeInstance`.
 """
 function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
-                   deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) where {K,V}
+                   deps::Vector{Core.MethodInstance}=Core.MethodInstance[],
+                   binding_edges=nothing) where {K,V}
     owner = cache.owner
-    edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
+
+    @static if VERSION >= v"1.12-"
+        bindings = _collect_bindings(binding_edges)
+        edges = if isempty(deps) && isempty(bindings)
+            Core.svec()
+        else
+            Core.svec(deps..., bindings...)
+        end
+    else
+        # Julia 1.11 has no per-CI edges field
+        edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
+    end
 
     # Create typed results instance via CachedResult{V}
     ar = CC.AnalysisResults(CachedResult{V}(V()), CC.NULL_ANALYSIS_RESULTS)
@@ -684,6 +730,19 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
     end
 
     return ci
+end
+
+@static if VERSION >= v"1.12-"
+    function _collect_bindings(::Nothing)
+        return Core.Binding[]
+    end
+    function _collect_bindings(binding_edges)
+        bindings = Core.Binding[]
+        for e in binding_edges
+            push!(bindings, e isa Core.Binding ? e : convert(Core.Binding, e::GlobalRef))
+        end
+        return bindings
+    end
 end
 
 """
