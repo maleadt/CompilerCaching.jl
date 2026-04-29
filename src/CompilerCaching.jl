@@ -20,7 +20,7 @@ include("utils.jl")
 # CacheView structure
 #==============================================================================#
 
-export CacheView, @setup_caching, results
+export CacheView, @setup_caching, results, lookup
 
 """
     SpecializedResult{V}
@@ -33,6 +33,20 @@ struct SpecializedResult{V}
     src::Any
     rettype::Any
     rettype_const::Any
+end
+
+# Fast equality for argtypes vectors. Element-wise `==(::Any, ::Any)` does
+# dynamic dispatch (~40 ns/element) — but `===` short-circuits to pointer
+# equality, which is true for interned `Type` values and immutable
+# `Core.Compiler.Const` instances with `===`-equal `.val`s. So most cache hits
+# resolve in O(n) pointer compares; we only fall through to `==` on the rare
+# element that isn't structurally identical.
+@inline function argtypes_egal(a::Vector{Any}, b::Vector{Any})::Bool
+    length(a) == length(b) || return false
+    @inbounds for i in eachindex(a)
+        a[i] === b[i] || a[i] == b[i] || return false
+    end
+    return true
 end
 
 """
@@ -108,6 +122,32 @@ end
 
 A cache into a cache partition at a specific world age. Serves as the main entry point
 for cached compilation.
+
+# Owner choice and lookup cost
+
+`owner` is stored on every cached `CodeInstance` as its `.owner` field. Cache
+lookups (`get(cache, mi)`) ccall `jl_rettype_inferred`, which compares
+`ci.owner` against the requested owner using `jl_egal` — i.e. structural
+equality for immutable values, identity (`===`) for mutable ones.
+
+The owner is passed to the ccall as `Any`, which forces the JIT to box it on
+every call when its concrete type is not already a heap-allocated reference.
+For hot paths this matters:
+
+| owner type                            | per `get(cache, mi)` |
+| ------------------------------------- | -------------------- |
+| `Symbol`                              |   ~2.5 ns, 0 allocs  |
+| `struct` (immutable, e.g. NamedTuple) |  ~10 ns,  small box  |
+| `Tuple{Symbol, NamedTuple{…}}`        |  ~38 ns, ~112 B box  |
+
+Prefer a `Symbol` if you don't need to shard. Otherwise, an immutable struct
+or tuple is the right shape — it boxes on each lookup, but `CodeInstance`s
+loaded from a package image still resolve because `jl_egal` matches by
+content.
+
+Avoid `mutable struct` owners: `jl_egal` falls back to identity for mutable
+types, so a `CodeInstance` deserialized from a package image will not match
+a fresh runtime instance even with identical fields.
 """
 struct CacheView{K, V}
     owner::K
@@ -208,7 +248,7 @@ function results(::Type{V}, ci::Core.CodeInstance, argtypes::Vector{Any})::V whe
     end
     @assert cached !== nothing "CodeInstance missing $V results for argtypes $argtypes"
     for entry in cached.const_entries
-        entry.argtypes == argtypes && return entry.inner
+        argtypes_egal(entry.argtypes, argtypes) && return entry.inner
     end
     error("CodeInstance missing $V results for argtypes $argtypes")
 end
@@ -238,6 +278,40 @@ function Base.get(cache::CacheView, mi::Core.MethodInstance)
 end
 Base.getindex(cache::CacheView, mi::Core.MethodInstance) = CC.getindex(code_cache(cache), mi)
 Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance) = CC.setindex!(code_cache(cache), ci, mi)
+
+"""
+    lookup(cache::CacheView{K,V}, mi::MethodInstance) -> Union{Nothing, Tuple{CodeInstance, V}}
+    lookup(cache::CacheView{K,V}, mi::MethodInstance, argtypes::Vector{Any}) ->
+        Union{Nothing, Tuple{CodeInstance, V}}
+
+Combined `get(cache, mi)` + `results(cache, ci[, argtypes])` accessor — single-pass
+cache lookup. Returns `(ci, res)` on a hit, or `nothing` if no `CodeInstance` is
+cached for `mi` (or, with `argtypes`, no matching const-prop entry exists).
+
+Hot-path callers (e.g. `cufunction`) typically need both `ci` and `res` and walk
+the same lookup multiple times across phases. Use `lookup` once and pass the
+resulting `(ci, res)` pair down through phases instead of resolving them each
+time.
+"""
+@inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance) where {K,V}
+    ci = get(cache, mi, nothing)
+    ci === nothing && return nothing
+    return (ci, results(V, ci))
+end
+
+@inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance,
+                        argtypes::Vector{Any}) where {K,V}
+    ci = get(cache, mi, nothing)
+    ci === nothing && return nothing
+    cached = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedResult{V} ? result : nothing
+    end
+    cached === nothing && return nothing
+    for entry in cached.const_entries
+        argtypes_egal(entry.argtypes, argtypes) && return (ci, entry.inner)
+    end
+    return nothing
+end
 
 
 #==============================================================================#
@@ -605,7 +679,7 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
 
     # Check if we already have a const-prop result for these argtypes
     for entry in cached.const_entries
-        entry.argtypes == argtypes && return
+        argtypes_egal(entry.argtypes, argtypes) && return
     end
 
     # Compute overridden_by_const
@@ -841,7 +915,7 @@ function get_source(ci::Core.CodeInstance, argtypes::Vector{Any})
     end
     cached === nothing && return nothing
     for entry in cached.const_entries
-        if entry.argtypes == argtypes
+        if argtypes_egal(entry.argtypes, argtypes)
             src = entry.src
             return src isa Core.CodeInfo ? src : nothing
         end
