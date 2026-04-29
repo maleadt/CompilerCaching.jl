@@ -559,20 +559,26 @@ end
 end
 
 @testset "binding edges" begin
-    # Tests register_binding_edges! and create_ci(...; binding_edges=...). The
-    # binding-backedge mechanism exists on 1.12+; on 1.11 both APIs are no-ops.
-    method_table = @eval @MethodTable $(gensym(:method_table))
-    function bound_node end
-    m = add_method(method_table, bound_node, (Int,), :bound_ir)
+    # add_method and create_ci consult bindings(source) to pick up the global
+    # bindings a foreign IR captures, so they participate in invalidation. The
+    # mechanism exists on 1.12+; on 1.11 it's a no-op.
 
     binding_mod = Module()
-    Core.eval(binding_mod, :(const captured_const = 7))
-    gr = GlobalRef(binding_mod, :captured_const)
-    @test register_binding_edges!(m, [gr]) === m
+    Core.eval(binding_mod, :(const trait_const = 1))
+    gr = GlobalRef(binding_mod, :trait_const)
+
+    # Custom IR carrying its captured bindings; override the hook for it.
+    struct TraitIR
+        grefs::Vector{GlobalRef}
+    end
+    CompilerCaching.bindings(ir::TraitIR) = ir.grefs
+
+    method_table = @eval @MethodTable $(gensym(:method_table))
+    function trait_node end
+    m = add_method(method_table, trait_node, (Int,), TraitIR([gr]))
 
     @static if VERSION >= v"1.12-"
-        # did_scan_source bit set, and the binding either gained a backedge
-        # (cross-module) or the implicit-edges flag (same-module).
+        # add_method should have consulted the hook automatically.
         @test (m.did_scan_source & 0x1) != 0x0
         b = convert(Core.Binding, gr)
         method_in_backedges = isdefined(b, :backedges) &&
@@ -581,15 +587,16 @@ end
         flag_set = (b.flags & Base.BINDING_FLAG_ANY_IMPLICIT_EDGES) != 0
         @test method_in_backedges || flag_set
 
-        # CI-level: bindings should appear in ci.edges so scan_edge_list finds them.
+        # create_ci should likewise consult the hook automatically.
         world = Base.get_world_counter()
-        cache = CacheView{TestResults}(:BindingTest, world)
-        mi = method_instance(bound_node, (Int,); world, method_table)
+        cache = CacheView{TestResults}(:TraitBindingTest, world)
+        mi = method_instance(trait_node, (Int,); world, method_table)
         ci = get!(cache, mi) do
-            create_ci(cache, mi; binding_edges=[gr])
+            create_ci(cache, mi)
         end
         @test isdefined(ci, :edges)
-        @test any(i -> isassigned(ci.edges, i) && ci.edges[i] === b, eachindex(ci.edges))
+        @test any(i -> isassigned(ci.edges, i) && ci.edges[i] === b,
+                  eachindex(ci.edges))
     end
 end
 
