@@ -283,13 +283,13 @@ Return the `GlobalRef`s a foreign IR `source` captures. Override this for
 your custom IR type to enable automatic binding-invalidation tracking; the
 default returns none.
 
-Both [`add_method`](@ref) and [`create_ci`](@ref) consult this hook so that
-the referenced bindings are wired into the runtime's invalidation mechanism
-without the caller having to thread them through manually.
+[`create_ci`](@ref) consults this hook to wire the referenced bindings into
+the runtime's invalidation mechanism without the caller having to thread
+them through manually.
 
 Report only bindings the IR actually reads: over-reporting causes spurious
 invalidations. The result must be stable for the lifetime of `source` —
-edges are registered once at method definition and reused for every CI.
+edges are registered on every CI created for a method using this source.
 """
 captured_globals(@nospecialize(source)) = ()
 
@@ -329,33 +329,20 @@ function add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source)
     m.slot_syms = ""
     m.source = source
 
-    # Suppress Julia's built-in source scan *before* publishing the method,
-    # so any concurrent retrieve_code_info / jl_scan_method_source_now sees
-    # did_scan_source already set and skips its CodeInfo-only scan (which
-    # would otherwise crash trying to uncompress foreign IR).
-    suppress_source_scan!(m, source)
+    # For non-CodeInfo sources, mark the source as scanned *before* publishing
+    # the method, so any concurrent retrieve_code_info / jl_scan_method_source_now
+    # skips its CodeInfo-only scan (which would otherwise crash trying to
+    # uncompress foreign IR). For CodeInfo sources the bit is left untouched so
+    # Julia's own scan still runs.
+    @static if VERSION >= v"1.12-"
+        if !isa(source, Core.CodeInfo)
+            @atomic m.did_scan_source |= 0x1
+        end
+    end
 
     ccall(:jl_method_table_insert, Cvoid, (Any, Any, Any), mt, m, nothing)
 
     return m
-end
-
-"""
-    suppress_source_scan!(method::Method, source) -> Method
-
-Internal helper. For non-`CodeInfo` `source` values, set
-`method.did_scan_source` to suppress Julia's built-in scan
-(`jl_scan_method_source_now`), which would otherwise crash trying to
-uncompress foreign IR. For `CodeInfo` sources the bit is left untouched
-so Julia's own scan still runs.
-"""
-function suppress_source_scan!(method::Core.Method, @nospecialize(source))
-    @static if VERSION >= v"1.12-"
-        if !isa(source, Core.CodeInfo)
-            @atomic method.did_scan_source |= 0x1
-        end
-    end
-    return method
 end
 
 
@@ -726,8 +713,13 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
     owner = cache.owner
 
     @static if VERSION >= v"1.12-"
-        binding_edges = isa(mi.def, Core.Method) && isdefined(mi.def, :source) ?
-            _collect_bindings(captured_globals(mi.def.source)) : Core.Binding[]
+        binding_edges = Core.Binding[]
+        if isa(mi.def, Core.Method) && isdefined(mi.def, :source)
+            for e in captured_globals(mi.def.source)
+                push!(binding_edges,
+                      e isa Core.Binding ? e : convert(Core.Binding, e::GlobalRef))
+            end
+        end
         edges = isempty(deps) && isempty(binding_edges) ?
             Core.svec() : Core.svec(deps..., binding_edges...)
     else
@@ -765,16 +757,6 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
     end
 
     return ci
-end
-
-@static if VERSION >= v"1.12-"
-    function _collect_bindings(grefs)
-        result = Core.Binding[]
-        for e in grefs
-            push!(result, e isa Core.Binding ? e : convert(Core.Binding, e::GlobalRef))
-        end
-        return result
-    end
 end
 
 """
