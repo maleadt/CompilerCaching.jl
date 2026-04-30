@@ -285,8 +285,9 @@ Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance)
         Union{Nothing, Tuple{CodeInstance, V}}
 
 Combined `get(cache, mi)` + `results(cache, ci[, argtypes])` accessor — single-pass
-cache lookup. Returns `(ci, res)` on a hit, or `nothing` if no `CodeInstance` is
-cached for `mi` (or, with `argtypes`, no matching const-prop entry exists).
+cache lookup. Returns `(ci, res)` on a hit, or `nothing` on a miss (no `CodeInstance`
+cached for `mi`, no `CachedResult{V}` on the CI, or — with `argtypes` — no matching
+const-prop entry).
 
 Hot-path callers (e.g. `cufunction`) typically need both `ci` and `res` and walk
 the same lookup multiple times across phases. Use `lookup` once and pass the
@@ -296,7 +297,11 @@ time.
 @inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance) where {K,V}
     ci = get(cache, mi, nothing)
     ci === nothing && return nothing
-    return (ci, results(V, ci))
+    cached = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedResult{V} ? result : nothing
+    end
+    cached === nothing && return nothing
+    return (ci, cached.inner)
 end
 
 @inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance,
