@@ -20,6 +20,7 @@ end
 @testset "basic caching" begin
     # Define a regular Julia function (in global MT)
     global_test_fn(x::Int) = x + 100
+    other_fn(x::Int) = x - 1  # used below to test `lookup` miss
 
     compile_count = Ref(0)
     function my_compile(mi)
@@ -53,6 +54,27 @@ end
     @test ci2 === ci
     @test res2 === res
     @test compile_count[] == 1  # unchanged
+
+    # `lookup` returns the same (ci, res) as separate get + results
+    hit = lookup(cache, mi)
+    @test hit isa Tuple{Core.CodeInstance, TestResults}
+    @test hit[1] === ci
+    @test hit[2] === res
+
+    # `lookup` miss when no CI is cached for the MI
+    other_mi = method_instance(other_fn, (Int,); world)
+    @test lookup(cache, other_mi) === nothing
+
+    # `lookup` miss when CI exists under the same owner but for a different V.
+    # CIs are keyed by owner, so a cache parameterized with a different V finds
+    # the CI but no `CachedResult{V}` on its analysis_results chain.
+    mutable struct OtherResults
+        result::Any
+        OtherResults() = new(nothing)
+    end
+    cache_otherV = CacheView{Symbol, OtherResults}(:GlobalTest, world)
+    @test get(cache_otherV, mi, nothing) === ci  # same owner → finds the CI
+    @test lookup(cache_otherV, mi) === nothing   # but no CachedResult{OtherResults}
 end
 
 @testset "compileable signatures" begin
@@ -263,6 +285,7 @@ end
     Core.Compiler.unlock_mi_inference(::ConstPropInterpreter, ::Core.MethodInstance) = nothing
 
     add_fn(a, b) = a + b
+    sub_fn(a, b) = a - b  # used below to test `lookup` miss
     world = Base.get_world_counter()
     mi = method_instance(add_fn, (Int, Int); world)
 
@@ -300,6 +323,35 @@ end
     res2 = results(cache, ci, argtypes2)
     @test res2 isa ConstPropResults
     @test res2 !== res  # different V instance
+
+    # 5a. `lookup` hits and misses for both arities
+    hit2 = lookup(cache, mi)
+    @test hit2 isa Tuple{Core.CodeInstance, ConstPropResults}
+    @test hit2[1] === ci
+    @test hit2[2] === results(cache, ci)
+
+    hit_const = lookup(cache, mi, const_argtypes)
+    @test hit_const isa Tuple{Core.CodeInstance, ConstPropResults}
+    @test hit_const[1] === ci
+    @test hit_const[2] === res
+
+    hit_const2 = lookup(cache, mi, argtypes2)
+    @test hit_const2[2] === res2  # different argtypes → different V instance
+
+    # Miss on unknown argtypes (CI present, no matching const-prop entry)
+    miss_argtypes = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(99), Core.Compiler.Const(99)]
+    @test lookup(cache, mi, miss_argtypes) === nothing
+
+    # Miss on unknown MI (no CI cached at all)
+    miss_mi = method_instance(sub_fn, (Int, Int); world)
+    @test lookup(cache, miss_mi) === nothing
+    @test lookup(cache, miss_mi, const_argtypes) === nothing
+
+    # Freshly-constructed Const wrapper around the same value still hits — the
+    # `===` fast path resolves it via egal-on-immutable-struct, no `==` dispatch.
+    fresh_argtypes = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(1), Core.Compiler.Const(2)]
+    @test fresh_argtypes !== const_argtypes
+    @test lookup(cache, mi, fresh_argtypes) === hit_const
 
     # 6. Varargs method: invoke stmts list args individually, but on Julia 1.11
     #    matching_cache_argtypes packs them into nargs elements. When more args
