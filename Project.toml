@@ -1,9 +1,9 @@
 name = "CompilerCaching"
 uuid = "9db33cc3-5358-4881-8759-fa4194144afd"
-version = "0.2.4"
+version = "0.2.5"
 
 [workspace]
 projects = ["test", "examples"]
 
 [compat]
-julia = "1.11"
+julia = "1.10"

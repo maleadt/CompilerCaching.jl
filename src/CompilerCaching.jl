@@ -10,6 +10,38 @@
 
 module CompilerCaching
 
+# Loading the package on an unsupported Julia is fatal: the integrated cache
+# (`Core.Compiler.InternalCodeCache`, `cache_owner` partitioning, persistent
+# `analysis_results` on `CodeInstance`) doesn't exist before 1.11, and there's no
+# meaningful fallback. We declare `julia = "1.10"` compat anyway so downstream
+# packages can list us in [deps] alongside a `VERSION >= v"1.11"` guard at the
+# call site (and a precompile workload that may import the module unconditionally).
+function __init__()
+    if VERSION < v"1.11"
+        error("CompilerCaching requires Julia 1.11 or later (current: $VERSION).")
+    end
+end
+
+"""
+    @public foo, bar
+
+Declare `foo, bar` as public API. Lowers to `public foo, bar` on 1.11+ (where `public`
+is keyword syntax) and to a no-op on 1.10. Lets the rest of the module use a single
+form regardless of Julia version, without `Meta.parse` workarounds.
+"""
+macro public(symbols_expr)
+    syms = symbols_expr isa Symbol ? [symbols_expr] :
+           symbols_expr.head === :tuple ? [a isa Symbol ? a : a.args[1] for a in symbols_expr.args] :
+           [symbols_expr.args[1]]
+    if VERSION >= v"1.11.0-DEV.469"
+        esc(Expr(:public, syms...))
+    else
+        nothing
+    end
+end
+
+@static if VERSION >= v"1.11"
+
 using Base.Experimental: @MethodTable
 const CC = Core.Compiler
 
@@ -353,7 +385,7 @@ end
 #==============================================================================#
 
 export add_method
-public captured_globals
+@public captured_globals
 
 """
     captured_globals(source) -> iterable of GlobalRef
@@ -999,5 +1031,7 @@ function get_codeinfos(ci::Core.CodeInstance, argtypes::Vector{Any})
     end
     return codeinfos
 end
+
+end # @static if VERSION >= v"1.11"
 
 end # module CompilerCaching
