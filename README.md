@@ -74,29 +74,33 @@ function from this package:
 
 ```julia
 # Set-up a custom interpreter, and link it to the cache
-struct CustomInterpreter <: CC.AbstractInterpreter
-    cache::CacheView
+struct CustomInterpreter{V} <: CC.AbstractInterpreter
+    world::UInt
     ...
 end
-@setup_caching CustomInterpreter.cache
+CC.cache_owner(::CustomInterpreter) = :MyCompiler
+CC.get_inference_world(interp::CustomInterpreter) = interp.world
+CompilerCaching.results_type(::CustomInterpreter{V}) where V = V
+CompilerCaching.@setup_results CustomInterpreter
 
 function compile!(cache, mi)
     # Get CI through inference
     ci = get(cache, mi, nothing)
     if ci === nothing
-        interp = CustomInterpreter(cache)
-        CompilerCaching.typeinf!(cache, interp, mi)
-        ci = get(cache, mi)
+        interp = CustomInterpreter{MyResults}(cache.world)
+        ci = CompilerCaching.typeinf!(interp, mi)
     end
 
     # ... further compilation steps
 end
 ```
 
-The `@setup_caching` macro defines the necessary methods to connect the interpreter
-to the cache:
-- `CC.cache_owner(interp)` returning the cache's owner token
-- `CC.finish!(interp, caller, ...)` that stacks a new `V()` instance in analysis results
+The interpreter must define three methods:
+- `CC.cache_owner(interp)` — partitions the integrated cache (same-owner CIs share storage)
+- `CC.get_inference_world(interp)` — world age inference runs at
+- `CompilerCaching.results_type(interp)` — which `V` to attach to each newly inferred CI
+
+`@setup_results` generates the `CC.finish!` hook that does the attachment.
 
 
 ## Cache sharding

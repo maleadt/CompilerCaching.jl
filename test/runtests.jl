@@ -206,7 +206,10 @@ end
     end
     TestInterpreter(cache::CacheView) =
         TestInterpreter(cache.world, cache, InfCacheT())
-    @setup_caching TestInterpreter.cache
+    Core.Compiler.cache_owner(interp::TestInterpreter) = interp.cache.owner
+    CompilerCaching.results_type(interp::TestInterpreter) =
+        CompilerCaching.results_type(interp.cache)
+    CompilerCaching.@setup_results TestInterpreter
 
     Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
     Core.Compiler.OptimizationParams(::TestInterpreter) = Core.Compiler.OptimizationParams()
@@ -225,7 +228,7 @@ end
     mi = method_instance(test_fn, (Int,); world)
 
     interp = TestInterpreter(cache)
-    typeinf!(cache, interp, mi)
+    typeinf!(interp, mi)
 
     # CI is stored in cache, retrieve with get
     ci = get(cache, mi, nothing)
@@ -247,7 +250,7 @@ end
     mi2 = method_instance(const_return_fn, (Int,); world=world2)
 
     interp2 = TestInterpreter(cache2)
-    typeinf!(cache2, interp2, mi2)
+    typeinf!(interp2, mi2)
 
     ci2 = get(cache2, mi2, nothing)
     @test ci2 isa Core.CodeInstance
@@ -271,7 +274,10 @@ end
     end
     ConstPropInterpreter(cache::CacheView) =
         ConstPropInterpreter(cache.world, cache, InfCacheT())
-    @setup_caching ConstPropInterpreter.cache
+    Core.Compiler.cache_owner(interp::ConstPropInterpreter) = interp.cache.owner
+    CompilerCaching.results_type(interp::ConstPropInterpreter) =
+        CompilerCaching.results_type(interp.cache)
+    CompilerCaching.@setup_results ConstPropInterpreter
 
     Core.Compiler.InferenceParams(::ConstPropInterpreter) = Core.Compiler.InferenceParams()
     Core.Compiler.OptimizationParams(::ConstPropInterpreter) = Core.Compiler.OptimizationParams()
@@ -293,14 +299,14 @@ end
     interp = ConstPropInterpreter(cache)
 
     # 1. Generic inference
-    typeinf!(cache, interp, mi)
+    typeinf!(interp, mi)
     ci = get(cache, mi)
     @test ci.rettype === Int
     @test results(cache, ci) isa ConstPropResults
 
     # 2. Const-seeded inference (same cache, same interp, same CI)
     const_argtypes = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(1), Core.Compiler.Const(2)]
-    typeinf!(cache, interp, mi, const_argtypes)
+    typeinf!(interp, mi, const_argtypes)
 
     # Results accessible via argtypes
     res = results(cache, ci, const_argtypes)
@@ -315,11 +321,11 @@ end
     @test get_source(ci) isa Core.CodeInfo
 
     # 4. Cache hit on second call (no error, no duplicate)
-    typeinf!(cache, interp, mi, const_argtypes)
+    typeinf!(interp, mi, const_argtypes)
 
     # 5. Different constants → separate entry on same CI
     argtypes2 = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(10), Core.Compiler.Const(20)]
-    typeinf!(cache, interp, mi, argtypes2)
+    typeinf!(interp, mi, argtypes2)
     res2 = results(cache, ci, argtypes2)
     @test res2 isa ConstPropResults
     @test res2 !== res  # different V instance
@@ -364,7 +370,7 @@ end
     # Provide unpacked argtypes (4 elements for nargs=3, as an invoke would)
     va_argtypes = Any[Core.Compiler.Const(va_fn), Core.Compiler.Const(1),
                       Core.Compiler.Const(2), Core.Compiler.Const(3)]
-    typeinf!(cache_va, interp_va, mi_va, va_argtypes)
+    typeinf!(interp_va, mi_va, va_argtypes)
 end
 
 #==============================================================================#

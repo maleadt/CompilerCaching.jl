@@ -51,7 +51,7 @@ include("utils.jl")
 # CacheView structure
 #==============================================================================#
 
-export CacheView, @setup_caching, results, lookup
+export CacheView, @setup_results, results, lookup
 
 """
     SpecializedResult{V}
@@ -189,50 +189,18 @@ end
 CacheView{V}(owner::K, world::UInt) where {K,V} = CacheView{K,V}(owner, world)
 
 """
-    @setup_caching InterpreterType.cache_field
+    CacheView(interp::CC.AbstractInterpreter) -> CacheView{typeof(cache_owner(interp)), results_type(interp)}
 
-Generate the required methods for an AbstractInterpreter to work with CompilerCaching.
-
-The cache field must be a `CacheView{K, V}` where `V` is your typed results struct.
-The macro generates:
-- `CC.cache_owner(interp)` returning the cache's owner token
-- `CC.finish!(interp, caller, ...)` that stacks a new `V()` instance in analysis results
+Convenience constructor: build a `CacheView` whose owner, world, and `V` come
+from the interpreter's standard hooks (`CC.cache_owner`, `CC.get_inference_world`,
+[`results_type`](@ref)). The right thing for entry points that need to address
+cached results for the same interpreter they just ran inference under.
 """
-macro setup_caching(expr)
-    # Parse InterpreterType.cache_field
-    if !(expr isa Expr && expr.head == :.)
-        error("Expected InterpreterType.cache_field, e.g., @setup_caching MyInterpreter.cache")
-    end
-    InterpType = expr.args[1]
-    cache_field = expr.args[2]
-    if cache_field isa QuoteNode
-        cache_field = cache_field.value
-    end
-
-    finish_method = if hasmethod(CC.finish!, Tuple{CC.AbstractInterpreter, CC.InferenceState, UInt, UInt64})
-        quote
-            function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState,
-                                 validation_world::UInt, time_before::UInt64)
-                V = $results_type(interp.$cache_field)
-                $CC.stack_analysis_result!(caller.result, $CachedResult{V}(V()))
-                @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState,
-                                    validation_world::UInt, time_before::UInt64)
-            end
-        end
-    else
-        quote
-            function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState)
-                V = $results_type(interp.$cache_field)
-                $CC.stack_analysis_result!(caller.result, $CachedResult{V}(V()))
-                @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState)
-            end
-        end
-    end
-
-    quote
-        $CC.cache_owner(interp::$InterpType) = $cache_owner(interp.$cache_field)
-        $finish_method
-    end |> esc
+function CacheView(interp::CC.AbstractInterpreter)
+    owner = CC.cache_owner(interp)
+    world = CC.get_inference_world(interp)
+    V = results_type(interp)
+    return CacheView{typeof(owner), V}(owner, world)
 end
 
 """
@@ -243,25 +211,92 @@ Returns the owner token for use as CodeInstance.owner.
 cache_owner(cache::CacheView) = cache.owner
 
 """
+    results_type(interp::CC.AbstractInterpreter) -> Type
     results_type(cache::CacheView{K,V}) -> Type{V}
 
-Returns the results type V for a cache view.
+Trait declaring the results type to attach to each newly-inferred `CodeInstance`
+(via `CachedResult{V}` on its `analysis_results` chain). The default
+`results_type(::CC.AbstractInterpreter) = Nothing` opts out — no attachment.
+Override on your interpreter type to opt in:
+
+```julia
+struct MyInterpreter{V} <: CC.AbstractInterpreter; ...; end
+CompilerCaching.results_type(::MyInterpreter{V}) where V = V
+```
+
+Used by [`@setup_results`](@ref) to drive the `CC.finish!` hook.
 """
+results_type(::CC.AbstractInterpreter) = Nothing
 results_type(::CacheView{K,V}) where {K,V} = V
+
+"""
+    @setup_results InterpreterType
+
+Generate a `CC.finish!` method on `InterpreterType` that, for each newly-inferred
+`CodeInstance`, stacks a fresh `V()` results struct on its `analysis_results`
+chain — where `V = results_type(interp::InterpreterType)`. When `V === Nothing`
+the method short-circuits to the default `CC.finish!`, so back-ends that don't
+opt in pay no inference-time cost.
+
+`InterpreterType` must define [`results_type`](@ref) (constant, derived from a
+type parameter, or any computation that's stable per concrete subtype).
+
+`CC.cache_owner` and `CC.get_inference_world` remain the user's responsibility —
+they're part of the standard `AbstractInterpreter` API and aren't generated here.
+This keeps the macro narrowly scoped to the one thing CompilerCaching uniquely
+provides: per-CI results attachment.
+
+# Example
+
+```julia
+struct MyInterpreter{V} <: CC.AbstractInterpreter
+    world::UInt
+    inf_cache; inf_params; opt_params
+end
+CC.cache_owner(::MyInterpreter) = :my_compiler
+CC.get_inference_world(interp::MyInterpreter) = interp.world
+CompilerCaching.results_type(::MyInterpreter{V}) where V = V
+CompilerCaching.@setup_results MyInterpreter
+```
+
+"""
+macro setup_results(InterpType)
+    if hasmethod(CC.finish!, Tuple{CC.AbstractInterpreter, CC.InferenceState, UInt, UInt64})
+        esc(quote
+            function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState,
+                                 validation_world::UInt, time_before::UInt64)
+                V = $results_type(interp)
+                V === Nothing || $CC.stack_analysis_result!(caller.result,
+                    $CachedResult{V}(V()))
+                @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState,
+                                    validation_world::UInt, time_before::UInt64)
+            end
+        end)
+    else
+        esc(quote
+            function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState)
+                V = $results_type(interp)
+                V === Nothing || $CC.stack_analysis_result!(caller.result,
+                    $CachedResult{V}(V()))
+                @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState)
+            end
+        end)
+    end
+end
 
 """
     results(::Type{V}, ci::CodeInstance)::V
     results(cache::CacheView{K,V}, ci::CodeInstance)::V
 
 Retrieve the generic typed results struct from a CodeInstance's `analysis_results` chain.
-Throws if no V is found - this indicates @setup_caching wasn't used correctly
+Throws if no V is found - this indicates @setup_results wasn't used correctly
 or create_ci wasn't called.
 """
 function results(::Type{V}, ci::Core.CodeInstance)::V where V
     cached = CC.traverse_analysis_results(ci) do @nospecialize result
         result isa CachedResult{V} ? result : nothing
     end
-    @assert cached !== nothing "CodeInstance missing $V results - ensure @setup_caching is used or create_ci was called"
+    @assert cached !== nothing "CodeInstance missing $V results - ensure @setup_results is used or create_ci was called"
     return cached.inner
 end
 
@@ -602,14 +637,16 @@ method_instance
 export typeinf!, create_ci, get_source, get_codeinfos
 
 """
-    typeinf!(cache, interp, mi) -> Nothing
+    typeinf!(interp, mi) -> Union{CodeInstance, Nothing}
 
-Run type inference on `mi` and store the resulting CodeInstance in the cache.
-Eagerly compiles all callees and stores their source so `get_codeinfos` works.
-The CodeInstance can be retrieved with `get(cache, mi)`.
+Run type inference on `mi` using `interp`, storing the resulting `CodeInstance`
+in Julia's integrated cache (partitioned by `CC.cache_owner(interp)`). Eagerly
+compiles all callees and stores their source so [`get_codeinfos`](@ref) works.
+
+Returns the root `CodeInstance` (or `nothing` if inference failed). Subsequent
+calls for the same `mi` and world are no-ops — the existing CI is returned.
 """
-function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
-                   mi::Core.MethodInstance)
+function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
         ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
         ci === nothing && return nothing
@@ -655,12 +692,15 @@ function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
                 end
             end
         end
+        return ci
     elseif VERSION >= v"1.12.0-DEV.15"
+        cache = CacheView(interp)
         inferred_ci = CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
         @assert inferred_ci !== nothing "Inference of $mi failed"
 
-        # inference should have populated our cache
-        ci = get(cache, mi)
+        # inference should have populated the cache
+        ci = get(cache, mi, nothing)
+        ci === nothing && return nothing
 
         # if ci is rettype_const, the inference result won't have been cached
         # (because it is normally not supposed to be used ever again).
@@ -668,26 +708,28 @@ function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
         if ci.inferred === nothing
             cache[mi] = inferred_ci
         end
+        return ci
     else
         # Julia 1.11: typeinf_ext_toplevel returns CodeInfo, not CI
+        cache = CacheView(interp)
         src = CC.typeinf_ext_toplevel(interp, mi)
         @assert src !== nothing "Inference of $mi failed"
 
-        # inference should have populated our cache
-        ci = get(cache, mi)
+        # inference should have populated the cache
+        ci = get(cache, mi, nothing)
+        ci === nothing && return nothing
 
-        # if ci is rettype_const, the inference result won't have been cached
-        # (because it is normally not supposed to be used ever again).
+        # if ci is rettype_const, the inference result won't have been cached.
         # to avoid the need to re-infer, set that field here.
         if ci.inferred === nothing
             @atomic ci.inferred = src
         end
+        return ci
     end
-    return
 end
 
 """
-    typeinf!(cache, interp, mi, argtypes) -> Nothing
+    typeinf!(interp, mi, argtypes) -> Nothing
 
 Run const-seeded type inference on `mi` with enriched `argtypes` and store the result
 as a `CachedResult` entry on the generic CI's `analysis_results` chain.
@@ -697,12 +739,15 @@ new CodeInstance is created. The const-specialized source and return type are st
 alongside the generic result for later retrieval via `results(cache, ci, argtypes)`
 and `get_source(ci, argtypes)`.
 """
-function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
-                  mi::Core.MethodInstance, argtypes::Vector{Any}) where {K,V}
+function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance,
+                  argtypes::Vector{Any})
+    V = results_type(interp)
+    cache = CacheView(interp)
+
     # Ensure generic CI exists
     ci = get(cache, mi, nothing)
     if ci === nothing
-        typeinf!(cache, interp, mi)
+        typeinf!(interp, mi)
         ci = get(cache, mi, nothing)
         ci === nothing && return nothing
     end
@@ -785,7 +830,7 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
                 callee_mi = get_invoke_mi(stmt)
                 callee_mi === nothing && continue
                 callee_argtypes = extract_invoke_argtypes(stmt, generic_src, sptypes, argtypes)
-                typeinf!(cache, interp, callee_mi, callee_argtypes)
+                typeinf!(interp, callee_mi, callee_argtypes)
             end
         end
     end
@@ -794,21 +839,21 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
 end
 
 """
-    create_ci(cache::CacheView{K,V}, mi; deps) -> CodeInstance
+    create_ci(cache, mi; deps) -> CodeInstance
+    create_ci(interp, mi; deps) -> CodeInstance
 
 Create a CodeInstance for `mi` with proper owner, typed results, and backedges.
 
 Creates a new CodeInstance with:
-- Owner set to `cache.owner`
-- A fresh `V()` instance in analysis_results
+- Owner set to `cache.owner` (or `CC.cache_owner(interp)` for the interp form)
+- A fresh `V()` instance in analysis_results, where `V = results_type(cache_or_interp)`
 - Backedges registered for all dependencies in `deps`
 - Per-CI binding edges, so that the resulting CodeInstance is invalidated
   whenever any binding the source captures is replaced. The set of
   `GlobalRef`s is taken from [`captured_globals(mi.def.source)`](@ref captured_globals).
 
-Used for foreign mode where inference doesn't run. The CI participates in
-Julia's invalidation mechanism via backedges registered from `deps` (callee
-methods) and the `captured_globals` hook (referenced global bindings).
+Used for foreign mode where inference doesn't run — pass a `CacheView` if you
+don't have an interpreter handy, otherwise pass the interpreter directly.
 
 The asymmetry between `deps` (explicit kwarg) and bindings (implicit trait)
 is intentional. Captured bindings are a property of the source IR — fixed at
@@ -818,9 +863,14 @@ to pin them to the source type once via [`captured_globals`](@ref) and have
 compilation: the same method may invoke different callees depending on the
 argument types of `mi`.
 """
+create_ci(interp::CC.AbstractInterpreter, mi::Core.MethodInstance;
+          deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) =
+    create_ci(CacheView(interp), mi; deps)
+
 function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
                    deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) where {K,V}
     owner = cache.owner
+    world = cache.world
 
     @static if VERSION >= v"1.12-"
         binding_edges = Core.Binding[]
@@ -842,10 +892,10 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
 
     @static if VERSION >= v"1.12-"
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), cache.world, typemax(UInt), UInt32(0), ar, nothing, edges)
+            Int32(0), world, typemax(UInt), UInt32(0), ar, nothing, edges)
     else
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), cache.world, typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
+            Int32(0), world, typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
     end
 
     # Register backedges for automatic invalidation

@@ -65,7 +65,10 @@ CC.unlock_mi_inference(::CustomInterpreter, ::Core.MethodInstance) = nothing
 CC.method_table(interp::CustomInterpreter) = interp.method_table
 
 # integration with CompilerCaching.jl
-@setup_caching CustomInterpreter.cache
+CC.cache_owner(interp::CustomInterpreter) = interp.cache.owner
+CompilerCaching.results_type(interp::CustomInterpreter) =
+    CompilerCaching.results_type(interp.cache)
+CompilerCaching.@setup_results CustomInterpreter
 
 
 ## high-level API
@@ -77,8 +80,7 @@ function compile!(cache::CacheView, mi::Core.MethodInstance)
     ci = get(cache, mi, nothing)
     if ci === nothing
         interp = CustomInterpreter(cache)
-        CompilerCaching.typeinf!(cache, interp, mi)
-        ci = get(cache, mi)
+        ci = CompilerCaching.typeinf!(interp, mi)
     end
 
     # Check for a cache hit
@@ -105,14 +107,13 @@ function compile!(cache::CacheView, mi::Core.MethodInstance, argtypes::Vector{An
     ci = get(cache, mi, nothing)
     if ci === nothing
         interp = CustomInterpreter(cache)
-        CompilerCaching.typeinf!(cache, interp, mi)
-        ci = get(cache, mi)
+        ci = CompilerCaching.typeinf!(interp, mi)
     end
 
     # Ensure const-seeded inference has run
     if CompilerCaching.get_source(ci, argtypes) === nothing
         interp = CustomInterpreter(cache)
-        CompilerCaching.typeinf!(cache, interp, mi, argtypes)
+        CompilerCaching.typeinf!(interp, mi, argtypes)
     end
 
     # codegen + JIT using const-optimized source
@@ -219,9 +220,8 @@ let
 
     # Ensure inference is done
     interp = CustomInterpreter(cache)
-    CompilerCaching.typeinf!(cache, interp, mi)
-    ci = get(cache, mi)
-    CompilerCaching.typeinf!(cache, interp, mi, argtypes)
+    ci = CompilerCaching.typeinf!(interp, mi)
+    CompilerCaching.typeinf!(interp, mi, argtypes)
 
     # Generic codegen
     (_, _, generic_ir) = julia_codegen(cache, mi, ci; dump_llvm=true)

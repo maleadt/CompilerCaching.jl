@@ -60,13 +60,16 @@ precompile_test_harness("Inference caching") do load_path
         end
         CC.lock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
         CC.unlock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
-        @setup_caching ExampleInterpreter.cache
+        CC.cache_owner(interp::ExampleInterpreter) = interp.cache.owner
+        CompilerCaching.results_type(interp::ExampleInterpreter) =
+            CompilerCaching.results_type(interp.cache)
+        CompilerCaching.@setup_results ExampleInterpreter
 
         emit_code_count = Ref(0)
 
         function emit_ir(cache, mi)
             interp = ExampleInterpreter(cache)
-            typeinf!(cache, interp, mi)
+            typeinf!(interp, mi)
         end
 
         function emit_code(cache, mi, ir)
