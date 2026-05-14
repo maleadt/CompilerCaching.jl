@@ -10,16 +10,15 @@
 
 module CompilerCaching
 
-# Loading the package on an unsupported Julia is fatal: the integrated cache
+# On Julia < 1.11 the package loads as an empty shell: the integrated cache
 # (`Core.Compiler.InternalCodeCache`, `cache_owner` partitioning, persistent
-# `analysis_results` on `CodeInstance`) doesn't exist before 1.11, and there's no
-# meaningful fallback. We declare `julia = "1.10"` compat anyway so downstream
-# packages can list us in [deps] alongside a `VERSION >= v"1.11"` guard at the
-# call site (and a precompile workload that may import the module unconditionally).
+# `analysis_results` on `CodeInstance`) doesn't exist there, so none of the
+# `CacheView` / `typeinf!` / `create_ci` API is defined (the module body below
+# is gated on `VERSION >= v"1.11"`). Letting the package load anyway means
+# downstream packages can list us in `[deps]` and `using CompilerCaching`
+# unconditionally — they then either guard call sites with `@static if` or
+# go through a higher-level facade (e.g., `GPUCompiler.cached_compilation`).
 function __init__()
-    if VERSION < v"1.11"
-        error("CompilerCaching requires Julia 1.11 or later (current: $VERSION).")
-    end
 end
 
 """
