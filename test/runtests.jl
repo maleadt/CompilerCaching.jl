@@ -65,16 +65,21 @@ end
     other_mi = method_instance(other_fn, (Int,); world)
     @test lookup(cache, other_mi) === nothing
 
-    # `lookup` miss when CI exists under the same owner but for a different V.
-    # CIs are keyed by owner, so a cache parameterized with a different V finds
-    # the CI but no `CachedResult{V}` on its analysis_results chain.
+    # Results structs for different `V`s coexist on the same CI: a cache view
+    # parameterized with another V finds the same CI and lazily attaches a fresh
+    # results struct alongside the existing one.
     mutable struct OtherResults
         result::Any
         OtherResults() = new(nothing)
     end
     cache_otherV = CacheView{Symbol, OtherResults}(:GlobalTest, world)
     @test get(cache_otherV, mi, nothing) === ci  # same owner → finds the CI
-    @test lookup(cache_otherV, mi) === nothing   # but no CachedResult{OtherResults}
+    other_hit = lookup(cache_otherV, mi)
+    @test other_hit isa Tuple{Core.CodeInstance, OtherResults}
+    @test other_hit[1] === ci
+    @test other_hit[2].result === nothing       # fresh, independent results
+    @test results(cache, ci) === res            # original results untouched
+    @test results(cache_otherV, ci) === other_hit[2]  # stable across accesses
 end
 
 @testset "compileable signatures" begin
@@ -207,9 +212,6 @@ end
     TestInterpreter(cache::CacheView) =
         TestInterpreter(cache.world, cache, InfCacheT())
     Core.Compiler.cache_owner(interp::TestInterpreter) = interp.cache.owner
-    CompilerCaching.results_type(interp::TestInterpreter) =
-        CompilerCaching.results_type(interp.cache)
-    CompilerCaching.@setup_results TestInterpreter
 
     Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
     Core.Compiler.OptimizationParams(::TestInterpreter) = Core.Compiler.OptimizationParams()
@@ -256,7 +258,7 @@ end
     @test ci2 isa Core.CodeInstance
     # Verify it's actually a const-return CI (skip under coverage as it disables const-return)
     @test Core.Compiler.use_const_api(ci2) skip=(Base.JLOptions().code_coverage > 0)
-    # The key test: finish! hook should have stacked our results even for const-return
+    # The key test: results attach lazily even for const-return CIs
     @test results(cache2, ci2) isa InferenceResults
 end
 
@@ -275,9 +277,6 @@ end
     ConstPropInterpreter(cache::CacheView) =
         ConstPropInterpreter(cache.world, cache, InfCacheT())
     Core.Compiler.cache_owner(interp::ConstPropInterpreter) = interp.cache.owner
-    CompilerCaching.results_type(interp::ConstPropInterpreter) =
-        CompilerCaching.results_type(interp.cache)
-    CompilerCaching.@setup_results ConstPropInterpreter
 
     Core.Compiler.InferenceParams(::ConstPropInterpreter) = Core.Compiler.InferenceParams()
     Core.Compiler.OptimizationParams(::ConstPropInterpreter) = Core.Compiler.OptimizationParams()
@@ -306,7 +305,7 @@ end
 
     # 2. Const-seeded inference (same cache, same interp, same CI)
     const_argtypes = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(1), Core.Compiler.Const(2)]
-    typeinf!(interp, mi, const_argtypes)
+    typeinf!(cache, interp, mi, const_argtypes)
 
     # Results accessible via argtypes
     res = results(cache, ci, const_argtypes)
@@ -321,11 +320,11 @@ end
     @test get_source(ci) isa Core.CodeInfo
 
     # 4. Cache hit on second call (no error, no duplicate)
-    typeinf!(interp, mi, const_argtypes)
+    typeinf!(cache, interp, mi, const_argtypes)
 
     # 5. Different constants → separate entry on same CI
     argtypes2 = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(10), Core.Compiler.Const(20)]
-    typeinf!(interp, mi, argtypes2)
+    typeinf!(cache, interp, mi, argtypes2)
     res2 = results(cache, ci, argtypes2)
     @test res2 isa ConstPropResults
     @test res2 !== res  # different V instance
@@ -370,7 +369,7 @@ end
     # Provide unpacked argtypes (4 elements for nargs=3, as an invoke would)
     va_argtypes = Any[Core.Compiler.Const(va_fn), Core.Compiler.Const(1),
                       Core.Compiler.Const(2), Core.Compiler.Const(3)]
-    typeinf!(interp_va, mi_va, va_argtypes)
+    typeinf!(cache_va, interp_va, mi_va, va_argtypes)
 end
 
 #==============================================================================#

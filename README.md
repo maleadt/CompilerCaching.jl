@@ -1,8 +1,15 @@
 # CompilerCaching.jl
 
 A package for interfacing with Julia's compiler caching infrastructure for the purpose
-of building custom compilers. It extends the existing `InternalCodeCache` type with
-auxiliary functionality.
+of building custom compilers. It provides a typed view on the integrated code cache
+(`Core.Compiler.InternalCodeCache`), drives inference into it, and attaches custom
+compilation results to cached `CodeInstance`s — including across precompilation, so
+that compilers building on this package can ship precompiled artifacts in package
+images.
+
+Requires Julia 1.11 or later. On older versions the package loads as an empty shell,
+so that downstream packages can depend on it unconditionally and provide their own
+fallback (e.g. GPUCompiler.jl, which retains a session-local cache on Julia 1.10).
 
 
 ## Installation
@@ -22,7 +29,9 @@ The basic usage pattern of working with the compiler cache through CompilerCachi
 1. Define a mutable struct with a zero-arg constructor to hold compilation results
 2. Create a `CacheView{V}(owner_token, world)` where `V` is your results struct type
 3. Use the cache's `Dict` interface to get or create a code instance for a method instance
-4. Access cached compilation results via `results(cache, ci)`, populating them if needed
+4. Access cached compilation results via `results(cache, ci)`, populating them if needed.
+   The results struct is attached to the code instance on first access; every later
+   access returns the same instance.
 
 ```julia
 using CompilerCaching
@@ -68,26 +77,24 @@ end
 The `create_ci` function creates a bare code instance with (initially empty)
 compilation results. Most users will want to rely on Julia's type inference
 to instead populate the cache with a code instance that knows about dependent
-methods for invalidation purposes, and contains inferred source code for further.
-compilation This can be done with a custom abstract interpreter and the `typeinf!`
+methods for invalidation purposes, and contains inferred source code for further
+compilation. This can be done with a custom abstract interpreter and the `typeinf!`
 function from this package:
 
 ```julia
 # Set-up a custom interpreter, and link it to the cache
-struct CustomInterpreter{V} <: CC.AbstractInterpreter
+struct CustomInterpreter <: CC.AbstractInterpreter
     world::UInt
     ...
 end
 CC.cache_owner(::CustomInterpreter) = :MyCompiler
 CC.get_inference_world(interp::CustomInterpreter) = interp.world
-CompilerCaching.results_type(::CustomInterpreter{V}) where V = V
-CompilerCaching.@setup_results CustomInterpreter
 
 function compile!(cache, mi)
     # Get CI through inference
     ci = get(cache, mi, nothing)
     if ci === nothing
-        interp = CustomInterpreter{MyResults}(cache.world)
+        interp = CustomInterpreter(cache.world)
         ci = CompilerCaching.typeinf!(interp, mi)
     end
 
@@ -95,12 +102,14 @@ function compile!(cache, mi)
 end
 ```
 
-The interpreter must define three methods:
+Beyond the standard `AbstractInterpreter` interface, the interpreter only needs the
+two methods Julia itself uses to address the integrated cache:
 - `CC.cache_owner(interp)` — partitions the integrated cache (same-owner CIs share storage)
 - `CC.get_inference_world(interp)` — world age inference runs at
-- `CompilerCaching.results_type(interp)` — which `V` to attach to each newly inferred CI
 
-`@setup_results` generates the `CC.finish!` hook that does the attachment.
+There is no inference-time hook for results: `results(cache, ci)` attaches the
+results struct on first access, so any interpreter whose owner matches the cache
+view works out of the box.
 
 
 ## Cache sharding

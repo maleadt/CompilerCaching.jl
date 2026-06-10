@@ -64,11 +64,9 @@ CC.unlock_mi_inference(::CustomInterpreter, ::Core.MethodInstance) = nothing
 # Use overlay method table for method lookup during inference
 CC.method_table(interp::CustomInterpreter) = interp.method_table
 
-# integration with CompilerCaching.jl
+# integration with CompilerCaching.jl: just route the owner token to the cache view.
+# Results structs are attached lazily by `results`, so no further hooks are needed.
 CC.cache_owner(interp::CustomInterpreter) = interp.cache.owner
-CompilerCaching.results_type(interp::CustomInterpreter) =
-    CompilerCaching.results_type(interp.cache)
-CompilerCaching.@setup_results CustomInterpreter
 
 
 ## high-level API
@@ -113,7 +111,7 @@ function compile!(cache::CacheView, mi::Core.MethodInstance, argtypes::Vector{An
     # Ensure const-seeded inference has run
     if CompilerCaching.get_source(ci, argtypes) === nothing
         interp = CustomInterpreter(cache)
-        CompilerCaching.typeinf!(interp, mi, argtypes)
+        CompilerCaching.typeinf!(cache, interp, mi, argtypes)
     end
 
     # codegen + JIT using const-optimized source
@@ -221,7 +219,7 @@ let
     # Ensure inference is done
     interp = CustomInterpreter(cache)
     ci = CompilerCaching.typeinf!(interp, mi)
-    CompilerCaching.typeinf!(interp, mi, argtypes)
+    CompilerCaching.typeinf!(cache, interp, mi, argtypes)
 
     # Generic codegen
     (_, _, generic_ir) = julia_codegen(cache, mi, ci; dump_llvm=true)
