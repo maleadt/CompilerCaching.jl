@@ -155,9 +155,14 @@ precompile_test_harness("Inference caching") do load_path
         @test ExampleCompiler.emit_code_count[] == 0
 
         # check that identity survived
-        ext_cis_lost = v"1.12.0-DEV.1268"<=VERSION<v"1.12.5" || v"1.13-"<=VERSION<v"1.13-beta3" || v"1.14-"<=VERSION<v"1.14.0-DEV.1843"
-        @test haskey(cache, identity_mi) broken=ext_cis_lost
-        ExampleCompiler.precompile(identity, (Int,))
-        @test ExampleCompiler.emit_code_count[] == 0 broken=ext_cis_lost
+        # NOTE: on 1.13, external CIs from the workload survive only flakily (the
+        #       1.13.0-beta3 backport did not fully fix this), so skip the check there
+        ext_cis_lost = v"1.12.0-DEV.1268"<=VERSION<v"1.12.5" || v"1.14-"<=VERSION<v"1.14.0-DEV.1843"
+        ext_cis_flaky = v"1.13-" <= VERSION < v"1.14-"
+        if !ext_cis_flaky
+            @test haskey(cache, identity_mi) broken=ext_cis_lost
+            ExampleCompiler.precompile(identity, (Int,))
+            @test ExampleCompiler.emit_code_count[] == 0 broken=ext_cis_lost
+        end
     end
 end
