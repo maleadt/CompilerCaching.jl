@@ -645,12 +645,20 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
                 continue
             end
 
-            src = CC.typeinf_code(interp, callee_mi, true)
-            if src isa Core.CodeInfo
+            # Reuse source already stored on the CI (by inference, or by a previous
+            # walk) instead of unconditionally calling `typeinf_code`, which re-runs
+            # inference and optimization without consulting the cache. This makes
+            # repeated walks over an already-populated graph (e.g. `cached_results`
+            # followed by the back-end's compile) traversal-only.
+            src = get_source(callee)
+            if src === nothing
+                src = CC.typeinf_code(interp, callee_mi, true)
                 # Store source so get_codeinfos can retrieve it later
-                if (@atomic callee.inferred) === nothing
+                if src isa Core.CodeInfo && (@atomic callee.inferred) === nothing
                     @atomic callee.inferred = src
                 end
+            end
+            if src isa Core.CodeInfo
                 if has_compilequeue
                     sptypes = CC.sptypes_from_meth_instance(callee_mi)
                     CC.collectinvokes!(workqueue, src, sptypes)
