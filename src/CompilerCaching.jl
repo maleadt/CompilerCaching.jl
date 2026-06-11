@@ -225,7 +225,15 @@ read_analysis_results(ci::Core.CodeInstance) =
 
 # Lock serializing chain mutations. Attachment is rare (once per (CI, V) pair), so a
 # single global lock suffices. Plain (lock-free) reads are safe: chain nodes are
-# immutable and only ever prepended.
+# immutable and only ever prepended, and `jl_set_nth_field` stores with release
+# semantics.
+#
+# The C runtime also writes this field, without taking our lock: `jl_fill_codeinst`
+# (and `jl_update_codeinst`) overwrite it wholesale when inference finishes. That's
+# only safe because those writes happen while the CI is still private to the inference
+# engine (jl_fill_codeinst asserts min_world == 1 / max_world == 0, i.e.
+# pre-publication). Corollary: only attach results to CIs that have been published to
+# the integrated cache — never to a CI still being inferred.
 const attach_lock = ReentrantLock()
 
 @noinline function attach_results!(::Type{V}, ci::Core.CodeInstance) where V
