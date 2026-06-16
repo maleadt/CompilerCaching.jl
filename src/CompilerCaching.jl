@@ -10,17 +10,6 @@
 
 module CompilerCaching
 
-# On Julia < 1.11 the package loads as an empty shell: the integrated cache
-# (`Core.Compiler.InternalCodeCache`, `cache_owner` partitioning, persistent
-# `analysis_results` on `CodeInstance`) doesn't exist there, so none of the
-# `CacheView` / `typeinf!` / `create_ci` API is defined (the module body below
-# is gated on `VERSION >= v"1.11"`). Letting the package load anyway means
-# downstream packages can list us in `[deps]` and `using CompilerCaching`
-# unconditionally — they then either guard call sites with `@static if` or
-# go through a higher-level facade (e.g., `GPUCompiler.cached_compilation`).
-function __init__()
-end
-
 """
     @public foo, bar
 

@@ -29,9 +29,7 @@ The basic usage pattern of working with the compiler cache through CompilerCachi
 1. Define a mutable struct with a zero-arg constructor to hold compilation results
 2. Create a `CacheView{V}(owner_token, world)` where `V` is your results struct type
 3. Use the cache's `Dict` interface to get or create a code instance for a method instance
-4. Access cached compilation results via `results(cache, ci)`, populating them if needed.
-   The results struct is attached to the code instance on first access; every later
-   access returns the same instance.
+4. Access cached compilation results via `results(cache, ci)`, populating them if needed
 
 ```julia
 using CompilerCaching
