@@ -489,7 +489,8 @@ end
 
 # jl_get_specialization1 doesn't support custom method tables (hardcodes jl_nothing).
 # Reimplement its pipeline (match → normalize → specialize) with method table support.
-function _specialization1(@nospecialize(sig), world::UInt, method_table::Core.MethodTable)
+function _specialization1(@nospecialize(sig), world::UInt,
+                          method_table::Union{Core.MethodTable,Nothing})
     matches = Base._methods_by_ftype(sig, method_table, 1, world)
     matches === nothing && return nothing
     length(matches) != 1 && return nothing
@@ -519,15 +520,27 @@ end
 # methods, causing lookups to fail or return stale global entries, so don't use the cache.
 # Use jl_get_specialization1 instead, which uses jl_matching_methods (not cached dispatch)
 # and returns compileable signatures (with proper vararg widening).
-# Fixed in 1.14.0-DEV.1581, backported to 1.13.0-beta2, 1.12.5, and 1.11.9.
-@static if (VERSION >= v"1.14.0-DEV.1581" ||
-            v"1.13.0-beta2" <= VERSION < v"1.14-" ||
+# The overlay lookup issue is fixed in 1.13.0-beta2, 1.12.5, and 1.11.9. On
+# 1.14+, `Base.method_instance` returns the dispatch-cache MI, and the compiler
+# normalizes that to a compilable MI later. Do the same here, since this API is
+# documented to return the compilation target.
+@static if (v"1.13.0-beta2" <= VERSION < v"1.14-" ||
             v"1.12.5" <= VERSION < v"1.13-" ||
             v"1.11.9" <= VERSION < v"1.12-")
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
         Base.method_instance(f, tt; world, method_table)
+    end
+elseif VERSION >= v"1.14-"
+    @inline function method_instance(@nospecialize(f), @nospecialize(tt);
+                                     world::UInt=Base.get_world_counter(),
+                                     method_table::Union{Core.MethodTable,Nothing}=nothing)
+        sig = Base.signature_type(f, tt)
+        @assert isdispatchtuple(sig)
+        mi = Base.method_instance(sig; world, method_table)
+        mi === nothing && return nothing
+        return ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::Core.MethodInstance
     end
 elseif VERSION >= v"1.13-"
     # 3-arg jl_get_specialization1, returns jl_nothing on failure
@@ -612,6 +625,9 @@ calls for the same `mi` and world are no-ops — the existing CI is returned.
 """
 function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
+        @static if VERSION >= v"1.14-"
+            mi = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::Core.MethodInstance
+        end
         ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
         ci === nothing && return nothing
 
