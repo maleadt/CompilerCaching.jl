@@ -613,6 +613,21 @@ method_instance
 
 export typeinf!, create_ci, get_source, get_codeinfos
 
+# Clear the interpreter-local const-prop cache: a `Vector{InferenceResult}` (1.12)
+# or `Compiler.InferenceCache` (1.13+, which lacks `empty!`).
+function reset_inference_cache!(interp::CC.AbstractInterpreter)
+    cache = CC.get_inference_cache(interp)
+    @static if isdefined(Core.Compiler, :InferenceCache)
+        if cache isa CC.InferenceCache
+            empty!(cache.results)
+            empty!(cache.index)
+            return
+        end
+    end
+    empty!(cache)
+    return
+end
+
 """
     typeinf!(interp, mi) -> Union{CodeInstance, Nothing}
 
@@ -665,6 +680,11 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
             # followed by the back-end's compile) traversal-only.
             src = get_source(callee)
             if src === nothing
+                # Standalone re-inference must behave like a fresh `jl_typeinf` entry:
+                # tombstoned (`LimitedAccuracy`) const-prop results left by the deeper
+                # root cascade would otherwise suppress const-prop that succeeds in
+                # this shallower context (JuliaGPU/CUDA.jl#3185).
+                reset_inference_cache!(interp)
                 src = CC.typeinf_code(interp, callee_mi, true)
                 # Store source so get_codeinfos can retrieve it later
                 if src isa Core.CodeInfo && (@atomic callee.inferred) === nothing

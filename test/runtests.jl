@@ -372,6 +372,55 @@ end
     typeinf!(cache_va, interp_va, mi_va, va_argtypes)
 end
 
+@static if VERSION >= v"1.12-"
+@testset "stale const-prop tombstones" begin
+    # A tombstoned (LimitedAccuracy) const-prop result left in the local cache by
+    # the root cascade must not suppress const-prop during the callee walk's
+    # standalone re-inference (JuliaGPU/CUDA.jl#3185).
+    @inline function set_flag!(p::Ptr{Int64}, sym::Symbol, x::Ptr{UInt8})
+        if sym === :b
+            unsafe_store!(reinterpret(Ptr{Int32}, p), x)     # dead unless const-prop elides it
+        elseif sym === :a
+            unsafe_store!(reinterpret(Ptr{Ptr{UInt8}}, p), x)
+        end
+    end
+    @noinline function tombstone_thrower(p::Ptr{Int64}, x::Ptr{UInt8})
+        set_flag!(p, :a, x)
+        throw(nothing)
+    end
+    function tombstone_kernel(p::Ptr{Int64}, x::Ptr{UInt8}, i::Int)
+        i < 1 && tombstone_thrower(p, x)
+        unsafe_store!(p, i)
+        return
+    end
+
+    world = Base.get_world_counter()
+    cache = CacheView{TestResults}(:TombstoneTest, world)
+    interp = TestInterpreter(cache.world, cache, InfCacheT())
+
+    # seed a tombstone for `set_flag!(::Ptr{Int64}, Const(:a), ::Ptr{UInt8})`
+    si_mi = method_instance(set_flag!, (Ptr{Int64}, Symbol, Ptr{UInt8}); world)
+    𝕃 = Core.Compiler.typeinf_lattice(interp)
+    argtypes = Core.Compiler.matching_cache_argtypes(𝕃, si_mi)
+    argtypes[3] = Core.Const(:a)
+    overridden = falses(length(argtypes))
+    overridden[3] = true
+    seed = Core.Compiler.InferenceResult(si_mi, argtypes, overridden)
+    seed.tombstone = true
+    push!(Core.Compiler.get_inference_cache(interp), seed)
+
+    mi = method_instance(tombstone_kernel, (Ptr{Int64}, Ptr{UInt8}, Int); world)
+    @test typeinf!(interp, mi) !== nothing
+
+    th_mi = method_instance(tombstone_thrower, (Ptr{Int64}, Ptr{UInt8}); world)
+    th_ci = get(cache, th_mi, nothing)
+    @test th_ci !== nothing
+    src = get_source(th_ci)
+    # with healthy const-prop, the `:b` branch (and its Ptr{Int32} store) is elided
+    @test !any(stmt -> occursin("Int32", string(stmt)), src.code)
+end
+end
+
 #==============================================================================#
 # Custom IR
 #==============================================================================#
