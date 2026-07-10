@@ -108,6 +108,22 @@ end
     @test mi === expected
 end
 
+@testset "type-valued callees and arguments" begin
+    # JuliaLang/julia#62001: closed type-valued callees and arguments dispatch on
+    # Core.TypeEgal keys, so `Type{T}` spellings in `tt` need normalization.
+    world = Base.get_world_counter()
+
+    # type-valued callee
+    mi = method_instance(Vector{Int}, (typeof(undef), Int); world)
+    @test mi !== nothing
+
+    # type-valued argument, spelled as Type{T}
+    mi = method_instance(identity, (Type{Int},); world)
+    @test mi !== nothing
+    mi = match_method_instance(identity, (Type{Int},); world)
+    @test mi !== nothing
+end
+
 @testset "cache partitioning" begin
     # Global MT with sharding keys (e.g., for GPUCompiler-style usage)
     # Different caches for different key combinations

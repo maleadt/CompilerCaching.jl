@@ -461,6 +461,28 @@ end
 
 export method_instance, match_method_instance
 
+# JuliaLang/julia#62001 specializes closed type-valued callees and arguments on
+# `Core.TypeEgal` dispatch keys, making `Type{T}` elements non-dispatchable.
+# `Base.signature_type` handles the callee (it takes a value), but not `Type{T}`
+# spellings in a user-provided `tt`, so normalize those ourselves.
+@static if isdefined(Core, :TypeEgal)
+    @inline function dispatch_key(@nospecialize(t))
+        if Base.isType(t)
+            u = Base.type_parameter(t)
+            Base.has_free_typevars(u) || return Core.TypeEgal{u}
+        end
+        return t
+    end
+
+    function signature_type(@nospecialize(f), @nospecialize(tt))
+        sig = Base.signature_type(f, tt)
+        u = Base.unwrap_unionall(sig)::DataType
+        return Base.rewrap_unionall(Tuple{map(dispatch_key, u.parameters)...}, sig)
+    end
+else
+    const signature_type = Base.signature_type
+end
+
 """
     match_method_instance(f, tt; world, method_table) -> Union{MethodInstance, Nothing}
 
@@ -476,7 +498,7 @@ Returns `nothing` if no unique matching method is found.
 function match_method_instance(@nospecialize(f), @nospecialize(tt);
                                world::UInt=Base.get_world_counter(),
                                method_table::Union{Core.MethodTable,Nothing}=nothing)
-    sig = Base.signature_type(f, tt)
+    sig = signature_type(f, tt)
     matches = Base._methods_by_ftype(sig, method_table, 1, world)
     matches === nothing && return nothing
     length(matches) != 1 && return nothing
@@ -536,7 +558,7 @@ elseif VERSION >= v"1.14-"
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
-        sig = Base.signature_type(f, tt)
+        sig = signature_type(f, tt)
         @assert isdispatchtuple(sig)
         mi = Base.method_instance(sig; world, method_table)
         mi === nothing && return nothing
@@ -547,7 +569,7 @@ elseif VERSION >= v"1.13-"
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
-        sig = Base.signature_type(f, tt)
+        sig = signature_type(f, tt)
         @assert isdispatchtuple(sig)
         if method_table === nothing
             mi = ccall(:jl_get_specialization1, Any, (Any, Csize_t, Cint),
@@ -562,7 +584,7 @@ elseif VERSION >= v"1.12-"
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
-        sig = Base.signature_type(f, tt)
+        sig = signature_type(f, tt)
         @assert isdispatchtuple(sig)
         if method_table === nothing
             ptr = ccall(:jl_get_specialization1, Ptr{Cvoid}, (Any, Csize_t, Cint),
@@ -576,7 +598,7 @@ else # 1.11: 5-arg jl_get_specialization1 (extra min_valid/max_valid out-params)
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
-        sig = Base.signature_type(f, tt)
+        sig = signature_type(f, tt)
         @assert isdispatchtuple(sig)
         if method_table === nothing
             min_valid = Ref{Csize_t}(1)
