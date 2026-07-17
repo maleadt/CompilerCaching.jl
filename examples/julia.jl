@@ -58,8 +58,8 @@ function getglobal_jljit()
 end
 
 """
-    julia_codegen(cache, mi, ci; argtypes=nothing, dump_llvm=false, dump_module=false)
-        -> (ir_bytes, entry_name, llvm_ir)
+    julia_codegen(cache, interp, mi, ci; argtypes=nothing, dump_llvm=false,
+                  dump_module=false) -> (ir_bytes, entry_name, llvm_ir)
 
 Generate LLVM IR and return serializable intermediate result.
 Returns a tuple of (LLVM bitcode bytes, entry function name, LLVM IR text).
@@ -67,14 +67,15 @@ The `llvm_ir` string is empty unless `dump_llvm` or `dump_module` is set.
 When `dump_llvm` is true, returns the IR of just the entry function.
 When `dump_module` is true, returns the IR of the entire module.
 
-Uses `get_codeinfos(ci)` to collect CodeInfos by walking :invoke statements (1.12+)
-or cache lookup callback (1.11). When `argtypes` is provided, uses the const-optimized
-source for the root CI via `get_codeinfos(ci, argtypes)`.
+Uses `get_codeinfos(interp, ci)` to collect CodeInfos by walking :invoke statements
+(1.12+, re-inferring through `interp` where cache history left gaps) or the cache
+lookup callback (1.11). When `argtypes` is provided, uses the const-optimized source
+for the root CI via `get_codeinfos(interp, ci, argtypes)`.
 
 This function handles codegen but does not JIT compile - use `julia_jit` for that.
 """
-function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
-                       ci::Core.CodeInstance;
+function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
+                       mi::Core.MethodInstance, ci::Core.CodeInstance;
                        argtypes::Union{Vector{Any},Nothing}=nothing,
                        dump_llvm::Bool=false,
                        dump_module::Bool=false)
@@ -106,7 +107,8 @@ function julia_codegen(cache::CacheView, mi::Core.MethodInstance,
         # Generate native code
         @static if VERSION >= v"1.12.0-DEV.1823"
             cis_vec = Any[]
-            codeinfos = argtypes !== nothing ? get_codeinfos(ci, argtypes) : get_codeinfos(ci)
+            codeinfos = argtypes !== nothing ? get_codeinfos(interp, ci, argtypes) :
+                                               get_codeinfos(interp, ci)
             for (ci, src) in codeinfos
                 push!(cis_vec, ci)
                 push!(cis_vec, src)

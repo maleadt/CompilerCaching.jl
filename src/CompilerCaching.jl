@@ -659,6 +659,11 @@ compiles all callees and stores their source so [`get_codeinfos`](@ref) works.
 
 Returns the root `CodeInstance` (or `nothing` if inference failed). Subsequent
 calls for the same `mi` and world are no-ops — the existing CI is returned.
+
+The eager callee walk only follows `:invoke` edges that refer to a `CodeInstance`.
+Optimized source (in particular source reused from the cache) can also contain
+`:invoke` statements targeting a bare `MethodInstance`; those callees are not
+compiled here, but are resolved lazily by [`get_codeinfos(interp, ci)`](@ref).
 """
 function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
@@ -1028,27 +1033,60 @@ function get_source(ci::Core.CodeInstance, argtypes::Vector{Any})
 end
 
 """
-    get_codeinfos(ci::CodeInstance) -> Vector{Pair{CodeInstance, CodeInfo}}
+    get_codeinfos(interp::AbstractInterpreter, ci::CodeInstance) ->
+        Vector{Pair{CodeInstance, CodeInfo}}
 
-Collect CodeInstance/CodeInfo pairs by walking forward edges from a root CI.
+Collect the `CodeInstance`/`CodeInfo` pairs needed to generate code for `ci`, walking
+`:invoke` edges transitively from the root. On Julia 1.12+ the result is closed under
+direct-call edges, making it suitable for closed-world code generation
+(`jl_emit_native`, which cannot look up missing callees during codegen).
 
-On Julia 1.12+, walks `:invoke` statements to collect callees transitively.
-On Julia 1.11, returns only the root entry.
+`interp` is used to repair gaps that cache history can leave behind:
 
-Requires that `typeinf!` was called first to populate source for all callees.
+- `:invoke`/`:invoke_modify` statements whose target is still a bare `MethodInstance`
+  (inlining's `compileable_specialization` emits those when the compileable
+  specialization was not cached at optimization time; codegen lowers them to runtime
+  dispatch) are resolved to a `CodeInstance` — running inference through `interp` if
+  the cache has none — and the statement is rewritten to target it, in a copy of the
+  containing source; cached `CodeInfo` is never mutated. Only targets callable through
+  a native ABI (concrete signature, fully-resolved sparams) are resolved; anything
+  else (e.g. `@nospecialize`-widened compileable signatures) deliberately keeps its
+  runtime-dispatch fallback semantics.
+- Referenced `CodeInstance`s that lack stored source (e.g. cached by an earlier
+  session) are re-inferred.
+
+`interp` must match the cache owner and world that produced `ci` (typically the
+interpreter previously passed to [`typeinf!`](@ref)).
+
+On Julia 1.11, code generation resolves callees through a lookup callback instead, so
+only the root entry is returned.
 """
-function get_codeinfos(ci::Core.CodeInstance)
+get_codeinfos(interp::CC.AbstractInterpreter, ci::Core.CodeInstance) =
+    collect_codeinfos(interp, ci, nothing)
+
+function collect_codeinfos(interp::CC.AbstractInterpreter,
+                           root::Core.CodeInstance, root_src::Union{Core.CodeInfo, Nothing})
     codeinfos = Pair{Core.CodeInstance, Core.CodeInfo}[]
     @static if VERSION >= v"1.12-"
         visited = IdSet{Core.CodeInstance}()
-        workqueue = Core.CodeInstance[ci]
+        workqueue = Core.CodeInstance[root]
         while !isempty(workqueue)
             callee_ci = pop!(workqueue)
             callee_ci in visited && continue
             push!(visited, callee_ci)
 
-            src = get_source(callee_ci)
-            @assert src !== nothing "CodeInstance for $(CC.get_ci_mi(callee_ci)) has no source - ensure typeinf! was called"
+            src = callee_ci === root && root_src !== nothing ? root_src :
+                                                               get_source(callee_ci)
+            if src === nothing
+                # a referenced CI may lack stored source (e.g. it was cached by an
+                # earlier session whose sources were dropped); re-establish it
+                typeinf!(interp, CC.get_ci_mi(callee_ci))
+                src = get_source(callee_ci)
+                # if inference cannot provide source either, leave the call site to
+                # codegen's runtime-dispatch fallback
+                src === nothing && continue
+            end
+            src = resolve_invoke_targets(interp, src)
             push!(codeinfos, callee_ci => src)
 
             for stmt in src.code
@@ -1064,40 +1102,78 @@ function get_codeinfos(ci::Core.CodeInstance)
             end
         end
     else
-        src = get_source(ci)
-        src !== nothing && push!(codeinfos, ci => src)
+        src = root_src === nothing ? get_source(root) : root_src
+        src !== nothing && push!(codeinfos, root => src)
     end
     return codeinfos
 end
 
-"""
-    get_codeinfos(ci::CodeInstance, argtypes::Vector{Any}) -> Vector{Pair{CodeInstance, CodeInfo}}
-
-Collect CodeInstance/CodeInfo pairs using the const-optimized source for the root CI
-and generic source for all callees.
-
-Delegates to `get_codeinfos(ci)` for the full callee walk, then swaps the root entry's
-source with the const-optimized version from `get_source(ci, argtypes)`. Extra callees
-from the generic walk are harmless (compiled but uncalled), and missing callees get
-runtime dispatch stubs from `jl_emit_native`.
-
-Falls back to `get_codeinfos(ci)` if no const entry exists for the given argtypes.
-"""
-function get_codeinfos(ci::Core.CodeInstance, argtypes::Vector{Any})
-    const_src = get_source(ci, argtypes)
-    if const_src === nothing
-        return get_codeinfos(ci)
+@static if VERSION >= v"1.12-"
+# Mirror of nightly's `Compiler.has_valid_abi_sparams`: specializations with
+# incomplete sparams (TypeVar) or SimpleVector/Vararg sparams cannot be called
+# through a native specsig ABI — codegen's `needsparams` path emits `jl_invoke`
+# even for CodeInstance operands, so rewriting such targets is useless.
+function has_valid_abi_sparams(mi::Core.MethodInstance)
+    for sp in mi.sparam_vals
+        if sp isa TypeVar || sp isa Core.SimpleVector || CC.isvarargtype(sp)
+            return false
+        end
     end
-    codeinfos = get_codeinfos(ci)
-    # Swap root entry's source with const-optimized version
-    idx = findfirst(p -> p.first === ci, codeinfos)
-    if idx !== nothing
-        codeinfos[idx] = ci => const_src
-    else
-        pushfirst!(codeinfos, ci => const_src)
-    end
-    return codeinfos
+    return true
 end
+
+# Rewrite `:invoke`/`:invoke_modify` statements whose target is still a bare
+# `MethodInstance` to target a `CodeInstance` instead, inferring one when the cache
+# has none. Codegen can only emit a direct call for a `CodeInstance` operand; a
+# `MethodInstance` operand unconditionally lowers to runtime dispatch. Returns `src`
+# unchanged when there is nothing to rewrite, or a rewritten copy (cached source is
+# never mutated).
+function resolve_invoke_targets(interp::CC.AbstractInterpreter, src::Core.CodeInfo)
+    resolved = src
+    for pc in eachindex(resolved.code)
+        stmt = resolved.code[pc]
+        rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+        rhs isa Expr && (rhs.head === :invoke || rhs.head === :invoke_modify) || continue
+
+        callee_mi = rhs.args[1]
+        callee_mi isa Core.MethodInstance || continue
+        # Only specializations with a fully-concrete signature can be invoked directly
+        # through a native ABI; anything else (e.g. `@nospecialize`-widened compileable
+        # signatures) keeps its runtime-dispatch fallback semantics.
+        callee_mi.def isa Method && isdispatchtuple(callee_mi.specTypes) &&
+            has_valid_abi_sparams(callee_mi) || continue
+
+        callee_ci = typeinf!(interp, callee_mi)
+        callee_ci === nothing && continue
+        # only rewrite when the callee's source is available, so the returned
+        # collection stays closed under direct-call edges
+        get_source(callee_ci) === nothing && continue
+
+        if resolved === src
+            resolved = copy(src)
+            stmt = resolved.code[pc]
+            rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+        end
+        new_rhs = Expr(rhs.head, callee_ci, rhs.args[2:end]...)
+        resolved.code[pc] = stmt === rhs ? new_rhs : Expr(:(=), stmt.args[1], new_rhs)
+    end
+    return resolved
+end
+end
+
+"""
+    get_codeinfos(interp::AbstractInterpreter, ci::CodeInstance, argtypes::Vector{Any}) ->
+        Vector{Pair{CodeInstance, CodeInfo}}
+
+Const-specialized variant of [`get_codeinfos(interp, ci)`](@ref): the callee walk is
+seeded with the const-optimized source stored for `argtypes` (see
+[`typeinf!(cache, interp, mi, argtypes)`](@ref)), so callees reachable only from the
+const-optimized code are included as well.
+
+Falls back to the generic source if no const entry exists for the given argtypes.
+"""
+get_codeinfos(interp::CC.AbstractInterpreter, ci::Core.CodeInstance, argtypes::Vector{Any}) =
+    collect_codeinfos(interp, ci, get_source(ci, argtypes))
 
 end # @static if VERSION >= v"1.11"
 

@@ -435,6 +435,123 @@ end
     # with healthy const-prop, the `:b` branch (and its Ptr{Int32} store) is elided
     @test !any(stmt -> occursin("Int32", string(stmt)), src.code)
 end
+
+@testset "unresolved invoke targets" begin
+    # Inlining's `compileable_specialization` leaves an `:invoke` target as a bare
+    # MethodInstance when the compileable specialization is not cached at optimization
+    # time; codegen lowers such statements to runtime dispatch. Cached optimized
+    # source can therefore reference callees that a plain CodeInstance-edge walk
+    # cannot follow (JuliaGPU/Metal.jl checked-conversion overlay failures on 1.12+).
+    # `get_codeinfos(interp, ci)` must resolve concrete targets to CodeInstances.
+    mod = @eval module $(gensym())
+        using Base.Experimental: @MethodTable, @overlay
+        @MethodTable method_table
+        function overlay_child end
+        @overlay method_table @noinline overlay_child(x::UInt32, p::Ptr{Int32}) =
+            unsafe_store!(p, x % Int32)
+
+        @noinline child(x::UInt32, p::Ptr{Int32}) = unsafe_store!(p, x % Int32)
+        @noinline nospec_child(p::Ptr{Int32}, @nospecialize(x)) =
+            unsafe_store!(p, Int32(2))
+        function kernel(x::UInt32, p::Ptr{Int32})
+            child(x, p)
+            nospec_child(p, x)
+            return
+        end
+    end
+
+    get_ci_mi = Core.Compiler.get_ci_mi
+    function find_invoke(src::Core.CodeInfo, pred)
+        findfirst(eachindex(src.code)) do pc
+            stmt = src.code[pc]
+            rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+            rhs isa Expr && rhs.head === :invoke && pred(rhs.args[1])
+        end
+    end
+    invoke_target(src::Core.CodeInfo, pc::Int) = begin
+        stmt = src.code[pc]
+        rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+        rhs.args[1]
+    end
+
+    world = Base.get_world_counter()
+    cache = CacheView{TestResults}(:UnresolvedInvokeTest, world)
+    interp = TestInterpreter(cache.world, cache, InfCacheT())
+
+    mi = method_instance(mod.kernel, (UInt32, Ptr{Int32}); world)
+    root = typeinf!(interp, mi)
+    @test root isa Core.CodeInstance
+
+    overlay_mi = method_instance(mod.overlay_child, (UInt32, Ptr{Int32});
+                                 world, method_table=mod.method_table)
+    @test overlay_mi isa Core.MethodInstance
+
+    # sources that need no rewriting are returned as-is, not copied (only checkable
+    # when the stored source is an uncompressed CodeInfo)
+    stored = @atomic :monotonic root.inferred
+    if stored isa Core.CodeInfo
+        @test only(src for (ci, src) in get_codeinfos(interp, root) if ci === root) ===
+              stored
+    end
+
+    # reconstruct the problematic cache state: retarget the `child` invoke (a
+    # CodeInstance edge from fresh inference) to the never-inferred overlay MI
+    doctored = copy(get_source(root))
+    child_pc = find_invoke(doctored, op -> op isa Core.CodeInstance &&
+        get_ci_mi(op).def in methods(mod.child))
+    @test child_pc !== nothing
+    stmt = doctored.code[child_pc]
+    rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+    new_rhs = Expr(:invoke, overlay_mi, rhs.args[2:end]...)
+    doctored.code[child_pc] = stmt === rhs ? new_rhs : Expr(:(=), stmt.args[1], new_rhs)
+    @atomic root.inferred = doctored
+
+    # the walk infers the unresolved callee, includes it, and rewrites the operand
+    pairs = get_codeinfos(interp, root)
+    overlay_idx = findfirst(p -> get_ci_mi(p.first) === overlay_mi, pairs)
+    @test overlay_idx !== nothing
+    root_src = only(src for (ci, src) in pairs if ci === root)
+    @test invoke_target(root_src, child_pc) === pairs[overlay_idx].first
+    # copy-on-write: the cached source still carries the MethodInstance operand
+    @test root_src !== doctored
+    @test invoke_target(doctored, child_pc) === overlay_mi
+
+    # targets with non-concrete signatures (@nospecialize-widened compileable
+    # signatures) keep their runtime-dispatch fallback
+    nospec_pc = find_invoke(doctored, op -> begin
+        op_mi = op isa Core.CodeInstance ? get_ci_mi(op) : op
+        op_mi isa Core.MethodInstance && op_mi.def in methods(mod.nospec_child)
+    end)
+    @test nospec_pc !== nothing
+    if invoke_target(doctored, nospec_pc) isa Core.MethodInstance
+        @test invoke_target(root_src, nospec_pc) === invoke_target(doctored, nospec_pc)
+        @test !any(p -> get_ci_mi(p.first).def in methods(mod.nospec_child), pairs)
+    end
+
+    # const-specialized collection receives the same treatment, seeded from the
+    # const-optimized root source
+    const_argtypes = Any[Core.Compiler.Const(mod.kernel), Core.Compiler.Const(UInt32(42)),
+                         Ptr{Int32}]
+    typeinf!(cache, interp, mi, const_argtypes)
+    const_src = get_source(root, const_argtypes)
+    @test const_src isa Core.CodeInfo
+    const_pc = find_invoke(const_src, op -> op isa Core.CodeInstance &&
+        get_ci_mi(op).def in methods(mod.child))
+    @test const_pc !== nothing
+    stmt = const_src.code[const_pc]
+    rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+    new_rhs = Expr(:invoke, overlay_mi, rhs.args[2:end]...)
+    const_src.code[const_pc] = stmt === rhs ? new_rhs : Expr(:(=), stmt.args[1], new_rhs)
+
+    const_pairs = get_codeinfos(interp, root, const_argtypes)
+    @test any(p -> get_ci_mi(p.first) === overlay_mi, const_pairs)
+    const_root_src = only(src for (ci, src) in const_pairs if ci === root)
+    @test invoke_target(const_root_src, const_pc) isa Core.CodeInstance
+    @test get_ci_mi(invoke_target(const_root_src, const_pc)) === overlay_mi
+    # the stored const-prop entry itself is left unmutated
+    @test const_root_src !== const_src
+    @test invoke_target(const_src, const_pc) === overlay_mi
+end
 end
 
 #==============================================================================#
