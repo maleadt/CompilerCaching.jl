@@ -875,7 +875,11 @@ Create a CodeInstance for `mi` with proper owner, typed results, and backedges.
 Creates a new CodeInstance with:
 - Owner set to `cache.owner`
 - A fresh `V()` instance in analysis_results
-- Backedges registered for all dependencies in `deps`
+- Backedges registered for all dependencies in `deps`. A dependency may be a
+  `MethodInstance`, meaning any compilation of that method, or a
+  `CodeInstance`, meaning that exact compilation on Julia 1.12 and newer.
+  Julia 1.11 has no per-CodeInstance forward-edge field, so there a
+  `CodeInstance` dependency degrades to its `MethodInstance`.
 - Per-CI binding edges, so that the resulting CodeInstance is invalidated
   whenever any binding the source captures is replaced. The set of
   `GlobalRef`s is taken from [`captured_globals(mi.def.source)`](@ref captured_globals).
@@ -890,8 +894,19 @@ to pin them to the source type once via [`captured_globals`](@ref) and have
 compilation: the same method may invoke different callees depending on the
 argument types of `mi`.
 """
+const CompilationDependency = Union{Core.MethodInstance,Core.CodeInstance}
+@public CompilationDependency
+
+dependency_mi(mi::Core.MethodInstance) = mi
+dependency_mi(ci::Core.CodeInstance) = @static if VERSION >= v"1.12-"
+    CC.get_ci_mi(ci)
+else
+    ci.def::Core.MethodInstance
+end
+
 function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
-                   deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) where {K,V}
+                   deps::AbstractVector{<:CompilationDependency}=
+                       CompilationDependency[]) where {K,V}
     owner = cache.owner
     world = cache.world
 
@@ -943,17 +958,20 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
 end
 
 """
-    store_backedges(mi::MethodInstance, ci::CodeInstance, deps::Vector{MethodInstance})
+    store_backedges(mi::MethodInstance, ci::CodeInstance, deps)
 
-Register backedges so Julia automatically invalidates cached code when dependencies change.
-This enables Julia's built-in invalidation mechanism - when any dependency MI is
-invalidated, the caller MI's CodeInstances will have their max_world reduced.
+Register backedges so Julia automatically invalidates cached code when dependencies
+change. On Julia 1.12 and newer, the caller is the new `CodeInstance` and its
+forward edges preserve whether each dependency is an entire `MethodInstance` or
+one exact `CodeInstance`. On Julia 1.11, both kinds degrade to a
+`MethodInstance`-to-`MethodInstance` backedge.
 """
 function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
-                         deps::Vector{Core.MethodInstance})
+                         deps::AbstractVector{<:CompilationDependency})
     isa(mi.def, Method) || return  # don't add backedges to toplevel
 
-    for dep_mi in deps
+    for dep in deps
+        dep_mi = dependency_mi(dep)
         @static if VERSION >= v"1.12-"
             # Julia 1.12+: pass CodeInstance as caller
             ccall(:jl_method_instance_add_backedge, Cvoid,

@@ -797,6 +797,33 @@ end
     @test parent_compile_count[] == 2
 end
 
+@testset "CodeInstance dependency invalidation" begin
+    method_table = @eval @MethodTable $(gensym(:method_table))
+
+    function exact_parent end
+    function exact_child end
+    add_method(method_table, exact_child, (Int,), :child_ir)
+    add_method(method_table, exact_parent, (Int,), :parent_ir)
+
+    world = Base.get_world_counter()
+    cache = CacheView{TestResults}(:ExactDepTest, world)
+    child_mi = method_instance(exact_child, (Int,); world, method_table)
+    parent_mi = method_instance(exact_parent, (Int,); world, method_table)
+    child_ci = create_ci(cache, child_mi)
+    parent_ci = create_ci(cache, parent_mi; deps=[child_ci])
+
+    @static if VERSION >= v"1.12-"
+        @test any(edge -> edge === child_ci, parent_ci.edges)
+
+        # Invalidating this particular child compilation follows the
+        # MethodInstance backedge only into callers that carry this exact CI
+        # as a forward edge.
+        ccall(:jl_invalidate_code_instance, Cvoid, (Any, Csize_t), child_ci, world)
+        @test (@atomic child_ci.max_world) == world
+        @test (@atomic parent_ci.max_world) == world
+    end
+end
+
 @testset "binding edges" begin
     # create_ci consults captured_globals(source) to pick up the
     # GlobalRefs a foreign IR captures, so they participate in invalidation.
