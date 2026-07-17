@@ -798,29 +798,175 @@ end
 end
 
 @testset "CodeInstance dependency invalidation" begin
-    method_table = @eval @MethodTable $(gensym(:method_table))
-
-    function exact_parent end
-    function exact_child end
-    add_method(method_table, exact_child, (Int,), :child_ir)
-    add_method(method_table, exact_parent, (Int,), :parent_ir)
-
-    world = Base.get_world_counter()
-    cache = CacheView{TestResults}(:ExactDepTest, world)
-    child_mi = method_instance(exact_child, (Int,); world, method_table)
-    parent_mi = method_instance(exact_parent, (Int,); world, method_table)
-    child_ci = create_ci(cache, child_mi)
-    parent_ci = create_ci(cache, parent_mi; deps=[child_ci])
+    # A CodeInstance dependency records an edge to one *exact* compilation,
+    # whereas a MethodInstance dependency covers *any* compilation of that
+    # method. On Julia 1.12+ the two are distinguishable: invalidating one CI
+    # of a child MI must leave callers wired to a *sibling* CI of the same MI
+    # alone. On 1.11 there is no per-CI forward-edge field, so a CI dep
+    # degrades to its MI (see `dependency_mi`) and we only assert the degraded
+    # behavior.
 
     @static if VERSION >= v"1.12-"
-        @test any(edge -> edge === child_ci, parent_ci.edges)
+        @testset "exactness: sibling CI survives" begin
+            method_table = @eval @MethodTable $(gensym(:method_table))
+            function exact_parent1 end
+            function exact_parent2 end
+            function exact_child end
+            add_method(method_table, exact_child, (Int,), :child_ir)
+            add_method(method_table, exact_parent1, (Int,), :parent1_ir)
+            add_method(method_table, exact_parent2, (Int,), :parent2_ir)
 
-        # Invalidating this particular child compilation follows the
-        # MethodInstance backedge only into callers that carry this exact CI
-        # as a forward edge.
-        ccall(:jl_invalidate_code_instance, Cvoid, (Any, Csize_t), child_ci, world)
-        @test (@atomic child_ci.max_world) == world
-        @test (@atomic parent_ci.max_world) == world
+            world = Base.get_world_counter()
+            cache = CacheView{TestResults}(:ExactDepTest, world)
+            child_mi = method_instance(exact_child, (Int,); world, method_table)
+            parent1_mi = method_instance(exact_parent1, (Int,); world, method_table)
+            parent2_mi = method_instance(exact_parent2, (Int,); world, method_table)
+
+            # Two distinct compilations (sibling CIs) of the SAME child MI.
+            # create_ci does not store into the cache, so both can coexist.
+            child_ci1 = create_ci(cache, child_mi)
+            child_ci2 = create_ci(cache, child_mi)
+            @test child_ci1 !== child_ci2
+
+            parent1_ci = create_ci(cache, parent1_mi; deps=[child_ci1])
+            parent2_ci = create_ci(cache, parent2_mi; deps=[child_ci2])
+
+            # The forward edge is the exact CI, not the MI.
+            @test any(edge -> edge === child_ci1, parent1_ci.edges)
+            @test any(edge -> edge === child_ci2, parent2_ci.edges)
+
+            # Invalidating child_ci1 walks child_mi's backedges but only
+            # invalidates callers whose forward edges name child_ci1.
+            ccall(:jl_invalidate_code_instance, Cvoid, (Any, Csize_t), child_ci1, world)
+            @test (@atomic child_ci1.max_world) == world
+            @test (@atomic parent1_ci.max_world) == world
+
+            # The sibling compilation and its caller are untouched. This is
+            # the assertion that proves the dependency is per-CI, not per-MI:
+            # a degradation to an MI dep would have invalidated parent2 too.
+            @test (@atomic child_ci2.max_world) == typemax(UInt)
+            @test (@atomic parent2_ci.max_world) == typemax(UInt)
+        end
+
+        @testset "broad MI dep invalidates on any CI" begin
+            method_table = @eval @MethodTable $(gensym(:method_table))
+            function broad_parent end
+            function sibling_parent end
+            function broad_child end
+            add_method(method_table, broad_child, (Int,), :child_ir)
+            add_method(method_table, broad_parent, (Int,), :broad_ir)
+            add_method(method_table, sibling_parent, (Int,), :sibling_ir)
+
+            world = Base.get_world_counter()
+            cache = CacheView{TestResults}(:ExactDepTest, world)
+            child_mi = method_instance(broad_child, (Int,); world, method_table)
+            broad_mi = method_instance(broad_parent, (Int,); world, method_table)
+            sibling_mi = method_instance(sibling_parent, (Int,); world, method_table)
+
+            child_ci1 = create_ci(cache, child_mi)
+            child_ci2 = create_ci(cache, child_mi)
+
+            # Broad dep on the whole MI vs. exact dep on the *other* sibling CI.
+            broad_ci = create_ci(cache, broad_mi; deps=[child_mi])
+            sibling_ci = create_ci(cache, sibling_mi; deps=[child_ci2])
+
+            ccall(:jl_invalidate_code_instance, Cvoid, (Any, Csize_t), child_ci1, world)
+
+            # MI dep = "any compilation": invalidated even though child_ci1 is
+            # not a CI it would ever have used.
+            @test (@atomic broad_ci.max_world) == world
+            # Exact dep on the surviving sibling CI: untouched.
+            @test (@atomic sibling_ci.max_world) == typemax(UInt)
+        end
+
+        @testset "redefinition invalidates exact-CI caller" begin
+            method_table = @eval @MethodTable $(gensym(:method_table))
+            function redef_parent end
+            function redef_child end
+            add_method(method_table, redef_child, (Int,), :child_ir)
+            add_method(method_table, redef_parent, (Int,), :parent_ir)
+
+            world = Base.get_world_counter()
+            cache = CacheView{TestResults}(:ExactDepTest, world)
+            child_mi = method_instance(redef_child, (Int,); world, method_table)
+            parent_mi = method_instance(redef_parent, (Int,); world, method_table)
+
+            child_ci = create_ci(cache, child_mi)
+            parent_ci = create_ci(cache, parent_mi; deps=[child_ci])
+            @test (@atomic parent_ci.max_world) == typemax(UInt)
+
+            # Method redefinition invalidates *all* callers of the old MI (the
+            # replaced_ci == NULL path in _invalidate_backedges), so an
+            # exact-CI caller must be caught even though no specific CI is named.
+            add_method(method_table, redef_child, (Int,), :new_child_ir)
+            @test (@atomic parent_ci.max_world) != typemax(UInt)
+        end
+
+        @testset "mixed dependency vector" begin
+            method_table = @eval @MethodTable $(gensym(:method_table))
+            function mixed_parent end
+            function mixed_child end
+            add_method(method_table, mixed_child, (Int,), :child_ir)
+            add_method(method_table, mixed_parent, (Int,), :parent_ir)
+
+            world = Base.get_world_counter()
+            cache = CacheView{TestResults}(:ExactDepTest, world)
+            child_mi = method_instance(mixed_child, (Int,); world, method_table)
+            parent_mi = method_instance(mixed_parent, (Int,); world, method_table)
+            child_ci = create_ci(cache, child_mi)
+
+            # An untyped [mi, ci] literal infers as Vector{Any}; `deps` accepts
+            # any AbstractVector and dispatches per element, so both edge kinds
+            # register.
+            @test [child_mi, child_ci] isa Vector{Any}
+            parent_ci = create_ci(cache, parent_mi; deps=[child_mi, child_ci])
+            @test any(edge -> edge === child_mi, parent_ci.edges)
+            @test any(edge -> edge === child_ci, parent_ci.edges)
+
+            # An explicitly-typed CompilationDependency vector works too.
+            parent_ci2 = create_ci(cache, parent_mi;
+                                   deps=CompilerCaching.CompilationDependency[child_mi, child_ci])
+            @test any(edge -> edge === child_mi, parent_ci2.edges)
+            @test any(edge -> edge === child_ci, parent_ci2.edges)
+
+            # A non-dependency element is rejected — late, from dependency_mi's
+            # dispatch, once backedge registration reaches it.
+            @test_throws MethodError create_ci(cache, parent_mi; deps=Any[1])
+        end
+    else
+        @testset "1.11 degrades CI dep to MI dep" begin
+            # Julia 1.11 has no per-CI forward-edge field, so a CodeInstance
+            # dependency is registered as a MethodInstance-to-MethodInstance
+            # backedge. There is no per-CI precision to assert; we only check
+            # that the degraded MI-level dependency still triggers invalidation
+            # when the child method is redefined.
+            #
+            # 1.11 invalidation walks `mi->cache`, so the caller CI must be
+            # stored in the cache to be reachable (unlike 1.12+, where the CI
+            # is itself the backedge target). Store both through the cache.
+            method_table = @eval @MethodTable $(gensym(:method_table))
+            function degrade_parent end
+            function degrade_child end
+            add_method(method_table, degrade_child, (Int,), :child_ir)
+            add_method(method_table, degrade_parent, (Int,), :parent_ir)
+
+            world = Base.get_world_counter()
+            cache = CacheView{TestResults}(:ExactDepTest, world)
+            child_mi = method_instance(degrade_child, (Int,); world, method_table)
+            parent_mi = method_instance(degrade_parent, (Int,); world, method_table)
+
+            child_ci = get!(cache, child_mi) do
+                create_ci(cache, child_mi)
+            end
+            # deps is a CodeInstance; on 1.11 this degrades to child_mi.
+            parent_ci = get!(cache, parent_mi) do
+                create_ci(cache, parent_mi; deps=[child_ci])
+            end
+            @test (@atomic parent_ci.max_world) == typemax(UInt)
+
+            add_method(method_table, degrade_child, (Int,), :new_child_ir)
+            @test (@atomic parent_ci.max_world) != typemax(UInt)
+        end
     end
 end
 

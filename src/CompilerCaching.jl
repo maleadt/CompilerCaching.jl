@@ -905,8 +905,7 @@ else
 end
 
 function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
-                   deps::AbstractVector{<:CompilationDependency}=
-                       CompilationDependency[]) where {K,V}
+                   deps::AbstractVector=CompilationDependency[]) where {K,V}
     owner = cache.owner
     world = cache.world
 
@@ -967,7 +966,7 @@ one exact `CodeInstance`. On Julia 1.11, both kinds degrade to a
 `MethodInstance`-to-`MethodInstance` backedge.
 """
 function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
-                         deps::AbstractVector{<:CompilationDependency})
+                         deps::AbstractVector)
     isa(mi.def, Method) || return  # don't add backedges to toplevel
 
     for dep in deps
