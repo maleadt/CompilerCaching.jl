@@ -554,7 +554,7 @@ end
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
         Base.method_instance(f, tt; world, method_table)
     end
-elseif VERSION >= v"1.14-"
+elseif VERSION >= v"1.14.0-DEV.2337"
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
@@ -667,7 +667,7 @@ compiled here, but are resolved lazily by [`get_codeinfos(interp, ci)`](@ref).
 """
 function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
-        @static if VERSION >= v"1.14-"
+        @static if VERSION >= v"1.14.0-DEV.2337"
             mi = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::Core.MethodInstance
         end
         ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
