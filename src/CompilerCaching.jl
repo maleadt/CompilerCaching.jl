@@ -667,9 +667,8 @@ compiled here, but are resolved lazily by [`get_codeinfos(interp, ci)`](@ref).
 """
 function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
-        @static if VERSION >= v"1.14-"
-            mi = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::Core.MethodInstance
-        end
+        # `mi` is inferred exactly as requested; callers wanting a compileable
+        # specialization should normalize before using it as a cache key.
         ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
         ci === nothing && return nothing
 

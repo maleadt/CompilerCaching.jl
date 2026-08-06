@@ -552,6 +552,41 @@ end
     @test const_root_src !== const_src
     @test invoke_target(const_src, const_pc) === overlay_mi
 end
+
+@testset "exact specializations" begin
+    # GPU-style consumers request inference of an exact specialization; `typeinf!` must
+    # not normalize it to a compileable one first, whose heuristics can widen
+    # function-typed pass-through arguments and leave runtime dispatch in the source
+    # (AcceleratedKernels.jl sort kernels on 1.14).
+    mod = @eval module $(gensym())
+        @noinline child(p::Ptr{Int32}, f) =
+            unsafe_store!(p, f(Int32(1), Int32(2)) ? Int32(1) : Int32(2))
+        function kernel(p::Ptr{Int32}, f)
+            child(p, f)
+            return
+        end
+    end
+
+    world = Base.get_world_counter()
+    cache = CacheView{TestResults}(:ExactSpecTest, world)
+    interp = TestInterpreter(cache.world, cache, InfCacheT())
+
+    sig = Tuple{typeof(mod.kernel), Ptr{Int32}, typeof(<)}
+    match = Base._which(sig; world)
+    mi = Core.Compiler.specialize_method(match)
+    @test mi.specTypes == sig
+
+    root = typeinf!(interp, mi)
+    @test root isa Core.CodeInstance
+    @test Core.Compiler.get_ci_mi(root).specTypes == sig
+
+    @static if VERSION >= v"1.12-"
+        # the callee must be reachable through CodeInstance edges (no runtime dispatch)
+        pairs = get_codeinfos(interp, root)
+        @test any(p -> (Core.Compiler.get_ci_mi(p.first).def::Method).name === :child,
+                  pairs)
+    end
+end
 end
 
 #==============================================================================#
