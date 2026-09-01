@@ -1207,6 +1207,149 @@ end
     end
 end
 
+@testset "concurrent const-seeded inference" begin
+    mutable struct RaceResults
+        tag::Any
+        RaceResults() = new(nothing)
+    end
+
+    struct RaceInterpreter <: Core.Compiler.AbstractInterpreter
+        world::UInt
+        cache::CacheView
+        inf_cache::InfCacheT
+    end
+    RaceInterpreter(cache::CacheView) = RaceInterpreter(cache.world, cache, InfCacheT())
+    Core.Compiler.cache_owner(interp::RaceInterpreter) = interp.cache.owner
+    Core.Compiler.InferenceParams(::RaceInterpreter) = Core.Compiler.InferenceParams()
+    Core.Compiler.OptimizationParams(::RaceInterpreter) = Core.Compiler.OptimizationParams()
+    Core.Compiler.get_inference_cache(interp::RaceInterpreter) = interp.inf_cache
+    @static if isdefined(Core.Compiler, :get_inference_world)
+        Core.Compiler.get_inference_world(interp::RaceInterpreter) = interp.world
+    else
+        Core.Compiler.get_world_counter(interp::RaceInterpreter) = interp.world
+    end
+    Core.Compiler.lock_mi_inference(::RaceInterpreter, ::Core.MethodInstance) = nothing
+    Core.Compiler.unlock_mi_inference(::RaceInterpreter, ::Core.MethodInstance) = nothing
+
+    # A callee chain, so const-seeding recurses into callee CIs (each with its
+    # own `const_entries`).
+    @noinline race_scale(x, k) = x * k
+    @noinline race_shift(x, k) = x + k
+    @noinline race_index(i, tile) = race_shift(race_scale(i, tile), tile ÷ 2)
+    race_kernel(i, tile) = race_index(i, tile) - race_scale(i, tile)
+    race_argtypes(tile) = Any[Core.Compiler.Const(race_kernel), Int, Core.Compiler.Const(tile)]
+
+    ntasks = max(2 * Threads.nthreads(), 8)
+    rounds = Threads.nthreads() > 1 ? 10 : 2
+
+    # Distinct constants per task: every task must end up with its own entry.
+    for round in 1:rounds
+        world = Base.get_world_counter()
+        cache = CacheView{RaceResults}(Symbol("ConstSeedRace", round), world)
+        mi = method_instance(race_kernel, (Int, Int); world)
+        typeinf!(RaceInterpreter(cache), mi)
+        ci = get(cache, mi)
+
+        @sync for t in 1:ntasks
+            Threads.@spawn begin
+                interp = RaceInterpreter(cache)
+                at = race_argtypes(16t)
+                typeinf!(cache, interp, mi, at)
+                res = results(cache, ci, at)
+                res.tag = 16t
+                hit = lookup(cache, mi, at)
+                @test hit !== nothing && hit[2] === res
+            end
+        end
+
+        entries = CompilerCaching.find_results(RaceResults, ci).const_entries
+        @test length(entries) == ntasks
+        @test allunique(e.argtypes[3].val for e in entries)
+        for t in 1:ntasks
+            @test results(cache, ci, race_argtypes(16t)).tag == 16t
+            @test get_source(ci, race_argtypes(16t)) isa Union{Core.CodeInfo, Nothing}
+        end
+    end
+
+    # The same constants from every task: one entry, everyone sees it.
+    for round in 1:rounds
+        world = Base.get_world_counter()
+        cache = CacheView{RaceResults}(Symbol("ConstSeedDedup", round), world)
+        mi = method_instance(race_kernel, (Int, Int); world)
+        typeinf!(RaceInterpreter(cache), mi)
+        ci = get(cache, mi)
+
+        seen = Vector{Any}(undef, ntasks)
+        @sync for t in 1:ntasks
+            Threads.@spawn begin
+                typeinf!(cache, RaceInterpreter(cache), mi, race_argtypes(32))
+                seen[t] = results(cache, ci, race_argtypes(32))
+            end
+        end
+        @test length(CompilerCaching.find_results(RaceResults, ci).const_entries) == 1
+        @test all(r -> r === seen[1], seen)
+    end
+
+    # Root inference racing on an isbits owner: the engine keys reservations by the
+    # boxed owner's address, while the integrated cache compares owners by value.
+    # CompilerCaching must serialize the logical cache key so every caller gets the
+    # same published CodeInstance. A deep callee chain widens the race window.
+    struct IsbitsOwner
+        id::Int
+    end
+    for i in 1:32
+        @eval @noinline $(Symbol(:race_deep_, i))(x, k) =
+            $(i == 1 ? :(x * k + 1) : :($(Symbol(:race_deep_, i-1))(x, k) + $i))
+    end
+    race_deep_kernel(x, k) = race_deep_32(x, k)
+    for round in 1:rounds
+        world = Base.get_world_counter()
+        cache = CacheView{RaceResults}(IsbitsOwner(round), world)
+        mi = method_instance(race_deep_kernel, (Int, Int); world)
+        seen = Vector{Any}(undef, ntasks)
+        @sync for t in 1:ntasks
+            Threads.@spawn begin
+                seen[t] = typeinf!(RaceInterpreter(cache), mi)
+            end
+        end
+        ci = get(cache, mi)
+        @test all(c -> c === ci, seen)
+    end
+end
+
+@testset "concurrent foreign-mode get!" begin
+    # N tasks compile the same method through the `get!` do-block: all must end up
+    # with the one CodeInstance the cache holds, so results attached by any task are
+    # visible to every other.
+    mutable struct ForeignRaceResults
+        tag::Any
+        ForeignRaceResults() = new(nothing)
+    end
+    foreign_race_fn(x::Int) = x + 1
+
+    ntasks = max(2 * Threads.nthreads(), 8)
+    for round in 1:(Threads.nthreads() > 1 ? 10 : 2)
+        world = Base.get_world_counter()
+        cache = CacheView{ForeignRaceResults}(Symbol("ForeignRace", round), world)
+        mi = method_instance(foreign_race_fn, (Int,); world)
+        cis = Vector{Any}(undef, ntasks)
+        @sync for t in 1:ntasks
+            Threads.@spawn begin
+                ci = get!(cache, mi) do
+                    yield()   # widen the window between the miss and the insert
+                    candidate = create_ci(cache, mi)
+                    results(cache, candidate).tag = t
+                    candidate
+                end
+                cis[t] = ci
+            end
+        end
+        @test all(ci -> ci === cis[1], cis)
+        @test get(cache, mi) === cis[1]
+        @test results(cache, cis[1]).tag in 1:ntasks
+    end
+end
+
 include("utils.jl")
 include("precompile.jl")
 

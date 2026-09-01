@@ -83,6 +83,22 @@ mutable struct CachedResult{V}
     CachedResult{V}(inner::V) where V = new{V}(inner, SpecializedResult{V}[])
 end
 
+# Guards every `const_entries` vector. One global lock: the critical sections are
+# short scans, and a per-CI lock could not be persisted with the CI anyway.
+const const_entries_lock = ReentrantLock()
+
+@inline function find_const_entry(cached::CachedResult{V}, argtypes::Vector{Any}) where V
+    for entry in cached.const_entries
+        argtypes_egal(entry.argtypes, argtypes) && return entry
+    end
+    return nothing
+end
+
+# Locked lookup of a const-seeded entry.
+function const_entry(cached::CachedResult{V}, argtypes::Vector{Any}) where V
+    Base.@lock const_entries_lock find_const_entry(cached, argtypes)
+end
+
 """
     get_invoke_mi(stmt::Expr) -> Union{MethodInstance, Nothing}
 
@@ -283,11 +299,9 @@ generic accessor, const-specialized entries are only created by [`typeinf!`](@re
 with `argtypes`; this throws if no matching entry exists.
 """
 function results(::Type{V}, ci::Core.CodeInstance, argtypes::Vector{Any})::V where V
-    cached = get_results(V, ci)
-    for entry in cached.const_entries
-        argtypes_egal(entry.argtypes, argtypes) && return entry.inner
-    end
-    error("CodeInstance missing $V results for argtypes $argtypes")
+    entry = const_entry(get_results(V, ci), argtypes)
+    entry === nothing && error("CodeInstance missing $V results for argtypes $argtypes")
+    return entry.inner
 end
 
 results(::CacheView{K,V}, ci::Core.CodeInstance, argtypes::Vector{Any}) where {K,V} =
@@ -341,11 +355,9 @@ end
                         argtypes::Vector{Any}) where {K,V}
     ci = get(cache, mi, nothing)
     ci === nothing && return nothing
-    cached = get_results(V, ci)
-    for entry in cached.const_entries
-        argtypes_egal(entry.argtypes, argtypes) && return (ci, entry.inner)
-    end
-    return nothing
+    entry = const_entry(get_results(V, ci), argtypes)
+    entry === nothing && return nothing
+    return (ci, entry.inner)
 end
 
 
@@ -361,6 +373,9 @@ Get an existing CodeInstance or create one using `f()`.
 Standard dict interface: returns existing CI if found, otherwise calls `f()`
 which must return a CodeInstance, stores it, and returns it.
 
+Concurrent misses may call `f()` more than once. The first CodeInstance inserted
+is returned to every caller; the other candidates are discarded.
+
 # Example (foreign mode)
 ```julia
 ci = get!(cache, mi) do
@@ -368,11 +383,20 @@ ci = get!(cache, mi) do
 end
 ```
 """
+# Serialize publication only; construction remains parallel across cache misses.
+const insert_lock = ReentrantLock()
+
 function Base.get!(f::Function, cache::CacheView, mi::Core.MethodInstance)
     ci = get(cache, mi, nothing)
     ci !== nothing && return ci
     ci = f()::Core.CodeInstance
-    cache[mi] = ci
+    # Another task may have inserted meanwhile; its CodeInstance wins, since results
+    # may already be attached to it.
+    Base.@lock insert_lock begin
+        existing = get(cache, mi, nothing)
+        existing !== nothing && return existing
+        cache[mi] = ci
+    end
     return ci
 end
 
@@ -635,6 +659,59 @@ method_instance
 
 export typeinf!, create_ci, get_source, get_codeinfos
 
+# Julia's inference engine keys foreign-owner reservations by object address, while
+# the integrated cache compares owners with `egal`. Equal immutable owners can
+# therefore infer and publish the same MethodInstance concurrently. Serialize root
+# inference for one logical cache key, without blocking unrelated compilations.
+mutable struct InferenceReservation
+    owner::Any
+    mi::Core.MethodInstance
+    lock::ReentrantLock
+    users::Int
+end
+
+const inference_reservations = InferenceReservation[]
+const inference_reservations_lock = ReentrantLock()
+
+function acquire_inference_reservation(@nospecialize(owner), mi::Core.MethodInstance)
+    Base.@lock inference_reservations_lock begin
+        for reservation in inference_reservations
+            if reservation.owner === owner && reservation.mi === mi
+                reservation.users += 1
+                return reservation
+            end
+        end
+        reservation = InferenceReservation(owner, mi, ReentrantLock(), 1)
+        push!(inference_reservations, reservation)
+        return reservation
+    end
+end
+
+function release_inference_reservation(reservation::InferenceReservation)
+    Base.@lock inference_reservations_lock begin
+        reservation.users -= 1
+        if reservation.users == 0
+            i = findfirst(item -> item === reservation, inference_reservations)::Int
+            deleteat!(inference_reservations, i)
+        end
+    end
+    return
+end
+
+function with_inference_reservation(f, interp::CC.AbstractInterpreter,
+                                    mi::Core.MethodInstance)
+    reservation = acquire_inference_reservation(CC.cache_owner(interp), mi)
+    locked = false
+    try
+        lock(reservation.lock)
+        locked = true
+        return f()
+    finally
+        locked && unlock(reservation.lock)
+        release_inference_reservation(reservation)
+    end
+end
+
 # Run `f()` with an empty local inference cache, then restore the caller's
 # entries. The cache is either a `Vector{InferenceResult}` or, on newer Julia
 # versions, an `InferenceCache` with a separate index.
@@ -678,9 +755,7 @@ function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
             if source_ci isa Core.CodeInstance && source_ci.rettype === ci.rettype
                 src = get(codegen, source_ci, nothing)
                 if src isa Core.CodeInfo
-                    if (@atomic ci.inferred) === nothing
-                        @atomic ci.inferred = src
-                    end
+                    @atomicreplace ci.inferred nothing => src
                     return src
                 end
             end
@@ -695,9 +770,7 @@ function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
     src = with_fresh_inference_cache(interp) do
         CC.typeinf_code(interp, mi, true)
     end
-    if src isa Core.CodeInfo && (@atomic ci.inferred) === nothing
-        @atomic ci.inferred = src
-    end
+    src isa Core.CodeInfo && @atomicreplace ci.inferred nothing => src
     return src
 end
 
@@ -720,8 +793,17 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
         # `mi` is inferred exactly as requested; callers wanting a compileable
         # specialization should normalize before using it as a cache key.
-        ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
+        ci = with_inference_reservation(interp, mi) do
+            CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
+        end
         ci === nothing && return nothing
+
+        # If another task inferred `mi` concurrently and published first, Julia's
+        # `cache_result!` skips our insert and `typeinf_ext` hands back the orphan.
+        # Adopt the published CodeInstance, so results attach to the one every cache
+        # lookup returns.
+        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
+        ci = @something get(cache, mi, nothing) ci
 
         # Eagerly compile all callees and store source
         has_compilequeue = VERSION >= v"1.13.0-DEV.499" || v"1.12-beta3" <= VERSION < v"1.13-"
@@ -771,7 +853,9 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
         return ci
     elseif VERSION >= v"1.12.0-DEV.15"
         cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
-        inferred_ci = CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
+        inferred_ci = with_inference_reservation(interp, mi) do
+            CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
+        end
         @assert inferred_ci !== nothing "Inference of $mi failed"
 
         # inference should have populated the cache
@@ -788,7 +872,9 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     else
         # Julia 1.11: typeinf_ext_toplevel returns CodeInfo, not CI
         cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
-        src = CC.typeinf_ext_toplevel(interp, mi)
+        src = with_inference_reservation(interp, mi) do
+            CC.typeinf_ext_toplevel(interp, mi)
+        end
         @assert src !== nothing "Inference of $mi failed"
 
         # inference should have populated the cache
@@ -797,9 +883,7 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
 
         # if ci is rettype_const, the inference result won't have been cached.
         # to avoid the need to re-infer, set that field here.
-        if ci.inferred === nothing
-            @atomic ci.inferred = src
-        end
+        @atomicreplace ci.inferred nothing => src
         return ci
     end
 end
@@ -818,6 +902,11 @@ and `get_source(ci, argtypes)`.
 Unlike the generic `typeinf!(interp, mi)`, this form takes a `CacheView`: const-prop
 entries are stored typed, so the results type `V` must be known up front. The cache
 view must match the interpreter's owner and world.
+
+Safe to call concurrently from multiple tasks, each with its own interpreter. Tasks
+seeding the same `(ci, argtypes)` at the same time may both run inference; the first
+to finish publishes its entry and the others discard theirs. The interpreter must not
+be shared between tasks: its inference cache is mutated during the walk over callees.
 """
 function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
                   mi::Core.MethodInstance, argtypes::Vector{Any}) where {K,V}
@@ -834,10 +923,7 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
 
     cached = get_results(V, ci)
 
-    # Check if we already have a const-prop result for these argtypes
-    for entry in cached.const_entries
-        argtypes_egal(entry.argtypes, argtypes) && return
-    end
+    const_entry(cached, argtypes) === nothing || return
 
     # Compute overridden_by_const
     𝕃 = CC.typeinf_lattice(interp)
@@ -879,10 +965,15 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
     rettype = inf_result.result
     rettype_const = rettype isa CC.Const ? rettype.val : nothing
 
-    # Store const-prop entry on the mutable CachedResult
-    # (must happen before recursive walk so the duplicate check on lines 441-443 prevents cycles)
+    # Publish the entry unless another task got there first. Copy on write, since
+    # readers may hold the old vector. This precedes the recursive walk so the
+    # entry check above terminates cycles.
     entry = SpecializedResult{V}(argtypes, v, src, rettype, rettype_const)
-    push!(cached.const_entries, entry)
+    Base.@lock const_entries_lock begin
+        if find_const_entry(cached, argtypes) === nothing
+            cached.const_entries = push!(copy(cached.const_entries), entry)
+        end
+    end
 
     # Recursively const-seed callees with propagated const argtypes.
     # Walk the *generic* source (which has :invoke stmts pointing to callee CIs)
@@ -1081,13 +1172,10 @@ function get_source(ci::Core.CodeInstance, argtypes::Vector{Any})
         result isa CachedResult ? result : nothing
     end
     cached === nothing && return nothing
-    for entry in cached.const_entries
-        if argtypes_egal(entry.argtypes, argtypes)
-            src = entry.src
-            return src isa Core.CodeInfo ? src : nothing
-        end
-    end
-    return nothing
+    entry = const_entry(cached, argtypes)
+    entry === nothing && return nothing
+    src = entry.src
+    return src isa Core.CodeInfo ? src : nothing
 end
 
 """
