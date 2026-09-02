@@ -5,6 +5,10 @@ import Core.Compiler: findsup, findall, isoverlayed
 Base.Experimental.@MethodTable(TestMT)
 Base.Experimental.@MethodTable(OtherMT)
 
+stacked_ambiguous(x, y) = 0
+Base.Experimental.@overlay TestMT stacked_ambiguous(x::Integer, y) = 1
+Base.Experimental.@overlay TestMT stacked_ambiguous(x, y::Integer) = 2
+
 # Helper to create different method table views
 OverlayMT() = Core.Compiler.OverlayMethodTable(Base.get_world_counter(), TestMT)
 StackedMT() = StackedMethodTable(Base.get_world_counter(), TestMT)
@@ -45,5 +49,19 @@ DoubleStackedMT() = StackedMethodTable(Base.get_world_counter(), OtherMT, TestMT
         result = findall(sig, stacked; limit=10)
         @test result !== nothing
         @test length(result.matches) >= 1
+    end
+
+    @static if VERSION >= v"1.14.0-DEV.3088"
+        @testset "findall includes ambiguous methods" begin
+            world = Base.get_world_counter()
+            stacked = StackedMethodTable(world, TestMT)
+            sig = Tuple{typeof(stacked_ambiguous), Integer, Integer}
+            result = findall(sig, stacked; limit=10, include_ambiguous=true)
+            @test result !== nothing
+            @test result.ambig
+            @test length(result.matches) == 2
+            base_method = only(methods(stacked_ambiguous))
+            @test all(match -> match.method !== base_method, result.matches)
+        end
     end
 end
