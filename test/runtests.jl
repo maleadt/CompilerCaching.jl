@@ -15,6 +15,12 @@ else
     Vector{Core.Compiler.InferenceResult}
 end
 
+struct MatchCallable end
+(::MatchCallable)(x::Int) = x
+
+abstract_match(x, y) = 1
+abstract_match(x::Int, y) = 2
+
 @testset "CompilerCaching" verbose=true begin
 
 @testset "basic caching" begin
@@ -122,6 +128,23 @@ end
     @test mi !== nothing
     mi = match_method_instance(identity, (Type{Int},); world)
     @test mi !== nothing
+
+    # A full signature supports non-singleton function selfs, where no callee
+    # value exists at compile time. Type-valued arguments use the same
+    # normalization as the known-callee form above.
+    mi = match_method_instance(Tuple{MatchCallable, Int}; world)
+    @test mi !== nothing
+    @test mi.specTypes <: Tuple{MatchCallable, Int}
+    mi = match_method_instance(Tuple{typeof(identity), Type{Int}}; world)
+    @test mi !== nothing
+
+    # Existence and unique-MI lookup differ for abstract signatures. The first
+    # method covers this signature, while the second intersects it for Ints.
+    sig = Tuple{typeof(abstract_match), Any, Int}
+    @test has_matching_method(sig; world)
+    @test has_matching_method(abstract_match, Tuple{Any, Int}; world)
+    @test match_method_instance(sig; world) === nothing
+    @test !has_matching_method(Tuple{typeof(abstract_match), String, String, Int}; world)
 end
 
 @testset "cache partitioning" begin
@@ -180,6 +203,12 @@ end
         $overlay_double_name
     end
 
+    # Full-signature lookup is what non-singleton callable values need: there
+    # is no instance to pass to the known-callee API.
+    @eval Base.Experimental.@overlay $method_table function (::MatchCallable)(x::Int)
+        -x
+    end
+
     compile_count = Ref(0)
     function my_compile(mi)
         compile_count[] += 1
@@ -210,6 +239,14 @@ end
     @test ci2 === ci
     @test res2 === res
     @test compile_count[] == 1  # unchanged
+
+    global_mi = match_method_instance(Tuple{MatchCallable, Int}; world)
+    overlay_mi = match_method_instance(Tuple{MatchCallable, Int}; world, method_table)
+    @test has_matching_method(Tuple{MatchCallable, Int}; world, method_table)
+    @test has_matching_method(overlay_double, Tuple{Int}; world, method_table)
+    @test global_mi !== nothing
+    @test overlay_mi !== nothing
+    @test overlay_mi.def !== global_mi.def
 end
 
 @testset "inference integration" begin

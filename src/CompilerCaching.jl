@@ -483,7 +483,7 @@ end
 # Method lookup
 #==============================================================================#
 
-export method_instance, match_method_instance
+export method_instance, has_matching_method, match_method_instance
 
 # JuliaLang/julia#62001 specializes closed type-valued callees and arguments on
 # `Core.TypeEgal` dispatch keys, making `Type{T}` elements non-dispatchable.
@@ -498,20 +498,25 @@ export method_instance, match_method_instance
         return t
     end
 
-    function signature_type(@nospecialize(f), @nospecialize(tt))
-        sig = Base.signature_type(f, tt)
+    function normalize_signature(@nospecialize(sig))
         u = Base.unwrap_unionall(sig)::DataType
         return Base.rewrap_unionall(Tuple{map(dispatch_key, u.parameters)...}, sig)
     end
+
+    signature_type(@nospecialize(f), @nospecialize(tt)) =
+        normalize_signature(Base.signature_type(f, tt))
 else
+    const normalize_signature = identity
     const signature_type = Base.signature_type
 end
 
 """
+    match_method_instance(sig; world, method_table) -> Union{MethodInstance, Nothing}
     match_method_instance(f, tt; world, method_table) -> Union{MethodInstance, Nothing}
 
-Look up the MethodInstance for function `f` with argument types `tt` using
-method matching instead of cached dispatch lookup.
+Look up a MethodInstance using method matching instead of cached dispatch lookup.
+Pass either the full call signature `sig`, including the function self as its first
+parameter, or a known function value `f` and argument types `tt`.
 
 Unlike `method_instance`, this function accepts non-dispatch tuples (abstract
 argument types) without crashing. Use this for compile-time analysis where
@@ -519,10 +524,10 @@ argument types may not be fully concrete.
 
 Returns `nothing` if no unique matching method is found.
 """
-function match_method_instance(@nospecialize(f), @nospecialize(tt);
+function match_method_instance(@nospecialize(sig::Type{<:Tuple});
                                world::UInt=Base.get_world_counter(),
                                method_table::Union{Core.MethodTable,Nothing}=nothing)
-    sig = signature_type(f, tt)
+    sig = normalize_signature(sig)
     matches = Base._methods_by_ftype(sig, method_table, 1, world)
     matches === nothing && return nothing
     length(matches) != 1 && return nothing
@@ -532,6 +537,39 @@ function match_method_instance(@nospecialize(f), @nospecialize(tt);
         return CC.specialize_method(matches[1]::Core.MethodMatch)
     end
 end
+
+function match_method_instance(@nospecialize(f), @nospecialize(tt);
+                               world::UInt=Base.get_world_counter(),
+                               method_table::Union{Core.MethodTable,Nothing}=nothing)
+    return match_method_instance(signature_type(f, tt); world, method_table)
+end
+
+"""
+    has_matching_method(sig; world, method_table) -> Bool
+    has_matching_method(f, tt; world, method_table) -> Bool
+
+Return whether a method fully covers the call signature. Pass either the full
+signature `sig`, including the function self as its first parameter, or a known
+function value `f` and argument types `tt`.
+
+This is an existence query, not a uniqueness query: it may return `true` when
+[`match_method_instance`](@ref) returns `nothing` because several methods
+intersect an abstract signature.
+"""
+function has_matching_method(@nospecialize(sig::Type{<:Tuple});
+                             world::UInt=Base.get_world_counter(),
+                             method_table::Union{Core.MethodTable,Nothing}=nothing)
+    sig = normalize_signature(sig)
+    match, = CC._findsup(sig, method_table, world)
+    return match !== nothing
+end
+
+function has_matching_method(@nospecialize(f), @nospecialize(tt);
+                             world::UInt=Base.get_world_counter(),
+                             method_table::Union{Core.MethodTable,Nothing}=nothing)
+    return has_matching_method(signature_type(f, tt); world, method_table)
+end
+
 
 # jl_get_specialization1 doesn't support custom method tables (hardcodes jl_nothing).
 # Reimplement its pipeline (match → normalize → specialize) with method table support.
