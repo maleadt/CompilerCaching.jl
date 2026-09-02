@@ -221,3 +221,59 @@ function call(f, args...)
     ccall(exe, ...)
 end
 ```
+
+
+## Persistent artifacts
+
+Compilation results handled by this package live in three tiers:
+
+1. **Session**: the results struct attached to a `CodeInstance` (`results(cache, ci)`).
+   Invalidated with the code instance.
+2. **Package image**: the same struct, serialized when the owning package is precompiled.
+   Covers whatever the package's precompile workload reaches.
+3. **Object cache**: byte artifacts produced at run time (a CUBIN, a shared library, an
+   object file), stored in Julia's on-disk object cache and reused by later sessions.
+
+The third tier is exposed by `CompilerCaching.ObjCache`. On Julia 1.14 (development build
+3075 or later) it uses the runtime's store, shared with the JIT and configured through the
+same environment variables (`JULIA_OBJCACHE=0` disables, `JULIA_OBJCACHE_PATH` relocates,
+`JULIA_OBJCACHE_CAPACITY` sizes it, default 512 MiB). On older Julia the package provides
+an LMDB-backed port of that store (same layout, capacity accounting, eviction order and
+environment variables), living in a Julia-minor-specific directory in CompilerCaching's
+scratch space; LMDB is only loaded there.
+
+```julia
+using CompilerCaching: ObjCache
+
+function compile_kernel(res, source::Vector{UInt8}, target::String)
+    res.binary !== nothing && return res.binary  # session tier
+    res.binary = ObjCache.get!("MyCompiler/binary", toolchain_version(), target, source;
+                               schema=1, persistable=true) do
+        run_toolchain(source, target)::Vector{UInt8}
+    end
+end
+```
+
+`get!` derives a SHA-256 key from the namespace, `schema` and the fields, returns the
+stored bytes on a hit, and otherwise runs the block and submits its result for storage.
+With `persistable=false` or no store, it simply runs the block. The store owns no policy;
+consumers must honour this contract:
+
+- **Key every input.** The fields must cover everything the value depends on, including
+  the external toolchain's identity. Under-keying serves stale artifacts silently.
+- **Write once.** The same key must always mean equivalent bytes.
+- **Writes are best-effort.** Julia's runtime backend commits on a background thread and
+  does not drain pending writes at exit; the fallback commits synchronously. Consumers
+  must rely on the weaker runtime contract, so a process that compiles and exits
+  immediately may not populate the store.
+- **The store is per Julia minor version**, not per build. This partitions storage but
+  does not make an under-keyed artifact valid across Julia builds.
+- **Keep the artifact in your session-tier struct.** `get!` has no in-memory memo.
+- **Values above about 32 MiB are dropped**, and the capacity is shared with the JIT under
+  LRU eviction, so any entry may disappear.
+- Only persist artifacts that are valid in another process under the given key. Anything
+  embedding session-local addresses, or depending on compatibility inputs that cannot be
+  keyed completely, must pass `persistable=false`.
+
+Namespaces follow `"<PackageName>/<artifact-kind>"`. Lower-level access is available via
+`ObjCache.enabled`, `ObjCache.get`, `ObjCache.put!` and `ObjCache.keyhash`.

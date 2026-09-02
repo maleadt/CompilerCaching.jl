@@ -1,9 +1,16 @@
 name = "CompilerCaching"
 uuid = "9db33cc3-5358-4881-8759-fa4194144afd"
-version = "0.4.5"
+version = "0.4.6"
+
+[deps]
+LMDB = "11f193de-5e89-5f17-923a-7d207d56daf9"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 
 [workspace]
 projects = ["test", "examples"]
 
 [compat]
+LMDB = "3"
+Scratch = "1.2"
 julia = "1.10"

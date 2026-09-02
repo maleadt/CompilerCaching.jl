@@ -1389,5 +1389,7 @@ end
 
 include("utils.jl")
 include("precompile.jl")
+include("objcache.jl")
+include("objcache_lmdb.jl")
 
 end
