@@ -30,6 +30,9 @@ end
 
 @static if VERSION >= v"1.11"
 
+include("objcache.jl")
+@public ObjCache
+
 using Base.Experimental: @MethodTable
 const CC = Core.Compiler
 
