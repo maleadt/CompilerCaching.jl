@@ -430,14 +430,17 @@ edges are registered on every CI created for a method using this source.
 captured_globals(@nospecialize(source)) = ()
 
 """
+    add_method(mt, sig, source) -> Method
     add_method(mt, f, arg_types, source) -> Method
 
 Register a method with custom source IR in the cache's method table.
 
 # Arguments
 - `mt::Core.MethodTable` - The method table to add the method to
-- `f::Function` - The function to add a method to
-- `arg_types::Tuple` - Argument types for this method
+- `sig::Type{<:Tuple}` - Full call signature. The first parameter must be the
+  singleton type of a `Function`; use `UnionAll` to bind static parameters.
+- `f::Function`, `arg_types::Tuple` - Function and argument types for a method
+  without static parameters
 - `source` - Custom IR to store (any type)
 
 If `source` captures global bindings, override [`captured_globals`](@ref)
@@ -448,18 +451,28 @@ invalidated whenever any of them is replaced.
 # Returns
 The created `Method` object.
 """
-function add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source)
-    sig = Tuple{typeof(f), arg_types...}
+function add_method(mt::Core.MethodTable, @nospecialize(sig::Type{<:Tuple}), source)
+    params = Base.unwrap_unionall(sig).parameters
+    isempty(params) && throw(ArgumentError("method signature must include a function type"))
+    Base.has_free_typevars(sig) &&
+        throw(ArgumentError("method signature has free type variables"))
 
-    m = ccall(:jl_new_method_uninit, Any, (Any,), parentmodule(f))
+    ft = params[1]
+    if !(ft isa DataType && isdefined(ft, :instance) && ft.instance isa Function)
+        throw(ArgumentError("method signature must begin with a singleton Function type"))
+    end
+    f = ft.instance
+    mod = parentmodule(f)
+
+    m = ccall(:jl_new_method_uninit, Any, (Any,), mod)
 
     m.name = nameof(f)
-    m.module = parentmodule(f)
+    m.module = mod
     m.file = Symbol("foreign")
     m.line = Int32(0)
     m.sig = sig
-    m.nargs = Int32(1 + length(arg_types))
-    m.isva = false
+    m.nargs = Int32(length(params))
+    m.isva = CC.isvarargtype(params[end])
     m.nospecialize = UInt32(0)
     m.external_mt = mt
     m.slot_syms = ""
@@ -480,6 +493,9 @@ function add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source)
 
     return m
 end
+
+add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source) =
+    add_method(mt, Tuple{typeof(f), arg_types...}, source)
 
 
 #==============================================================================#

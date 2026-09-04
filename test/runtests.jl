@@ -859,6 +859,57 @@ end
     @test mi.specTypes === Tuple{typeof(callable_node), MyCallable, Int}
 end
 
+@testset "static parameters" begin
+    method_table = @eval @MethodTable $(gensym(:method_table))
+
+    struct GenericArg{T} end
+    function generic_node end
+    tv = TypeVar(:T)
+    add_method(
+        method_table,
+        UnionAll(tv, Tuple{typeof(generic_node), GenericArg{tv}}),
+        :generic_ir,
+    )
+
+    world = Base.get_world_counter()
+    mi = method_instance(generic_node, (GenericArg{Float64},); world, method_table)
+    @test mi !== nothing
+    @test mi.def.source === :generic_ir
+    @test mi.def.nargs == 2
+    @test mi.specTypes === Tuple{typeof(generic_node), GenericArg{Float64}}
+    @test collect(mi.sparam_vals) == [Float64]
+end
+
+@testset "signature validation" begin
+    method_table = @eval @MethodTable $(gensym(:method_table))
+
+    function vararg_node end
+    tv = TypeVar(:T)
+    method = add_method(
+        method_table,
+        UnionAll(tv, Tuple{typeof(vararg_node), Int, Vararg{tv}}),
+        :vararg_ir,
+    )
+    @test method.nargs == 3
+    @test method.isva
+
+    world = Base.get_world_counter()
+    mi = method_instance(vararg_node, (Int, String, String); world, method_table)
+    @test mi !== nothing
+    # How many vararg positions get unrolled is a Julia heuristic that differs
+    # between versions (1.11 consults the overlay table's max_args), so only
+    # check that the signature was widened to a Vararg{String} tail.
+    @test Tuple{typeof(vararg_node), Int, String, String} <: mi.specTypes
+    @test mi.specTypes <: Tuple{typeof(vararg_node), Int, Vararg{String}}
+    @test Base.isvarargtype(last(mi.specTypes.parameters))
+    @test collect(mi.sparam_vals) == [String]
+
+    @test_throws ArgumentError add_method(method_table, Tuple{}, :invalid_ir)
+    @test_throws ArgumentError add_method(method_table, Tuple{Function, Int}, :invalid_ir)
+    @test_throws ArgumentError add_method(
+        method_table, Tuple{typeof(vararg_node), Ref{tv}}, :invalid_ir)
+end
+
 @testset "missing method" begin
     method_table = @eval @MethodTable $(gensym(:method_table))
 
