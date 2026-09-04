@@ -43,12 +43,21 @@ include("utils.jl")
 # CacheView structure
 #==============================================================================#
 
-export CacheView, results, lookup
+export CacheView, results, lookup, specialization, SpecializedResult
 
 """
     SpecializedResult{V}
 
-A specialized inference result for specific argument types.
+A cached result of const-seeded inference for specific argument types. Entries are
+stored on the generic `CodeInstance`'s `CachedResult{V}` and found through
+[`specialization`](@ref) or [`lookup`](@ref).
+
+Fields:
+- `argtypes::Vector{Any}`: the (extended lattice) argument types inference was seeded with
+- `src`: the const-optimized `CodeInfo`, read through [`get_source`](@ref)
+- `rettype`: the extended-lattice return value (`InferenceResult.result`)
+- `rettype_const`: the value of `rettype` when it is a `Const`, otherwise `nothing`
+- `inner::V`: the results struct, read through [`results`](@ref)
 """
 struct SpecializedResult{V}
     argtypes::Vector{Any}
@@ -294,21 +303,31 @@ results(::Type{V}, ci::Core.CodeInstance) where V = get_results(V, ci).inner
 results(::CacheView{K,V}, ci::Core.CodeInstance) where {K,V} = results(V, ci)
 
 """
-    results(::Type{V}, ci::CodeInstance, argtypes::Vector{Any})::V
-    results(cache::CacheView{K,V}, ci::CodeInstance, argtypes::Vector{Any})::V
+    results(entry::SpecializedResult{V})::V
 
-Retrieve const-specialized results for a specific set of argument types. Unlike the
-generic accessor, const-specialized entries are only created by [`typeinf!`](@ref)
-with `argtypes`; this throws if no matching entry exists.
+The results struct of a const-specialized entry, created along with the entry by
+[`typeinf!(cache, interp, mi, argtypes)`](@ref).
 """
-function results(::Type{V}, ci::Core.CodeInstance, argtypes::Vector{Any})::V where V
-    entry = const_entry(get_results(V, ci), argtypes)
-    entry === nothing && error("CodeInstance missing $V results for argtypes $argtypes")
-    return entry.inner
+results(entry::SpecializedResult) = entry.inner
+
+"""
+    specialization(::Type{V}, ci::CodeInstance, argtypes::Vector{Any})
+    specialization(cache::CacheView{K,V}, ci::CodeInstance, argtypes::Vector{Any})
+        -> Union{SpecializedResult{V}, Nothing}
+
+Find the const-specialized entry stored on `ci` for `argtypes` by
+[`typeinf!(cache, interp, mi, argtypes)`](@ref). Entries live on the `CachedResult{V}`
+of the results type that seeded them, so the lookup is scoped by `V`; several results
+types can share a `CodeInstance`. Returns `nothing` if no entry exists.
+"""
+function specialization(::Type{V}, ci::Core.CodeInstance, argtypes::Vector{Any}) where V
+    cached = find_results(V, ci)
+    cached === nothing && return nothing
+    return const_entry(cached, argtypes)
 end
 
-results(::CacheView{K,V}, ci::Core.CodeInstance, argtypes::Vector{Any}) where {K,V} =
-    results(V, ci, argtypes)
+specialization(::CacheView{K,V}, ci::Core.CodeInstance, argtypes::Vector{Any}) where {K,V} =
+    specialization(V, ci, argtypes)
 
 @static if VERSION >= v"1.14-"
     function code_cache(cache::CacheView)
@@ -336,17 +355,17 @@ Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance)
 """
     lookup(cache::CacheView{K,V}, mi::MethodInstance) -> Union{Nothing, Tuple{CodeInstance, V}}
     lookup(cache::CacheView{K,V}, mi::MethodInstance, argtypes::Vector{Any}) ->
-        Union{Nothing, Tuple{CodeInstance, V}}
+        Union{Nothing, Tuple{CodeInstance, SpecializedResult{V}}}
 
-Combined `get(cache, mi)` + `results(cache, ci[, argtypes])` accessor — single-pass
-cache lookup. Returns `(ci, res)` when a `CodeInstance` is cached for `mi` (attaching
-a fresh `V()` on first access), or `nothing` when there is no CI — or, with
-`argtypes`, no matching const-prop entry.
+Single-pass cache lookup. The generic form combines `get(cache, mi)` and
+`results(cache, ci)`: it returns `(ci, res)` when a `CodeInstance` is cached for `mi`
+(attaching a fresh `V()` on first access), or `nothing` when there is none. The
+`argtypes` form combines `get(cache, mi)` and `specialization(cache, ci, argtypes)`:
+it returns `(ci, entry)`, or `nothing` when there is no CI or no matching entry.
 
-Hot-path callers (e.g. `cufunction`) typically need both `ci` and `res` and walk
-the same lookup multiple times across phases. Use `lookup` once and pass the
-resulting `(ci, res)` pair down through phases instead of resolving them each
-time.
+Hot-path callers (e.g. `cufunction`) typically need both `ci` and the results and walk
+the same lookup multiple times across phases. Use `lookup` once and pass the resulting
+pair down through phases instead of resolving them each time.
 """
 @inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance) where {K,V}
     ci = get(cache, mi, nothing)
@@ -358,9 +377,9 @@ end
                         argtypes::Vector{Any}) where {K,V}
     ci = get(cache, mi, nothing)
     ci === nothing && return nothing
-    entry = const_entry(get_results(V, ci), argtypes)
+    entry = specialization(V, ci, argtypes)
     entry === nothing && return nothing
-    return (ci, entry.inner)
+    return (ci, entry)
 end
 
 
@@ -946,15 +965,17 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
 end
 
 """
-    typeinf!(cache::CacheView{K,V}, interp, mi, argtypes) -> Nothing
+    typeinf!(cache::CacheView{K,V}, interp, mi, argtypes) -> Union{SpecializedResult{V}, Nothing}
 
 Run const-seeded type inference on `mi` with enriched `argtypes` and store the result
-as a `SpecializedResult{V}` entry on the generic CI's `CachedResult{V}`.
+as a [`SpecializedResult{V}`](@ref) entry on the generic CI's `CachedResult{V}`.
+Returns that entry (the existing one, if `argtypes` was seeded before), or `nothing`
+if inference could not run.
 
 Uses Julia's ephemeral `:local` inference mode (same as internal const-prop) so no
-new CodeInstance is created. The const-specialized source and return type are stored
-alongside the generic result for later retrieval via `results(cache, ci, argtypes)`
-and `get_source(ci, argtypes)`.
+new CodeInstance is created. The const-specialized source, return type and results
+struct are stored alongside the generic result, for later retrieval via
+[`specialization(cache, ci, argtypes)`](@ref) or [`lookup(cache, mi, argtypes)`](@ref).
 
 Unlike the generic `typeinf!(interp, mi)`, this form takes a `CacheView`: const-prop
 entries are stored typed, so the results type `V` must be known up front. The cache
@@ -980,7 +1001,8 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
 
     cached = get_results(V, ci)
 
-    const_entry(cached, argtypes) === nothing || return
+    existing = const_entry(cached, argtypes)
+    existing === nothing || return existing
 
     # Compute overridden_by_const
     𝕃 = CC.typeinf_lattice(interp)
@@ -1025,10 +1047,14 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
     # Publish the entry unless another task got there first. Copy on write, since
     # readers may hold the old vector. This precedes the recursive walk so the
     # entry check above terminates cycles.
-    entry = SpecializedResult{V}(argtypes, v, src, rettype, rettype_const)
+    # Keep the lookup key independent of the caller's reusable argument buffer.
+    entry = SpecializedResult{V}(copy(argtypes), v, src, rettype, rettype_const)
     Base.@lock const_entries_lock begin
-        if find_const_entry(cached, argtypes) === nothing
+        published = find_const_entry(cached, argtypes)
+        if published === nothing
             cached.const_entries = push!(copy(cached.const_entries), entry)
+        else
+            entry = published
         end
     end
 
@@ -1053,7 +1079,7 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
         end
     end
 
-    return
+    return entry
 end
 
 """
@@ -1219,18 +1245,12 @@ function get_source(ci::Core.CodeInstance)
 end
 
 """
-    get_source(ci::CodeInstance, argtypes::Vector{Any}) -> Union{CodeInfo, Nothing}
+    get_source(entry::SpecializedResult) -> Union{CodeInfo, Nothing}
 
-Retrieve const-specialized CodeInfo from a CodeInstance's `CachedResult` chain.
-Returns `nothing` if no const-prop entry exists for the given argtypes.
+Retrieve the const-optimized CodeInfo of a const-specialized entry (see
+[`specialization`](@ref)). Returns `nothing` if inference produced no source.
 """
-function get_source(ci::Core.CodeInstance, argtypes::Vector{Any})
-    cached = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CachedResult ? result : nothing
-    end
-    cached === nothing && return nothing
-    entry = const_entry(cached, argtypes)
-    entry === nothing && return nothing
+function get_source(entry::SpecializedResult)
     src = entry.src
     return src isa Core.CodeInfo ? src : nothing
 end
@@ -1374,18 +1394,26 @@ end
 end
 
 """
-    get_codeinfos(interp::AbstractInterpreter, ci::CodeInstance, argtypes::Vector{Any}) ->
+    get_codeinfos(interp::AbstractInterpreter, ci::CodeInstance, entry::SpecializedResult) ->
         Vector{Pair{CodeInstance, CodeInfo}}
 
 Const-specialized variant of [`get_codeinfos(interp, ci)`](@ref): the callee walk is
-seeded with the const-optimized source stored for `argtypes` (see
-[`typeinf!(cache, interp, mi, argtypes)`](@ref)), so callees reachable only from the
-const-optimized code are included as well.
+seeded with the const-optimized source of `entry`, a const-specialized entry of `ci`
+(see [`specialization`](@ref)), so callees reachable only from the const-optimized
+code are included as well. The root pair carries that source in place of `ci`'s
+generic one.
 
-Falls back to the generic source if no const entry exists for the given argtypes.
+Falls back to the generic source if `entry` has no source.
 """
-get_codeinfos(interp::CC.AbstractInterpreter, ci::Core.CodeInstance, argtypes::Vector{Any}) =
-    collect_codeinfos(interp, ci, get_source(ci, argtypes))
+function get_codeinfos(interp::CC.AbstractInterpreter, ci::Core.CodeInstance,
+                       entry::SpecializedResult{V}) where V
+    cached = find_results(V, ci)
+    belongs_to_ci = cached !== nothing && Base.@lock const_entries_lock begin
+        any(candidate -> candidate === entry, cached.const_entries)
+    end
+    belongs_to_ci || throw(ArgumentError("SpecializedResult does not belong to CodeInstance"))
+    return collect_codeinfos(interp, ci, get_source(entry))
+end
 
 end # @static if VERSION >= v"1.11"
 
