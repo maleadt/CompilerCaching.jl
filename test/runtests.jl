@@ -380,27 +380,33 @@ end
 
     # 2. Const-seeded inference (same cache, same interp, same CI)
     const_argtypes = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(1), Core.Compiler.Const(2)]
-    typeinf!(cache, interp, mi, const_argtypes)
+    entry = typeinf!(cache, interp, mi, const_argtypes)
+    @test entry isa SpecializedResult{ConstPropResults}
+    @test entry.argtypes == const_argtypes
+    @test entry.argtypes !== const_argtypes
+    @test entry.rettype === Core.Compiler.Const(3)
+    @test entry.rettype_const === 3
 
-    # Results accessible via argtypes
-    res = results(cache, ci, const_argtypes)
+    # The entry is found again through the CI, and carries results and source
+    @test specialization(cache, ci, const_argtypes) === entry
+    @test specialization(ConstPropResults, ci, const_argtypes) === entry
+    res = results(entry)
     @test res isa ConstPropResults
-
-    # Source accessible via argtypes
-    src = get_source(ci, const_argtypes)
+    src = get_source(entry)
     @test src isa Core.CodeInfo || src === nothing  # nothing if constabi
 
     # 3. Generic lookup still works
     @test results(cache, ci) isa ConstPropResults
     @test get_source(ci) isa Core.CodeInfo
 
-    # 4. Cache hit on second call (no error, no duplicate)
-    typeinf!(cache, interp, mi, const_argtypes)
+    # 4. Cache hit on second call: the existing entry, no duplicate
+    @test typeinf!(cache, interp, mi, const_argtypes) === entry
 
     # 5. Different constants → separate entry on same CI
     argtypes2 = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(10), Core.Compiler.Const(20)]
-    typeinf!(cache, interp, mi, argtypes2)
-    res2 = results(cache, ci, argtypes2)
+    entry2 = typeinf!(cache, interp, mi, argtypes2)
+    @test entry2 !== entry
+    res2 = results(entry2)
     @test res2 isa ConstPropResults
     @test res2 !== res  # different V instance
 
@@ -411,12 +417,12 @@ end
     @test hit2[2] === results(cache, ci)
 
     hit_const = lookup(cache, mi, const_argtypes)
-    @test hit_const isa Tuple{Core.CodeInstance, ConstPropResults}
+    @test hit_const isa Tuple{Core.CodeInstance, SpecializedResult{ConstPropResults}}
     @test hit_const[1] === ci
-    @test hit_const[2] === res
+    @test hit_const[2] === entry
 
     hit_const2 = lookup(cache, mi, argtypes2)
-    @test hit_const2[2] === res2  # different argtypes → different V instance
+    @test hit_const2[2] === entry2  # different argtypes → different entry
 
     # Miss on unknown argtypes (CI present, no matching const-prop entry)
     miss_argtypes = Any[Core.Compiler.Const(add_fn), Core.Compiler.Const(99), Core.Compiler.Const(99)]
@@ -433,6 +439,43 @@ end
     @test fresh_argtypes !== const_argtypes
     @test lookup(cache, mi, fresh_argtypes) === hit_const
 
+    # Another results type on the same CI must not shadow the specialization (#30).
+    mutable struct ConstPropOtherResults
+        x::Any
+        ConstPropOtherResults() = new(nothing)
+    end
+    scoped_argtypes = Any[Core.Compiler.Const(add_fn), Int, Core.Compiler.Const(2)]
+    scoped = typeinf!(cache, interp, mi, scoped_argtypes)
+    scoped_src = get_source(scoped)
+    @test scoped_src isa Core.CodeInfo
+    @test get_codeinfos(interp, ci, scoped)[1] == (ci => scoped_src)
+
+    other_mi = method_instance(sub_fn, (Int, Int); world)
+    typeinf!(interp, other_mi)
+    other_ci = get(cache, other_mi)
+    @test_throws ArgumentError get_codeinfos(interp, other_ci, scoped)
+
+    @test results(ConstPropOtherResults, ci) isa ConstPropOtherResults
+    @test specialization(cache, ci, scoped_argtypes) === scoped
+    @test specialization(ConstPropResults, ci, scoped_argtypes) === scoped
+    @test specialization(ConstPropOtherResults, ci, scoped_argtypes) === nothing
+    @test lookup(cache, mi, scoped_argtypes) === (ci, scoped)
+
+    other_cache = CacheView{ConstPropOtherResults}(cache.owner, cache.world)
+    other_entry = typeinf!(other_cache, ConstPropInterpreter(other_cache), mi, scoped_argtypes)
+    @test other_entry isa SpecializedResult{ConstPropOtherResults}
+    @test get_source(other_entry) isa Core.CodeInfo
+    @test specialization(other_cache, ci, scoped_argtypes) === other_entry
+    @test specialization(cache, ci, scoped_argtypes) === scoped
+    @test get_source(scoped) === scoped_src
+    @test results(other_entry) !== results(scoped)
+
+    # Reusing the caller's buffer must not change an existing entry's identity.
+    saved_argtypes = copy(scoped_argtypes)
+    scoped_argtypes[end] = Core.Compiler.Const(7)
+    @test specialization(cache, ci, saved_argtypes) === scoped
+    @test specialization(cache, ci, scoped_argtypes) === nothing
+
     # 6. Varargs method: invoke stmts list args individually, but on Julia 1.11
     #    matching_cache_argtypes packs them into nargs elements. When more args
     #    are passed than nargs, argtypes must be packed to match.
@@ -444,7 +487,12 @@ end
     # Provide unpacked argtypes (4 elements for nargs=3, as an invoke would)
     va_argtypes = Any[Core.Compiler.Const(va_fn), Core.Compiler.Const(1),
                       Core.Compiler.Const(2), Core.Compiler.Const(3)]
-    typeinf!(cache_va, interp_va, mi_va, va_argtypes)
+    va_entry = typeinf!(cache_va, interp_va, mi_va, va_argtypes)
+    va_ci = get(cache_va, mi_va)
+    @test va_entry.argtypes == va_argtypes
+    @test specialization(cache_va, va_ci, va_argtypes) === va_entry
+    @test lookup(cache_va, mi_va, va_argtypes) === (va_ci, va_entry)
+    @test typeinf!(cache_va, interp_va, mi_va, copy(va_argtypes)) === va_entry
 end
 
 @static if VERSION >= v"1.12-"
@@ -647,8 +695,8 @@ end
     # const-optimized root source
     const_argtypes = Any[Core.Compiler.Const(mod.kernel), Core.Compiler.Const(UInt32(42)),
                          Ptr{Int32}]
-    typeinf!(cache, interp, mi, const_argtypes)
-    const_src = get_source(root, const_argtypes)
+    centry = typeinf!(cache, interp, mi, const_argtypes)
+    const_src = get_source(centry)
     @test const_src isa Core.CodeInfo
     const_pc = find_invoke(const_src, op -> op isa Core.CodeInstance &&
         get_ci_mi(op).def in methods(mod.child))
@@ -658,7 +706,7 @@ end
     new_rhs = Expr(:invoke, overlay_mi, rhs.args[2:end]...)
     const_src.code[const_pc] = stmt === rhs ? new_rhs : Expr(:(=), stmt.args[1], new_rhs)
 
-    const_pairs = get_codeinfos(interp, root, const_argtypes)
+    const_pairs = get_codeinfos(interp, root, centry)
     @test any(p -> get_ci_mi(p.first) === overlay_mi, const_pairs)
     const_root_src = only(src for (ci, src) in const_pairs if ci === root)
     @test invoke_target(const_root_src, const_pc) isa Core.CodeInstance
@@ -1342,11 +1390,10 @@ end
             Threads.@spawn begin
                 interp = RaceInterpreter(cache)
                 at = race_argtypes(16t)
-                typeinf!(cache, interp, mi, at)
-                res = results(cache, ci, at)
-                res.tag = 16t
+                entry = typeinf!(cache, interp, mi, at)
+                results(entry).tag = 16t
                 hit = lookup(cache, mi, at)
-                @test hit !== nothing && hit[2] === res
+                @test hit !== nothing && hit[2] === entry
             end
         end
 
@@ -1354,8 +1401,9 @@ end
         @test length(entries) == ntasks
         @test allunique(e.argtypes[3].val for e in entries)
         for t in 1:ntasks
-            @test results(cache, ci, race_argtypes(16t)).tag == 16t
-            @test get_source(ci, race_argtypes(16t)) isa Union{Core.CodeInfo, Nothing}
+            entry = specialization(cache, ci, race_argtypes(16t))
+            @test results(entry).tag == 16t
+            @test get_source(entry) isa Union{Core.CodeInfo, Nothing}
         end
     end
 
@@ -1370,8 +1418,8 @@ end
         seen = Vector{Any}(undef, ntasks)
         @sync for t in 1:ntasks
             Threads.@spawn begin
-                typeinf!(cache, RaceInterpreter(cache), mi, race_argtypes(32))
-                seen[t] = results(cache, ci, race_argtypes(32))
+                # every task gets the published entry, whether or not it ran inference
+                seen[t] = typeinf!(cache, RaceInterpreter(cache), mi, race_argtypes(32))
             end
         end
         @test length(CompilerCaching.find_results(RaceResults, ci).const_entries) == 1

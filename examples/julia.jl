@@ -58,7 +58,7 @@ function getglobal_jljit()
 end
 
 """
-    julia_codegen(cache, interp, mi, ci; argtypes=nothing, dump_llvm=false,
+    julia_codegen(cache, interp, mi, ci; entry=nothing, dump_llvm=false,
                   dump_module=false) -> (ir_bytes, entry_name, llvm_ir)
 
 Generate LLVM IR and return serializable intermediate result.
@@ -69,14 +69,15 @@ When `dump_module` is true, returns the IR of the entire module.
 
 Uses `get_codeinfos(interp, ci)` to collect CodeInfos by walking :invoke statements
 (1.12+, re-inferring through `interp` where cache history left gaps) or the cache
-lookup callback (1.11). When `argtypes` is provided, uses the const-optimized source
-for the root CI via `get_codeinfos(interp, ci, argtypes)`.
+lookup callback (1.11). When a const-specialized `entry` of `ci` is provided (see
+`specialization`), uses its const-optimized source for the root CI via
+`get_codeinfos(interp, ci, entry)`.
 
 This function handles codegen but does not JIT compile - use `julia_jit` for that.
 """
 function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
                        mi::Core.MethodInstance, ci::Core.CodeInstance;
-                       argtypes::Union{Vector{Any},Nothing}=nothing,
+                       entry::Union{SpecializedResult,Nothing}=nothing,
                        dump_llvm::Bool=false,
                        dump_module::Bool=false)
     # Set up globals for the lookup callback
@@ -107,8 +108,8 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
         # Generate native code
         @static if VERSION >= v"1.12.0-DEV.1823"
             cis_vec = Any[]
-            codeinfos = argtypes !== nothing ? get_codeinfos(interp, ci, argtypes) :
-                                               get_codeinfos(interp, ci)
+            codeinfos = entry !== nothing ? get_codeinfos(interp, ci, entry) :
+                                            get_codeinfos(interp, ci)
             for (ci, src) in codeinfos
                 push!(cis_vec, ci)
                 push!(cis_vec, src)
@@ -131,8 +132,8 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
             # On 1.11, jl_create_native reads ci.inferred via the lookup callback.
             # Temporarily swap with the const-seeded source if available.
             saved_inferred = nothing
-            if argtypes !== nothing
-                const_src = get_source(ci, argtypes)
+            if entry !== nothing
+                const_src = get_source(entry)
                 if const_src !== nothing
                     saved_inferred = @atomic :monotonic ci.inferred
                     @atomic :monotonic ci.inferred = const_src

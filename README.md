@@ -109,6 +109,27 @@ There is no inference-time hook for results: `results(cache, ci)` attaches the
 results struct on first access, so any interpreter whose owner matches the cache
 view works out of the box.
 
+### Const-seeded inference
+
+When argument values are known at compile time, pass extended-lattice argument types
+(including the callable at position 1) to `typeinf!`:
+
+```julia
+argtypes = Any[Core.Const(f), Int, Core.Const(2)]
+entry = @something typeinf!(cache, interp, mi, argtypes)
+res = results(entry)
+src = get_source(entry)
+rettype = Core.Compiler.widenconst(entry.rettype)
+```
+
+The returned `SpecializedResult{V}` holds the specialized source, return value, and
+compilation results. It is stored on the generic `CodeInstance`, scoped by the cache
+view's results type `V`, so independent consumers cannot shadow each other's entries.
+`specialization(cache, ci, argtypes)` retrieves an existing entry;
+`lookup(cache, mi, argtypes)` returns `(ci, entry)`. Both return `nothing` on a miss.
+For native code generation, `get_codeinfos(interp, ci, entry)` collects the specialized
+root source and its callees. See [examples/native.jl](examples/native.jl).
+
 
 ## Cache sharding
 
