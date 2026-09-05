@@ -53,11 +53,14 @@ stored on the generic `CodeInstance`'s `CachedResult{V}` and found through
 [`specialization`](@ref) or [`lookup`](@ref).
 
 Fields:
-- `argtypes::Vector{Any}`: the (extended lattice) argument types inference was seeded with
+- `argtypes::Vector{Any}`: a copy of the caller's argument types, before vararg packing
 - `src`: the const-optimized `CodeInfo`, read through [`get_source`](@ref)
 - `rettype`: the extended-lattice return value (`InferenceResult.result`)
 - `rettype_const`: the value of `rettype` when it is a `Const`, otherwise `nothing`
 - `inner::V`: the results struct, read through [`results`](@ref)
+
+Treat `argtypes` as read-only: it is the cache key. Mutable compilation results belong
+in `results(entry)`.
 """
 struct SpecializedResult{V}
     argtypes::Vector{Any}
@@ -363,9 +366,7 @@ Single-pass cache lookup. The generic form combines `get(cache, mi)` and
 `argtypes` form combines `get(cache, mi)` and `specialization(cache, ci, argtypes)`:
 it returns `(ci, entry)`, or `nothing` when there is no CI or no matching entry.
 
-Hot-path callers (e.g. `cufunction`) typically need both `ci` and the results and walk
-the same lookup multiple times across phases. Use `lookup` once and pass the resulting
-pair down through phases instead of resolving them each time.
+Pass the returned pair through compilation phases to avoid repeated lookups.
 """
 @inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance) where {K,V}
     ci = get(cache, mi, nothing)
@@ -1004,6 +1005,9 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
     existing = const_entry(cached, argtypes)
     existing === nothing || return existing
 
+    # Keep the public cache key unpacked and independent of the caller's buffer.
+    cache_argtypes = copy(argtypes)
+
     # Compute overridden_by_const
     𝕃 = CC.typeinf_lattice(interp)
     @static if VERSION >= v"1.12-"
@@ -1047,10 +1051,9 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
     # Publish the entry unless another task got there first. Copy on write, since
     # readers may hold the old vector. This precedes the recursive walk so the
     # entry check above terminates cycles.
-    # Keep the lookup key independent of the caller's reusable argument buffer.
-    entry = SpecializedResult{V}(copy(argtypes), v, src, rettype, rettype_const)
+    entry = SpecializedResult{V}(cache_argtypes, v, src, rettype, rettype_const)
     Base.@lock const_entries_lock begin
-        published = find_const_entry(cached, argtypes)
+        published = find_const_entry(cached, cache_argtypes)
         if published === nothing
             cached.const_entries = push!(copy(cached.const_entries), entry)
         else

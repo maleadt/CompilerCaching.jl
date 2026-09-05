@@ -384,6 +384,8 @@ end
     @test entry isa SpecializedResult{ConstPropResults}
     @test entry.argtypes == const_argtypes
     @test entry.argtypes !== const_argtypes
+    @test entry.rettype === Core.Compiler.Const(3)
+    @test entry.rettype_const === 3
 
     # The entry is found again through the CI, and carries results and source
     @test specialization(cache, ci, const_argtypes) === entry
@@ -437,9 +439,7 @@ end
     @test fresh_argtypes !== const_argtypes
     @test lookup(cache, mi, fresh_argtypes) === hit_const
 
-    # 5b. Const-specialized source lookups are scoped by results type. Attaching a
-    #     second results type to the same CI prepends to the analysis chain and must
-    #     not shadow the entries stored under ConstPropResults (issue #30).
+    # Another results type on the same CI must not shadow the specialization (#30).
     mutable struct ConstPropOtherResults
         x::Any
         ConstPropOtherResults() = new(nothing)
@@ -461,6 +461,21 @@ end
     @test specialization(ConstPropOtherResults, ci, scoped_argtypes) === nothing
     @test lookup(cache, mi, scoped_argtypes) === (ci, scoped)
 
+    other_cache = CacheView{ConstPropOtherResults}(cache.owner, cache.world)
+    other_entry = typeinf!(other_cache, ConstPropInterpreter(other_cache), mi, scoped_argtypes)
+    @test other_entry isa SpecializedResult{ConstPropOtherResults}
+    @test get_source(other_entry) isa Core.CodeInfo
+    @test specialization(other_cache, ci, scoped_argtypes) === other_entry
+    @test specialization(cache, ci, scoped_argtypes) === scoped
+    @test get_source(scoped) === scoped_src
+    @test results(other_entry) !== results(scoped)
+
+    # Reusing the caller's buffer must not change an existing entry's identity.
+    saved_argtypes = copy(scoped_argtypes)
+    scoped_argtypes[end] = Core.Compiler.Const(7)
+    @test specialization(cache, ci, saved_argtypes) === scoped
+    @test specialization(cache, ci, scoped_argtypes) === nothing
+
     # 6. Varargs method: invoke stmts list args individually, but on Julia 1.11
     #    matching_cache_argtypes packs them into nargs elements. When more args
     #    are passed than nargs, argtypes must be packed to match.
@@ -472,7 +487,12 @@ end
     # Provide unpacked argtypes (4 elements for nargs=3, as an invoke would)
     va_argtypes = Any[Core.Compiler.Const(va_fn), Core.Compiler.Const(1),
                       Core.Compiler.Const(2), Core.Compiler.Const(3)]
-    typeinf!(cache_va, interp_va, mi_va, va_argtypes)
+    va_entry = typeinf!(cache_va, interp_va, mi_va, va_argtypes)
+    va_ci = get(cache_va, mi_va)
+    @test va_entry.argtypes == va_argtypes
+    @test specialization(cache_va, va_ci, va_argtypes) === va_entry
+    @test lookup(cache_va, mi_va, va_argtypes) === (va_ci, va_entry)
+    @test typeinf!(cache_va, interp_va, mi_va, copy(va_argtypes)) === va_entry
 end
 
 @static if VERSION >= v"1.12-"
