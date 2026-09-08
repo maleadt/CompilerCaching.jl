@@ -1085,47 +1085,52 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
     return entry
 end
 
-"""
-    create_ci(cache::CacheView{K,V}, mi; deps) -> CodeInstance
-
-Create a CodeInstance for `mi` with proper owner, typed results, and backedges.
-
-Creates a new CodeInstance with:
-- Owner set to `cache.owner`
-- A fresh `V()` instance in analysis_results
-- Backedges registered for all dependencies in `deps`. A dependency may be a
-  `MethodInstance`, meaning any compilation of that method, or a
-  `CodeInstance`, meaning that exact compilation on Julia 1.12 and newer.
-  Julia 1.11 has no per-CodeInstance forward-edge field, so there a
-  `CodeInstance` dependency degrades to its `MethodInstance`.
-- Per-CI binding edges, so that the resulting CodeInstance is invalidated
-  whenever any binding the source captures is replaced. The set of
-  `GlobalRef`s is taken from [`captured_globals(mi.def.source)`](@ref captured_globals).
-
-Used for foreign mode where inference doesn't run.
-
-The asymmetry between `deps` (explicit kwarg) and bindings (implicit trait)
-is intentional. Captured bindings are a property of the source IR — fixed at
-method definition and shared across every specialization — so it's natural
-to pin them to the source type once via [`captured_globals`](@ref) and have
-`create_ci` consult them. Dependencies, by contrast, are discovered per
-compilation: the same method may invoke different callees depending on the
-argument types of `mi`.
-"""
 const CompilationDependency = Union{Core.MethodInstance,Core.CodeInstance}
 @public CompilationDependency
 
-dependency_mi(mi::Core.MethodInstance) = mi
-dependency_mi(ci::Core.CodeInstance) = @static if VERSION >= v"1.12-"
-    CC.get_ci_mi(ci)
-else
-    ci.def::Core.MethodInstance
-end
+"""
+    create_ci(cache::CacheView{K,V}, mi; deps=[], edges=nothing) -> CodeInstance
 
+Create a CodeInstance for `mi` with `cache.owner`, fresh `V()` results, and
+backedges for automatic invalidation. Used for foreign IR where inference
+does not run.
+
+Pass dependencies either as `deps`, a vector of `CompilationDependency`
+(`MethodInstance` or `CodeInstance`), or as `edges::Core.SimpleVector` in Julia's
+inference edge encoding (`CodeInfo.edges` / `CodeInstance.edges`). The latter
+also supports method-table dependencies, `invoke` signatures, and `Core.Binding`
+entries. The caller must supply a valid edge list for the running Julia version.
+Passing nonempty `deps` together with `edges` throws an `ArgumentError`.
+
+On Julia 1.12 and newer, a `CodeInstance` dependency tracks that exact compilation;
+a `MethodInstance` dependency tracks any compilation of that method. Binding
+edges from [`captured_globals(mi.def.source)`](@ref captured_globals) are appended
+to either form. All binding edges are registered directly against the new
+CodeInstance, without scanning the source as Julia IR.
+
+On Julia 1.11, both forms only register MethodInstance-to-MethodInstance
+backedges: CodeInstances reduce to their MethodInstance, and signatures,
+method tables, and bindings are ignored. In particular, adding a method that
+matches a method-table edge does not invalidate the CodeInstance on 1.11.
+"""
 function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
-                   deps::AbstractVector=CompilationDependency[]) where {K,V}
+                   deps::AbstractVector=CompilationDependency[],
+                   edges::Union{Nothing,Core.SimpleVector}=nothing) where {K,V}
     owner = cache.owner
     world = cache.world
+
+    if edges !== nothing && !isempty(deps)
+        throw(ArgumentError("create_ci: pass either `deps` or a pre-encoded `edges` list, not both"))
+    end
+    # Julia's edge iterator interprets some non-dependency values as metadata.
+    # Reject them in `deps`, which only accepts method or code instances.
+    if edges === nothing
+        for dep in deps
+            dep isa CompilationDependency ||
+                throw(ArgumentError("create_ci: `deps` entries must be a MethodInstance or CodeInstance, got $(typeof(dep))"))
+        end
+    end
+    forward_edges = edges === nothing ? Core.svec(deps...) : edges
 
     @static if VERSION >= v"1.12-"
         binding_edges = Core.Binding[]
@@ -1135,11 +1140,11 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
                       e isa Core.Binding ? e : convert(Core.Binding, e::GlobalRef))
             end
         end
-        edges = isempty(deps) && isempty(binding_edges) ?
-            Core.svec() : Core.svec(deps..., binding_edges...)
+        ci_edges = isempty(binding_edges) ? forward_edges :
+            Core.svec(forward_edges..., binding_edges...)
     else
         # Julia 1.11 has no per-CI edges field
-        edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
+        ci_edges = forward_edges
     end
 
     # Create typed results instance via CachedResult{V}
@@ -1147,59 +1152,49 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
 
     @static if VERSION >= v"1.12-"
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), world, typemax(UInt), UInt32(0), ar, nothing, edges)
+            Int32(0), world, typemax(UInt), UInt32(0), ar, nothing, ci_edges)
     else
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
             Int32(0), world, typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
     end
 
     # Register backedges for automatic invalidation
-    if !isempty(deps)
-        store_backedges(mi, ci, deps)
-    end
-
     @static if VERSION >= v"1.12-"
-        # Register the CI as a direct edge of each captured binding. We
-        # deliberately bypass `jl_maybe_add_binding_backedge` (which would
-        # register the *Method* and route same-module invalidations through
-        # `invalidate_method_for_globalref!`); that path tries to
-        # `_uncompressed_ir(method)` and crashes on non-CodeInfo source.
-        # Going CI-direct means binding replacement invalidates the CI via
-        # the `isa(edge, CodeInstance)` branch in `invalidate_code_for_globalref!`.
-        for b in binding_edges
-            ccall(:jl_add_binding_backedge, Cvoid, (Any, Any), b, ci)
+        # Same-module bindings must bypass Julia's source-scanning path, which
+        # cannot recover supplied edges from foreign IR (or unrelated CodeInfo).
+        if any(edge -> edge isa Core.Binding, forward_edges)
+            method_edges = Core.svec(filter(edge -> !(edge isa Core.Binding),
+                                            collect(forward_edges))...)
+            CC.store_backedges(ci, method_edges)
+        else
+            CC.store_backedges(ci, forward_edges)
         end
+        for edge in ci_edges
+            edge isa Core.Binding || continue
+            ccall(:jl_add_binding_backedge, Cvoid, (Any, Any), edge, ci)
+        end
+    else
+        store_backedges(mi, forward_edges)
     end
 
     return ci
 end
 
-"""
-    store_backedges(mi::MethodInstance, ci::CodeInstance, deps)
-
-Register backedges so Julia automatically invalidates cached code when dependencies
-change. On Julia 1.12 and newer, the caller is the new `CodeInstance` and its
-forward edges preserve whether each dependency is an entire `MethodInstance` or
-one exact `CodeInstance`. On Julia 1.11, both kinds degrade to a
-`MethodInstance`-to-`MethodInstance` backedge.
-"""
-function store_backedges(mi::Core.MethodInstance, ci::Core.CodeInstance,
-                         deps::AbstractVector)
+@static if VERSION < v"1.12-"
+# Julia 1.11 can only track the method instances in the supplied edge list.
+function store_backedges(mi::Core.MethodInstance, edges::Core.SimpleVector)
     isa(mi.def, Method) || return  # don't add backedges to toplevel
 
-    for dep in deps
-        dep_mi = dependency_mi(dep)
-        @static if VERSION >= v"1.12-"
-            # Julia 1.12+: pass CodeInstance as caller
-            ccall(:jl_method_instance_add_backedge, Cvoid,
-                  (Any, Any, Any), dep_mi, nothing, ci)
-        else
-            # Julia 1.11: pass MethodInstance as caller
-            ccall(:jl_method_instance_add_backedge, Cvoid,
-                  (Any, Any, Any), dep_mi, nothing, mi)
+    for edge in edges
+        if edge isa Core.CodeInstance
+            edge = edge.def::Core.MethodInstance
         end
+        edge isa Core.MethodInstance || continue
+        ccall(:jl_method_instance_add_backedge, Cvoid,
+              (Any, Any, Any), edge, nothing, mi)
     end
     nothing
+end
 end
 
 """
