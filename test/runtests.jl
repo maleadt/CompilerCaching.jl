@@ -1052,7 +1052,7 @@ end
     # method. On Julia 1.12+ the two are distinguishable: invalidating one CI
     # of a child MI must leave callers wired to a *sibling* CI of the same MI
     # alone. On 1.11 there is no per-CI forward-edge field, so a CI dep
-    # degrades to its MI (see `dependency_mi`) and we only assert the degraded
+    # degrades to its MI (see `store_backedges`) and we only assert the degraded
     # behavior.
 
     @static if VERSION >= v"1.12-"
@@ -1178,9 +1178,9 @@ end
             @test any(edge -> edge === child_mi, parent_ci2.edges)
             @test any(edge -> edge === child_ci, parent_ci2.edges)
 
-            # A non-dependency element is rejected — late, from dependency_mi's
-            # dispatch, once backedge registration reaches it.
-            @test_throws MethodError create_ci(cache, parent_mi; deps=Any[1])
+            # A non-dependency element is rejected up front: Julia's edge
+            # iterator would otherwise skip an `Int` as query information.
+            @test_throws ArgumentError create_ci(cache, parent_mi; deps=Any[1])
         end
     else
         @testset "1.11 degrades CI dep to MI dep" begin
@@ -1216,6 +1216,125 @@ end
             add_method(method_table, degrade_child, (Int,), :new_child_ir)
             @test (@atomic parent_ci.max_world) != typemax(UInt)
         end
+    end
+end
+
+@testset "pre-encoded edges" begin
+    @static if VERSION >= v"1.12-"
+        @testset "method-table edge" begin
+            mod = @eval module $(gensym())
+                const edge_value = 1
+                edge_callee(x::Number) = x
+                edge_caller(x) = edge_callee(x)
+            end
+
+            world = Base.get_world_counter()
+            cache = CacheView{TestResults}(:EdgesTest, world)
+            mi = method_instance(mod.edge_caller, (Int,); world)
+
+            # Record the dispatch dependency without running inference.
+            sig = Tuple{typeof(mod.edge_callee), Int}
+            mt = ccall(:jl_method_table_for, Any, (Any,), sig)
+            @test mt isa Core.MethodTable
+            # Mix a binding with method edges to exercise both registration paths.
+            binding = convert(Core.Binding, GlobalRef(mod, :edge_value))
+            edges = Core.svec(sig, mt, binding)
+            ci = create_ci(cache, mi; edges)
+            @test ci.edges[1] === sig
+            @test ci.edges[2] === mt
+            cache[mi] = ci
+            @test get(cache, mi) === ci
+            @test (@atomic ci.max_world) == typemax(UInt)
+
+            # A new method matching `sig` invalidates the CI through the
+            # method-table backedge; nothing else refers to `edge_caller`.
+            @eval mod edge_callee(x::Int) = x + 1
+            @test (@atomic ci.max_world) != typemax(UInt)
+            world = Base.get_world_counter()
+            cache = CacheView{TestResults}(:EdgesTest, world)
+            mi = method_instance(mod.edge_caller, (Int,); world)
+            @test get(cache, mi, nothing) === nothing
+        end
+    end
+
+    @static if VERSION >= v"1.12-"
+        @testset "explicit binding edges ($foreign source)" for foreign in (false, true)
+            mod = @eval module $(gensym())
+                const value = 1
+                caller(x) = x
+            end
+            method_table = @eval @MethodTable $(gensym(:method_table))
+            if foreign
+                add_method(method_table, mod.caller, (Int,), :foreign_ir)
+            end
+            world = Base.get_world_counter()
+            cache = CacheView{TestResults}(:ExplicitBindingTest, world)
+            mi = foreign ? method_instance(mod.caller, (Int,); world, method_table) :
+                           method_instance(mod.caller, (Int,); world)
+            binding = convert(Core.Binding, GlobalRef(mod, :value))
+            ci = create_ci(cache, mi; edges=Core.svec(binding))
+            cache[mi] = ci
+            @test ci.edges[1] === binding
+            @test (@atomic ci.max_world) == typemax(UInt)
+
+            # The dependency exists only in `edges`, not in the source or trait.
+            @eval mod const value = 2
+            @test (@atomic ci.max_world) < typemax(UInt)
+            new_cache = CacheView{TestResults}(:ExplicitBindingTest, Base.get_world_counter())
+            @test get(new_cache, mi, nothing) === nothing
+        end
+    end
+
+    @testset "method edges ($kind)" for kind in (:mi, :ci, :invoke_mi, :invoke_ci)
+        method_table = @eval @MethodTable $(gensym(:method_table))
+        function edges_parent end
+        function edges_child end
+        add_method(method_table, edges_child, (Int,), :child_ir)
+        add_method(method_table, edges_parent, (Int,), :parent_ir)
+
+        world = Base.get_world_counter()
+        cache = CacheView{TestResults}(:EdgesTest, world)
+        child_mi = method_instance(edges_child, (Int,); world, method_table)
+        parent_mi = method_instance(edges_parent, (Int,); world, method_table)
+
+        # 1.11 invalidation walks `mi->cache`, so store both through the cache
+        # (see "1.11 degrades CI dep to MI dep").
+        child_ci = get!(cache, child_mi) do
+            create_ci(cache, child_mi)
+        end
+        child = kind in (:ci, :invoke_ci) ? child_ci : child_mi
+        edges = kind in (:invoke_mi, :invoke_ci) ?
+            Core.svec(Tuple{typeof(edges_child), Int}, child) : Core.svec(child)
+        parent_ci = get!(cache, parent_mi) do
+            create_ci(cache, parent_mi; edges)
+        end
+        @static if VERSION >= v"1.12-"
+            @test any(edge -> edge === child, parent_ci.edges)
+        end
+        @test (@atomic parent_ci.max_world) == typemax(UInt)
+
+        add_method(method_table, edges_child, (Int,), :new_child_ir)
+        @test (@atomic parent_ci.max_world) != typemax(UInt)
+    end
+
+    @testset "deps and edges are exclusive" begin
+        method_table = @eval @MethodTable $(gensym(:method_table))
+        function excl_parent end
+        function excl_child end
+        add_method(method_table, excl_child, (Int,), :child_ir)
+        add_method(method_table, excl_parent, (Int,), :parent_ir)
+
+        world = Base.get_world_counter()
+        cache = CacheView{TestResults}(:EdgesTest, world)
+        child_mi = method_instance(excl_child, (Int,); world, method_table)
+        parent_mi = method_instance(excl_parent, (Int,); world, method_table)
+        @test_throws ArgumentError create_ci(cache, parent_mi; deps=[child_mi],
+                                             edges=Core.svec(child_mi))
+        @test_throws ArgumentError create_ci(cache, parent_mi; deps=Any[1])
+        # An empty `deps` (the default) alongside `edges` is fine.
+        ci = create_ci(cache, parent_mi; deps=CompilerCaching.CompilationDependency[],
+                       edges=Core.svec(child_mi))
+        @test ci isa Core.CodeInstance
     end
 end
 
