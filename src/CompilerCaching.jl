@@ -1435,7 +1435,9 @@ function resolve_invoke_targets(interp::CC.AbstractInterpreter, src::Core.CodeIn
     for pc in eachindex(resolved.code)
         stmt = resolved.code[pc]
         rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
-        rhs isa Expr && (rhs.head === :invoke || rhs.head === :invoke_modify) || continue
+        # separate checks, so that inference narrows `rhs` to an `Expr`
+        rhs isa Expr || continue
+        rhs.head === :invoke || rhs.head === :invoke_modify || continue
 
         callee_mi = rhs.args[1]
         callee_mi isa Core.MethodInstance || continue
@@ -1454,10 +1456,10 @@ function resolve_invoke_targets(interp::CC.AbstractInterpreter, src::Core.CodeIn
         if resolved === src
             resolved = copy(src)
             stmt = resolved.code[pc]
-            rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+            rhs = (stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt)::Expr
         end
         new_rhs = Expr(rhs.head, callee_ci, rhs.args[2:end]...)
-        resolved.code[pc] = stmt === rhs ? new_rhs : Expr(:(=), stmt.args[1], new_rhs)
+        resolved.code[pc] = stmt === rhs ? new_rhs : Expr(:(=), (stmt::Expr).args[1], new_rhs)
     end
     return resolved
 end
