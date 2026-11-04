@@ -1272,7 +1272,8 @@ direct-call edges, making it suitable for closed-world code generation
   containing source; cached `CodeInfo` is never mutated. Only targets callable through
   a native ABI (concrete signature, fully-resolved sparams) are resolved; anything
   else (e.g. `@nospecialize`-widened compileable signatures) deliberately keeps its
-  runtime-dispatch fallback semantics.
+  runtime-dispatch fallback semantics. Interpreters that emit such statements on
+  purpose can opt out with [`resolve_dynamic_invokes`](@ref).
 - Referenced `CodeInstance`s that lack stored source (e.g. cached by an earlier
   session) are re-inferred.
 
@@ -1285,10 +1286,31 @@ only the root entry is returned.
 get_codeinfos(interp::CC.AbstractInterpreter, ci::Core.CodeInstance) =
     collect_codeinfos(interp, ci, nothing)
 
+@public resolve_dynamic_invokes
+
+"""
+    resolve_dynamic_invokes(interp::AbstractInterpreter) -> Bool
+
+Whether [`get_codeinfos`](@ref) turns `:invoke` statements that target a bare
+`MethodInstance` into direct calls to a `CodeInstance` inferred with `interp`.
+Defaults to `true`; overload it for an interpreter type to change that.
+
+Codegen lowers an `:invoke` of a `MethodInstance` to a call into the runtime
+(`jl_invoke`), which compiles and runs the callee with Julia's native compiler,
+not with `interp`. Resolving such statements keeps the callee in the compiled
+code, which is required when there is no runtime to call into (e.g. on GPUs).
+An interpreter that emits these statements on purpose, so that the callee
+runs natively, should return `false`: resolving them would compile the callee
+with `interp` instead. The statements are then left to the runtime, and the
+result of `get_codeinfos` remains closed under its direct-call edges.
+"""
+resolve_dynamic_invokes(::CC.AbstractInterpreter) = true
+
 function collect_codeinfos(interp::CC.AbstractInterpreter,
                            root::Core.CodeInstance, root_src::Union{Core.CodeInfo, Nothing})
     codeinfos = Pair{Core.CodeInstance, Core.CodeInfo}[]
     @static if VERSION >= v"1.12-"
+        resolve = resolve_dynamic_invokes(interp)
         visited = IdSet{Core.CodeInstance}()
         workqueue = Core.CodeInstance[root]
         while !isempty(workqueue)
@@ -1307,7 +1329,7 @@ function collect_codeinfos(interp::CC.AbstractInterpreter,
                 # codegen's runtime-dispatch fallback
                 src === nothing && continue
             end
-            src = resolve_invoke_targets(interp, src)
+            resolve && (src = resolve_invoke_targets(interp, src))
             push!(codeinfos, callee_ci => src)
 
             for stmt in src.code
