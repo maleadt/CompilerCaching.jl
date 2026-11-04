@@ -818,6 +818,15 @@ end
 
 function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
     mi = CC.get_ci_mi(ci)
+
+    # Source stored in a CI is shared with everything that uses its cache, so it has to
+    # come from that cache's own interpreter. Code inferred by `interp` can call CIs of
+    # other owners, e.g. native ones for code it lets run natively.
+    if ci.owner !== CC.cache_owner(interp)
+        ci.owner === nothing || return nothing
+        interp = CC.NativeInterpreter(CC.get_inference_world(interp))
+    end
+
     @static if isdefined(Core.Compiler, :find_cached_ci) &&
                isdefined(Core.Compiler, :codegen_cache) &&
                isdefined(Core.Compiler, :SOURCE_MODE_GET_SOURCE)
@@ -1323,7 +1332,11 @@ function collect_codeinfos(interp::CC.AbstractInterpreter,
             if src === nothing
                 # a referenced CI may lack stored source (e.g. it was cached by an
                 # earlier session whose sources were dropped); re-establish it
-                typeinf!(interp, CC.get_ci_mi(callee_ci))
+                if callee_ci.owner === CC.cache_owner(interp)
+                    typeinf!(interp, CC.get_ci_mi(callee_ci))
+                else
+                    infer_source!(interp, callee_ci)
+                end
                 src = get_source(callee_ci)
                 # if inference cannot provide source either, leave the call site to
                 # codegen's runtime-dispatch fallback
