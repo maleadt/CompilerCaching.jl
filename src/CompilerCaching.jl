@@ -1286,6 +1286,9 @@ direct-call edges, making it suitable for closed-world code generation
 - Referenced `CodeInstance`s that lack stored source (e.g. cached by an earlier
   session) are re-inferred.
 
+Callees owned by another cache (e.g. native code that `interp` lets run natively) are
+collected too, unless `interp` opts out with [`collect_foreign_callees`](@ref).
+
 `interp` must match the cache owner and world that produced `ci` (typically the
 interpreter previously passed to [`typeinf!`](@ref)).
 
@@ -1315,17 +1318,37 @@ result of `get_codeinfos` remains closed under its direct-call edges.
 """
 resolve_dynamic_invokes(::CC.AbstractInterpreter) = true
 
+@public collect_foreign_callees
+
+"""
+    collect_foreign_callees(interp::AbstractInterpreter) -> Bool
+
+Whether [`get_codeinfos`](@ref) includes callees whose `CodeInstance` is owned by another
+cache than that of `interp`, such as native code that `interp` lets run natively. Defaults
+to `true`; overload it for an interpreter type to change that.
+
+Including them makes the result closed under its direct-call edges, which is required
+when there is no runtime to call into (e.g. on GPUs), but it compiles the entire native
+call tree of such a callee again. An interpreter whose code runs on the host can return
+`false`: calls to these callees are then left to codegen, which calls the existing native
+code through the runtime (`jl_invoke`).
+"""
+collect_foreign_callees(::CC.AbstractInterpreter) = true
+
 function collect_codeinfos(interp::CC.AbstractInterpreter,
                            root::Core.CodeInstance, root_src::Union{Core.CodeInfo, Nothing})
     codeinfos = Pair{Core.CodeInstance, Core.CodeInfo}[]
     @static if VERSION >= v"1.12-"
         resolve = resolve_dynamic_invokes(interp)
+        foreign = collect_foreign_callees(interp)
         visited = IdSet{Core.CodeInstance}()
         workqueue = Core.CodeInstance[root]
         while !isempty(workqueue)
             callee_ci = pop!(workqueue)
             callee_ci in visited && continue
             push!(visited, callee_ci)
+            foreign || callee_ci === root ||
+                callee_ci.owner === CC.cache_owner(interp) || continue
 
             src = callee_ci === root && root_src !== nothing ? root_src :
                                                                get_source(callee_ci)
