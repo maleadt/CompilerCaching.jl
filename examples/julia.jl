@@ -5,6 +5,7 @@ using CompilerCaching
 using CompilerCaching: get_source, get_codeinfos
 using LLVM
 using LLVM.Interop
+using LLVM.IR, LLVM.Passes, LLVM.ORC
 
 const CC = Core.Compiler
 using Base: get_world_counter, CodegenParams
@@ -42,19 +43,19 @@ function _codegen_lookup_cb(mi, min_world, max_world)
     return ci
 end
 
-# Global JuliaOJIT instance
-const global_jljit = Ref{Any}(nothing)
-function getglobal_jljit()
-    if global_jljit[] === nothing
+# Julia's JIT, and the JITDylib to add the generated code to
+const global_jit = Ref{Any}(nothing)
+function getglobal_jit()
+    if global_jit[] === nothing
         jljit = JuliaOJIT()
-        # Add process symbol generator so Julia runtime symbols can be resolved
-        jd = JITDylib(jljit)
-        prefix = LLVM.get_prefix(jljit)
-        dg = LLVM.CreateDynamicLibrarySearchGeneratorForProcess(prefix)
-        add!(jd, dg)
-        global_jljit[] = jljit
+        jd = if LLVM.supports_jit_dylib_creation(jljit)
+            JITDylib(jljit, "CompilerCaching")
+        else
+            jljit.external_dylib
+        end
+        global_jit[] = (jljit, jd)
     end
-    return global_jljit[]
+    return global_jit[]
 end
 
 """
@@ -92,7 +93,7 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
     end
 
     # Get JuliaOJIT for target configuration
-    jljit = getglobal_jljit()
+    jljit, _ = getglobal_jit()
 
     # Generate LLVM IR
     with_llvm_context() do ctx
@@ -101,8 +102,8 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
 
         # Configure module for native target using JuliaOJIT's settings
         ts_mod() do mod
-            triple!(mod, triple(jljit))
-            datalayout!(mod, datalayout(jljit))
+            mod.triple = jljit.triple
+            mod.datalayout = jljit.datalayout_string
         end
 
         # Generate native code
@@ -180,14 +181,14 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
                     (specfunc_idx[] - 1)::UInt32
                 )::LLVM.API.LLVMValueRef
             @assert func_ref != C_NULL
-            func_name = name(LLVM.Function(func_ref))
+            func_name = LLVM.Function(func_ref).name
         elseif func_idx[] >= 1
             func_ref = @ccall jl_get_llvm_function(
                     native_code::Ptr{Cvoid},
                     (func_idx[] - 1)::UInt32
                 )::LLVM.API.LLVMValueRef
             @assert func_ref != C_NULL
-            func_name = name(LLVM.Function(func_ref))
+            func_name = LLVM.Function(func_ref).name
         end
 
         @assert func_name !== nothing "No compiled function found"
@@ -199,7 +200,7 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
             end
         elseif dump_llvm
             llvm_ts_mod() do mod
-                string(functions(mod)[func_name])
+                string(mod.functions[func_name])
             end
         else
             ""
@@ -225,8 +226,7 @@ The `cache` and `mi` arguments are ignored but included for use as an `emit_exec
 function julia_jit(cache, mi, ir_data)
     ir_bytes, entry_name = ir_data
 
-    jljit = getglobal_jljit()
-    jd = JITDylib(jljit)
+    jljit, jd = getglobal_jit()
 
     with_llvm_context() do ctx
         # Parse bitcode back into a module, then wrap in ThreadSafeModule
@@ -242,7 +242,7 @@ function julia_jit(cache, mi, ir_data)
         add!(jljit, jd, ts_mod)
 
         # Look up the compiled function
-        addr = LLVM.lookup(jljit, entry_name)
+        addr = LLVM.lookup(jljit, jd, entry_name)
         return pointer(addr)
     end
 end

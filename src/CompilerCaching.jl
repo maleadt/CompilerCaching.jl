@@ -818,6 +818,15 @@ end
 
 function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
     mi = CC.get_ci_mi(ci)
+
+    # Source stored in a CI is shared with everything that uses its cache, so it has to
+    # come from that cache's own interpreter. Code inferred by `interp` can call CIs of
+    # other owners, e.g. native ones for code it lets run natively.
+    if ci.owner !== CC.cache_owner(interp)
+        ci.owner === nothing || return nothing
+        interp = CC.NativeInterpreter(CC.get_inference_world(interp))
+    end
+
     @static if isdefined(Core.Compiler, :find_cached_ci) &&
                isdefined(Core.Compiler, :codegen_cache) &&
                isdefined(Core.Compiler, :SOURCE_MODE_GET_SOURCE)
@@ -1272,7 +1281,8 @@ direct-call edges, making it suitable for closed-world code generation
   containing source; cached `CodeInfo` is never mutated. Only targets callable through
   a native ABI (concrete signature, fully-resolved sparams) are resolved; anything
   else (e.g. `@nospecialize`-widened compileable signatures) deliberately keeps its
-  runtime-dispatch fallback semantics.
+  runtime-dispatch fallback semantics. Interpreters that emit such statements on
+  purpose can opt out with [`resolve_dynamic_invokes`](@ref).
 - Referenced `CodeInstance`s that lack stored source (e.g. cached by an earlier
   session) are re-inferred.
 
@@ -1285,10 +1295,31 @@ only the root entry is returned.
 get_codeinfos(interp::CC.AbstractInterpreter, ci::Core.CodeInstance) =
     collect_codeinfos(interp, ci, nothing)
 
+@public resolve_dynamic_invokes
+
+"""
+    resolve_dynamic_invokes(interp::AbstractInterpreter) -> Bool
+
+Whether [`get_codeinfos`](@ref) turns `:invoke` statements that target a bare
+`MethodInstance` into direct calls to a `CodeInstance` inferred with `interp`.
+Defaults to `true`; overload it for an interpreter type to change that.
+
+Codegen lowers an `:invoke` of a `MethodInstance` to a call into the runtime
+(`jl_invoke`), which compiles and runs the callee with Julia's native compiler,
+not with `interp`. Resolving such statements keeps the callee in the compiled
+code, which is required when there is no runtime to call into (e.g. on GPUs).
+An interpreter that emits these statements on purpose, so that the callee
+runs natively, should return `false`: resolving them would compile the callee
+with `interp` instead. The statements are then left to the runtime, and the
+result of `get_codeinfos` remains closed under its direct-call edges.
+"""
+resolve_dynamic_invokes(::CC.AbstractInterpreter) = true
+
 function collect_codeinfos(interp::CC.AbstractInterpreter,
                            root::Core.CodeInstance, root_src::Union{Core.CodeInfo, Nothing})
     codeinfos = Pair{Core.CodeInstance, Core.CodeInfo}[]
     @static if VERSION >= v"1.12-"
+        resolve = resolve_dynamic_invokes(interp)
         visited = IdSet{Core.CodeInstance}()
         workqueue = Core.CodeInstance[root]
         while !isempty(workqueue)
@@ -1301,13 +1332,17 @@ function collect_codeinfos(interp::CC.AbstractInterpreter,
             if src === nothing
                 # a referenced CI may lack stored source (e.g. it was cached by an
                 # earlier session whose sources were dropped); re-establish it
-                typeinf!(interp, CC.get_ci_mi(callee_ci))
+                if callee_ci.owner === CC.cache_owner(interp)
+                    typeinf!(interp, CC.get_ci_mi(callee_ci))
+                else
+                    infer_source!(interp, callee_ci)
+                end
                 src = get_source(callee_ci)
                 # if inference cannot provide source either, leave the call site to
                 # codegen's runtime-dispatch fallback
                 src === nothing && continue
             end
-            src = resolve_invoke_targets(interp, src)
+            resolve && (src = resolve_invoke_targets(interp, src))
             push!(codeinfos, callee_ci => src)
 
             for stmt in src.code

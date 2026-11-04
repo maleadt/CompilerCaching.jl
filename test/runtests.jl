@@ -599,6 +599,19 @@ end
     @test marker in Core.Compiler.get_inference_cache(interp)
 end
 
+struct NativeDispatchInterpreter <: Core.Compiler.AbstractInterpreter
+    world::UInt
+    cache::CacheView
+    inf_cache::InfCacheT
+end
+Core.Compiler.cache_owner(interp::NativeDispatchInterpreter) = interp.cache.owner
+Core.Compiler.InferenceParams(::NativeDispatchInterpreter) = Core.Compiler.InferenceParams()
+Core.Compiler.OptimizationParams(::NativeDispatchInterpreter) =
+    Core.Compiler.OptimizationParams()
+Core.Compiler.get_inference_cache(interp::NativeDispatchInterpreter) = interp.inf_cache
+Core.Compiler.get_inference_world(interp::NativeDispatchInterpreter) = interp.world
+CompilerCaching.resolve_dynamic_invokes(::NativeDispatchInterpreter) = false
+
 @testset "unresolved invoke targets" begin
     # Inlining's `compileable_specialization` leaves an `:invoke` target as a bare
     # MethodInstance when the compileable specialization is not cached at optimization
@@ -714,6 +727,102 @@ end
     # the stored const-prop entry itself is left unmutated
     @test const_root_src !== const_src
     @test invoke_target(const_src, const_pc) === overlay_mi
+
+    # an interpreter that emits such statements to have the callee run natively opts
+    # out: the operand is left to runtime dispatch, and the callee is not inferred
+    native_cache = CacheView{TestResults}(:NativeDispatchTest, world)
+    native_interp = NativeDispatchInterpreter(world, native_cache, InfCacheT())
+    @test !CompilerCaching.resolve_dynamic_invokes(native_interp)
+    @test CompilerCaching.resolve_dynamic_invokes(interp)
+    native_root = typeinf!(native_interp, mi)
+    native_doctored = copy(get_source(native_root))
+    stmt = native_doctored.code[child_pc]
+    rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+    new_rhs = Expr(:invoke, overlay_mi, rhs.args[2:end]...)
+    native_doctored.code[child_pc] =
+        stmt === rhs ? new_rhs : Expr(:(=), stmt.args[1], new_rhs)
+    @atomic native_root.inferred = native_doctored
+
+    native_pairs = get_codeinfos(native_interp, native_root)
+    @test only(src for (ci, src) in native_pairs if ci === native_root) ===
+          native_doctored
+    @test !any(p -> get_ci_mi(p.first) === overlay_mi, native_pairs)
+    @test get(native_cache, overlay_mi, nothing) === nothing
+end
+
+struct OverlayTestInterpreter <: Core.Compiler.AbstractInterpreter
+    world::UInt
+    cache::CacheView
+    inf_cache::InfCacheT
+    method_table::Core.MethodTable
+end
+Core.Compiler.cache_owner(interp::OverlayTestInterpreter) = interp.cache.owner
+Core.Compiler.InferenceParams(::OverlayTestInterpreter) = Core.Compiler.InferenceParams()
+Core.Compiler.OptimizationParams(::OverlayTestInterpreter) =
+    Core.Compiler.OptimizationParams()
+Core.Compiler.get_inference_cache(interp::OverlayTestInterpreter) = interp.inf_cache
+Core.Compiler.get_inference_world(interp::OverlayTestInterpreter) = interp.world
+Core.Compiler.method_table(interp::OverlayTestInterpreter) =
+    Core.Compiler.OverlayMethodTable(interp.world, interp.method_table)
+
+@testset "callees owned by other caches" begin
+    # Code inferred by one interpreter can call CIs owned by another cache, e.g. native
+    # ones for code it lets run natively. Filling in their missing source must not use
+    # the calling interpreter, whose results would then be shared with every user of
+    # that cache (EnzymeAD/Reactant.jl#3616).
+    mod = @eval module $(gensym())
+        using Base.Experimental: @MethodTable, @overlay
+        @MethodTable method_table
+        @inline inner(x::Int) = x + 1
+        @overlay method_table @inline inner(x::Int) = x * 3
+        @noinline leaf(x::Int) = inner(x)
+        caller(x::Int) = leaf(x)
+    end
+    CC = Core.Compiler
+    has_call(src, name) = occursin(name, sprint(show, src))
+    function retarget!(src, target)
+        pc = findfirst(src.code) do stmt
+            rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+            rhs isa Expr && rhs.head === :invoke
+        end
+        stmt = src.code[pc]
+        rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+        new_rhs = Expr(:invoke, target, rhs.args[2:end]...)
+        src.code[pc] = stmt === rhs ? new_rhs : Expr(:(=), stmt.args[1], new_rhs)
+        return src
+    end
+
+    world = Base.get_world_counter()
+    leaf_mi = method_instance(mod.leaf, (Int,); world)
+    caller_mi = method_instance(mod.caller, (Int,); world)
+    function overlay_root(owner)
+        cache = CacheView{TestResults}(owner, world)
+        interp = OverlayTestInterpreter(world, cache, InfCacheT(), mod.method_table)
+        return interp, typeinf!(interp, caller_mi)
+    end
+
+    # A native CI without source gets native code, not the overlay.
+    native_ci = CC.typeinf_ext(CC.NativeInterpreter(world), leaf_mi,
+                               CC.SOURCE_MODE_NOT_REQUIRED)
+    @atomic native_ci.inferred = nothing
+    interp, root = overlay_root(:ForeignCalleeTest)
+    @atomic root.inferred = retarget!(copy(get_source(root)), native_ci)
+    @test typeinf!(interp, caller_mi) === root
+    native_src = get_source(native_ci)
+    @test native_src isa Core.CodeInfo
+    @test has_call(native_src, "add_int") && !has_call(native_src, "mul_int")
+    @test any(p -> p.first === native_ci, get_codeinfos(interp, root))
+
+    # A CI of another non-native cache is left alone.
+    other_cache = CacheView{TestResults}(:OtherOwnerTest, world)
+    other_ci = typeinf!(TestInterpreter(world, other_cache, InfCacheT()), leaf_mi)
+    @atomic other_ci.inferred = nothing
+    interp, root = overlay_root(:ForeignCalleeTest2)
+    @atomic root.inferred = retarget!(copy(get_source(root)), other_ci)
+    @test typeinf!(interp, caller_mi) === root
+    @test other_ci.inferred === nothing
+    @test !any(p -> p.first === other_ci, get_codeinfos(interp, root))
+    @test other_ci.inferred === nothing
 end
 
 @testset "exact specializations" begin

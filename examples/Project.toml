@@ -4,3 +4,6 @@ CompilerCaching = "9db33cc3-5358-4881-8759-fa4194144afd"
 
 [sources]
 CompilerCaching = {path = ".."}
+
+[compat]
+LLVM = "10"
