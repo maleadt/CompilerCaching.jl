@@ -765,6 +765,18 @@ Core.Compiler.get_inference_world(interp::OverlayTestInterpreter) = interp.world
 Core.Compiler.method_table(interp::OverlayTestInterpreter) =
     Core.Compiler.OverlayMethodTable(interp.world, interp.method_table)
 
+struct HostTestInterpreter <: Core.Compiler.AbstractInterpreter
+    world::UInt
+    cache::CacheView
+    inf_cache::InfCacheT
+end
+Core.Compiler.cache_owner(interp::HostTestInterpreter) = interp.cache.owner
+Core.Compiler.InferenceParams(::HostTestInterpreter) = Core.Compiler.InferenceParams()
+Core.Compiler.OptimizationParams(::HostTestInterpreter) = Core.Compiler.OptimizationParams()
+Core.Compiler.get_inference_cache(interp::HostTestInterpreter) = interp.inf_cache
+Core.Compiler.get_inference_world(interp::HostTestInterpreter) = interp.world
+CompilerCaching.collect_foreign_callees(::HostTestInterpreter) = false
+
 @testset "callees owned by other caches" begin
     # Code inferred by one interpreter can call CIs owned by another cache, e.g. native
     # ones for code it lets run natively. Filling in their missing source must not use
@@ -823,6 +835,22 @@ Core.Compiler.method_table(interp::OverlayTestInterpreter) =
     @test other_ci.inferred === nothing
     @test !any(p -> p.first === other_ci, get_codeinfos(interp, root))
     @test other_ci.inferred === nothing
+
+    # An interpreter that opts out leaves native callees, and what they call, to the
+    # runtime, but still collects its own callees.
+    @test CompilerCaching.collect_foreign_callees(interp)
+    native_ci = CC.typeinf_ext(CC.NativeInterpreter(world), leaf_mi,
+                               CC.SOURCE_MODE_NOT_REQUIRED)
+    host_cache = CacheView{TestResults}(:HostCalleeTest, world)
+    host_interp = HostTestInterpreter(world, host_cache, InfCacheT())
+    @test !CompilerCaching.collect_foreign_callees(host_interp)
+    host_root = typeinf!(host_interp, caller_mi)
+    own_pairs = get_codeinfos(host_interp, host_root)
+    @test any(p -> CC.get_ci_mi(p.first) === leaf_mi &&
+                   p.first.owner === host_cache.owner, own_pairs)
+    @atomic host_root.inferred = retarget!(copy(get_source(host_root)), native_ci)
+    host_pairs = get_codeinfos(host_interp, host_root)
+    @test only(host_pairs).first === host_root
 end
 
 @testset "exact specializations" begin
