@@ -775,9 +775,8 @@ function release_inference_reservation(reservation::InferenceReservation)
     return
 end
 
-function with_inference_reservation(f, interp::CC.AbstractInterpreter,
-                                    mi::Core.MethodInstance)
-    reservation = acquire_inference_reservation(CC.cache_owner(interp), mi)
+function with_inference_reservation(f, @nospecialize(owner), mi::Core.MethodInstance)
+    reservation = acquire_inference_reservation(owner, mi)
     locked = false
     try
         lock(reservation.lock)
@@ -893,7 +892,7 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
         # `mi` is inferred exactly as requested; callers wanting a compileable
         # specialization should normalize before using it as a cache key.
-        ci = with_inference_reservation(interp, mi) do
+        ci = with_inference_reservation(CC.cache_owner(interp), mi) do
             CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
         end
         ci === nothing && return nothing
@@ -905,7 +904,48 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
         cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
         ci = @something get(cache, mi, nothing) ci
 
-        # Eagerly compile all callees and store source
+        compile_callees!(interp, ci)
+        return ci
+    elseif VERSION >= v"1.12.0-DEV.15"
+        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
+        inferred_ci = with_inference_reservation(CC.cache_owner(interp), mi) do
+            CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
+        end
+        @assert inferred_ci !== nothing "Inference of $mi failed"
+
+        # inference should have populated the cache
+        ci = get(cache, mi, nothing)
+        ci === nothing && return nothing
+
+        # if ci is rettype_const, the inference result won't have been cached
+        # (because it is normally not supposed to be used ever again).
+        # to avoid the need to re-infer, set that field here.
+        if ci.inferred === nothing
+            cache[mi] = inferred_ci
+        end
+        return ci
+    else
+        # Julia 1.11: typeinf_ext_toplevel returns CodeInfo, not CI
+        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
+        src = with_inference_reservation(CC.cache_owner(interp), mi) do
+            CC.typeinf_ext_toplevel(interp, mi)
+        end
+        @assert src !== nothing "Inference of $mi failed"
+
+        # inference should have populated the cache
+        ci = get(cache, mi, nothing)
+        ci === nothing && return nothing
+
+        # if ci is rettype_const, the inference result won't have been cached.
+        # to avoid the need to re-infer, set that field here.
+        @atomicreplace ci.inferred nothing => src
+        return ci
+    end
+end
+
+# Make sure `ci` and every callee reachable through its `:invoke` edges has source.
+function compile_callees!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
+    @static if VERSION >= v"1.12.0-DEV.1434"
         has_compilequeue = VERSION >= v"1.13.0-DEV.499" || v"1.12-beta3" <= VERSION < v"1.13-"
         if has_compilequeue
             workqueue = CC.CompilationQueue(; interp)
@@ -950,42 +990,8 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
                 end
             end
         end
-        return ci
-    elseif VERSION >= v"1.12.0-DEV.15"
-        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
-        inferred_ci = with_inference_reservation(interp, mi) do
-            CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
-        end
-        @assert inferred_ci !== nothing "Inference of $mi failed"
-
-        # inference should have populated the cache
-        ci = get(cache, mi, nothing)
-        ci === nothing && return nothing
-
-        # if ci is rettype_const, the inference result won't have been cached
-        # (because it is normally not supposed to be used ever again).
-        # to avoid the need to re-infer, set that field here.
-        if ci.inferred === nothing
-            cache[mi] = inferred_ci
-        end
-        return ci
-    else
-        # Julia 1.11: typeinf_ext_toplevel returns CodeInfo, not CI
-        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
-        src = with_inference_reservation(interp, mi) do
-            CC.typeinf_ext_toplevel(interp, mi)
-        end
-        @assert src !== nothing "Inference of $mi failed"
-
-        # inference should have populated the cache
-        ci = get(cache, mi, nothing)
-        ci === nothing && return nothing
-
-        # if ci is rettype_const, the inference result won't have been cached.
-        # to avoid the need to re-infer, set that field here.
-        @atomicreplace ci.inferred nothing => src
-        return ci
     end
+    return
 end
 
 """
