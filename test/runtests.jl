@@ -813,17 +813,22 @@ CompilerCaching.collect_foreign_callees(::HostTestInterpreter) = false
         return interp, typeinf!(interp, caller_mi)
     end
 
-    # A native CI without source gets native code, not the overlay.
-    native_ci = CC.typeinf_ext(CC.NativeInterpreter(world), leaf_mi,
-                               CC.SOURCE_MODE_NOT_REQUIRED)
-    @atomic native_ci.inferred = nothing
-    interp, root = overlay_root(:ForeignCalleeTest)
-    @atomic root.inferred = retarget!(copy(get_source(root)), native_ci)
-    @test typeinf!(interp, caller_mi) === root
-    native_src = get_source(native_ci)
-    @test native_src isa Core.CodeInfo
-    @test has_call(native_src, "add_int") && !has_call(native_src, "mul_int")
-    @test any(p -> p.first === native_ci, get_codeinfos(interp, root))
+    # A native CI without source gets native code, not the overlay. Its source may be
+    # missing altogether, or a package image may have discarded it and only kept the
+    # inlining cost (Julia 1.13+).
+    for (owner, discarded) in ((:ForeignCalleeTest, nothing),
+                               (:ForeignCalleeTestCost, 0xff))
+        native_ci = CC.typeinf_ext(CC.NativeInterpreter(world), leaf_mi,
+                                   CC.SOURCE_MODE_NOT_REQUIRED)
+        @atomic native_ci.inferred = discarded
+        interp, root = overlay_root(owner)
+        @atomic root.inferred = retarget!(copy(get_source(root)), native_ci)
+        @test typeinf!(interp, caller_mi) === root
+        native_src = get_source(native_ci)
+        @test native_src isa Core.CodeInfo
+        @test has_call(native_src, "add_int") && !has_call(native_src, "mul_int")
+        @test any(p -> p.first === native_ci, get_codeinfos(interp, root))
+    end
 
     # A CI of another non-native cache is left alone.
     other_cache = CacheView{TestResults}(:OtherOwnerTest, world)

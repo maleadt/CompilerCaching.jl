@@ -841,7 +841,7 @@ function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
             if source_ci isa Core.CodeInstance && source_ci.rettype === ci.rettype
                 src = get(codegen, source_ci, nothing)
                 if src isa Core.CodeInfo
-                    @atomicreplace ci.inferred nothing => src
+                    store_source!(ci, src)
                     return src
                 end
             end
@@ -856,8 +856,22 @@ function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
     src = with_fresh_inference_cache(interp) do
         CC.typeinf_code(interp, mi, true)
     end
-    src isa Core.CodeInfo && @atomicreplace ci.inferred nothing => src
+    src isa Core.CodeInfo && store_source!(ci, src)
     return src
+end
+
+# Without source, `inferred` holds `nothing` or, for a CI loaded from a package image on
+# Julia 1.13+, the `UInt8` inlining cost that the serializer keeps after discarding it.
+has_source(@nospecialize(inferred)) = inferred isa Core.CodeInfo || inferred isa String
+
+# Store `src` on `ci`, unless another task already stored source there.
+function store_source!(ci::Core.CodeInstance, src::Core.CodeInfo)
+    old = @atomic :monotonic ci.inferred
+    while !has_source(old)
+        old, success = @atomicreplace ci.inferred old => src
+        success && break
+    end
+    return
 end
 
 """
@@ -1225,7 +1239,7 @@ function get_source(ci::Core.CodeInstance)
     end
 
     src = @atomic :monotonic ci.inferred
-    if src === nothing
+    if !has_source(src)
         # For const-return functions, generate synthetic CodeInfo
         if CC.use_const_api(ci)
             @static if VERSION >= v"1.13.0-DEV.1121"
