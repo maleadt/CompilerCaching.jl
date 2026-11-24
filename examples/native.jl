@@ -102,19 +102,13 @@ function compile!(cache::CacheView, mi::Core.MethodInstance)
 end
 
 function compile!(cache::CacheView, mi::Core.MethodInstance, argtypes::Vector{Any})
+    # The const-seeded CodeInstance, running const-seeded inference if needed
     interp = CustomInterpreter(cache)
-    ci = get(cache, mi, nothing)
-    if ci === nothing
-        ci = CompilerCaching.typeinf!(interp, mi)
-    end
-
-    # Get the const-specialized entry, running const-seeded inference if needed
-    entry = @something CompilerCaching.specialization(cache, ci, argtypes) begin
-        CompilerCaching.typeinf!(cache, interp, mi, argtypes)
-    end
+    ci = @something(get(seeded(cache, argtypes), mi, nothing),
+                    CompilerCaching.typeinf!(interp, mi, argtypes))
 
     # codegen + JIT using const-optimized source
-    code = julia_codegen(cache, interp, mi, ci; entry)
+    code = julia_codegen(cache, interp, mi, ci)
     return julia_jit(cache, mi, code)
 end
 
@@ -230,7 +224,7 @@ let
     # Ensure inference is done
     interp = CustomInterpreter(cache)
     ci = CompilerCaching.typeinf!(interp, mi)
-    entry = CompilerCaching.typeinf!(cache, interp, mi, argtypes)
+    seeded_ci = CompilerCaching.typeinf!(interp, mi, argtypes)
 
     # Generic codegen
     (_, _, generic_ir) = julia_codegen(cache, interp, mi, ci; dump_llvm=true)
@@ -240,7 +234,7 @@ let
     @assert contains(generic_ir, "sub i64") "Generic IR should have the sub branch"
 
     # Const-seeded codegen (n=3 is a known constant)
-    (_, _, const_ir) = julia_codegen(cache, interp, mi, ci; entry, dump_llvm=true)
+    (_, _, const_ir) = julia_codegen(cache, interp, mi, seeded_ci; dump_llvm=true)
     println("\n=== Const-seeded LLVM IR (n=3) ===")
     println(const_ir)
     @assert !contains(const_ir, "icmp") "Const-seeded IR should eliminate the comparison"

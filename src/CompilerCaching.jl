@@ -43,130 +43,17 @@ include("utils.jl")
 # CacheView structure
 #==============================================================================#
 
-export CacheView, results, lookup, specialization, SpecializedResult
-
-"""
-    SpecializedResult{V}
-
-A cached result of const-seeded inference for specific argument types. Entries are
-stored on the generic `CodeInstance`'s `CachedResult{V}` and found through
-[`specialization`](@ref) or [`lookup`](@ref).
-
-Fields:
-- `argtypes::Vector{Any}`: a copy of the caller's argument types, before vararg packing
-- `src`: the const-optimized `CodeInfo`, read through [`get_source`](@ref)
-- `rettype`: the extended-lattice return value (`InferenceResult.result`)
-- `rettype_const`: the value of `rettype` when it is a `Const`, otherwise `nothing`
-- `inner::V`: the results struct, read through [`results`](@ref)
-
-Treat `argtypes` as read-only: it is the cache key. Mutable compilation results belong
-in `results(entry)`.
-"""
-struct SpecializedResult{V}
-    argtypes::Vector{Any}
-    inner::V
-    src::Any
-    rettype::Any
-    rettype_const::Any
-end
-
-# Fast equality for argtypes vectors. Element-wise `==(::Any, ::Any)` does
-# dynamic dispatch (~40 ns/element) — but `===` short-circuits to pointer
-# equality, which is true for interned `Type` values and immutable
-# `Core.Compiler.Const` instances with `===`-equal `.val`s. So most cache hits
-# resolve in O(n) pointer compares; we only fall through to `==` on the rare
-# element that isn't structurally identical.
-@inline function argtypes_egal(a::Vector{Any}, b::Vector{Any})::Bool
-    length(a) == length(b) || return false
-    @inbounds for i in eachindex(a)
-        a[i] === b[i] || a[i] == b[i] || return false
-    end
-    return true
-end
+export CacheView, results, lookup, seeded
 
 """
     CachedResult{V}
 
-Mutable wrapper for analysis results that supports both generic and const-specialized
-entries. Attached to a CI's `analysis_results` chain on first access (see
-[`results`](@ref)) or at CI creation (see [`create_ci`](@ref)). Const-prop entries are
-accumulated by pushing to `const_entries`.
+Wrapper identifying the results struct of type `V` on a CI's `analysis_results` chain.
+Attached on first access (see [`results`](@ref)) or at CI creation (see
+[`create_ci`](@ref)).
 """
-mutable struct CachedResult{V}
+struct CachedResult{V}
     inner::V
-    const_entries::Vector{SpecializedResult{V}}
-    CachedResult{V}(inner::V) where V = new{V}(inner, SpecializedResult{V}[])
-end
-
-# Guards every `const_entries` vector. One global lock: the critical sections are
-# short scans, and a per-CI lock could not be persisted with the CI anyway.
-const const_entries_lock = ReentrantLock()
-
-@inline function find_const_entry(cached::CachedResult{V}, argtypes::Vector{Any}) where V
-    for entry in cached.const_entries
-        argtypes_egal(entry.argtypes, argtypes) && return entry
-    end
-    return nothing
-end
-
-# Locked lookup of a const-seeded entry.
-function const_entry(cached::CachedResult{V}, argtypes::Vector{Any}) where V
-    Base.@lock const_entries_lock find_const_entry(cached, argtypes)
-end
-
-"""
-    get_invoke_mi(stmt::Expr) -> Union{MethodInstance, Nothing}
-
-Version-portable extraction of the callee MethodInstance from an `:invoke` statement.
-On 1.12+ the first arg may be a CodeInstance; on 1.11 it's a MethodInstance directly.
-"""
-function get_invoke_mi(stmt::Expr)
-    target = stmt.args[1]
-    @static if VERSION >= v"1.12-"
-        target isa Core.CodeInstance && return CC.get_ci_mi(target)
-    end
-    target isa Core.MethodInstance && return target
-    return nothing
-end
-
-"""
-    extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes) -> Vector{Any}
-
-Extract inferred argument types at each position of an `:invoke` call using `CC.argextype`.
-Skips the invoke target at position 1.
-"""
-function extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes)
-    argtypes = Any[]
-    for j in 2:length(stmt.args)
-        if src.slottypes !== nothing
-            push!(argtypes, CC.argextype(stmt.args[j], src, sptypes))
-        else
-            push!(argtypes, Any)
-        end
-    end
-    return argtypes
-end
-
-"""
-    extract_invoke_argtypes(stmt, src, sptypes, parent_argtypes) -> Vector{Any}
-
-Like `extract_invoke_argtypes`, but resolves `Argument(i)` nodes using the parent's
-const-enriched argtypes instead of the source's generic slot types.
-"""
-function extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes,
-                                 parent_argtypes::Vector{Any})
-    argtypes = Any[]
-    for j in 2:length(stmt.args)
-        arg = stmt.args[j]
-        if arg isa Core.Argument && checkbounds(Bool, parent_argtypes, arg.n)
-            push!(argtypes, parent_argtypes[arg.n])
-        elseif src.slottypes !== nothing
-            push!(argtypes, CC.argextype(arg, src, sptypes))
-        else
-            push!(argtypes, Any)
-        end
-    end
-    return argtypes
 end
 
 """
@@ -305,33 +192,6 @@ results(::Type{V}, ci::Core.CodeInstance) where V = get_results(V, ci).inner
 
 results(::CacheView{K,V}, ci::Core.CodeInstance) where {K,V} = results(V, ci)
 
-"""
-    results(entry::SpecializedResult{V})::V
-
-The results struct of a const-specialized entry, created along with the entry by
-[`typeinf!(cache, interp, mi, argtypes)`](@ref).
-"""
-results(entry::SpecializedResult) = entry.inner
-
-"""
-    specialization(::Type{V}, ci::CodeInstance, argtypes::Vector{Any})
-    specialization(cache::CacheView{K,V}, ci::CodeInstance, argtypes::Vector{Any})
-        -> Union{SpecializedResult{V}, Nothing}
-
-Find the const-specialized entry stored on `ci` for `argtypes` by
-[`typeinf!(cache, interp, mi, argtypes)`](@ref). Entries live on the `CachedResult{V}`
-of the results type that seeded them, so the lookup is scoped by `V`; several results
-types can share a `CodeInstance`. Returns `nothing` if no entry exists.
-"""
-function specialization(::Type{V}, ci::Core.CodeInstance, argtypes::Vector{Any}) where V
-    cached = find_results(V, ci)
-    cached === nothing && return nothing
-    return const_entry(cached, argtypes)
-end
-
-specialization(::CacheView{K,V}, ci::Core.CodeInstance, argtypes::Vector{Any}) where {K,V} =
-    specialization(V, ci, argtypes)
-
 @static if VERSION >= v"1.14-"
     function code_cache(cache::CacheView)
         world_range = CC.WorldRange(cache.world)
@@ -357,14 +217,10 @@ Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance)
 
 """
     lookup(cache::CacheView{K,V}, mi::MethodInstance) -> Union{Nothing, Tuple{CodeInstance, V}}
-    lookup(cache::CacheView{K,V}, mi::MethodInstance, argtypes::Vector{Any}) ->
-        Union{Nothing, Tuple{CodeInstance, SpecializedResult{V}}}
 
-Single-pass cache lookup. The generic form combines `get(cache, mi)` and
-`results(cache, ci)`: it returns `(ci, res)` when a `CodeInstance` is cached for `mi`
-(attaching a fresh `V()` on first access), or `nothing` when there is none. The
-`argtypes` form combines `get(cache, mi)` and `specialization(cache, ci, argtypes)`:
-it returns `(ci, entry)`, or `nothing` when there is no CI or no matching entry.
+Single-pass cache lookup, combining `get(cache, mi)` and `results(cache, ci)`: returns
+`(ci, res)` when a `CodeInstance` is cached for `mi` (attaching a fresh `V()` on first
+access), or `nothing` when there is none.
 
 Pass the returned pair through compilation phases to avoid repeated lookups.
 """
@@ -374,15 +230,58 @@ Pass the returned pair through compilation phases to avoid repeated lookups.
     return (ci, results(V, ci))
 end
 
-@inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance,
-                        argtypes::Vector{Any}) where {K,V}
-    ci = get(cache, mi, nothing)
-    ci === nothing && return nothing
-    entry = specialization(V, ci, argtypes)
-    entry === nothing && return nothing
-    return (ci, entry)
+# The owner of const-seeded inference results: the owner of the cache they were seeded
+# in, plus the seeds. Not public, so that no ordinary owner can collide with it.
+struct SeededOwner
+    owner::Any
+    argtypes::Tuple
 end
 
+"""
+    seeded(cache::CacheView{K,V}, argtypes::Vector{Any}) -> CacheView
+
+The cache view holding the results of const-seeded inference on `argtypes` (see
+[`typeinf!(interp, mi, argtypes)`](@ref)) in `cache`'s partition and world. Every seeded
+result is a `CodeInstance` of its own, so the usual operations apply: `get(view, mi,
+nothing)` finds it, and `results(view, ci)` returns its results struct.
+
+`argtypes` are compared by `===`, element by element, and copied, so the caller may
+reuse the vector. Seeds must therefore be immutable to be found again: a `Const`
+wrapping a mutable object only matches that very object, and a `PartialStruct`, which
+holds vectors, only matches itself. Seeds that are constructed anew for every call
+never match, so every call publishes another `CodeInstance`.
+
+Lookups pass over seeded `CodeInstance`s without source (e.g. because a package image
+dropped it): inferring the seeds again could give code with other dependencies than the
+`CodeInstance` tracks, so [`typeinf!`](@ref typeinf!(::CC.AbstractInterpreter,
+::Core.MethodInstance, ::Vector{Any})) publishes a new one instead. With
+`CACHE_MODE_ROOT`, if the interpreter's codegen cache still holds the source, `typeinf!`
+restores it and returns the same `CodeInstance`.
+"""
+seeded(cache::CacheView{K,V}, argtypes::Vector{Any}) where {K,V} =
+    CacheView{SeededOwner,V}(SeededOwner(cache.owner, Tuple(argtypes)), cache.world)
+
+function Base.get(cache::CacheView{SeededOwner}, mi::Core.MethodInstance, default)
+    isdefined(mi, :cache) || return default
+    ci = @atomic :acquire mi.cache
+    while true
+        if ci.owner === cache.owner &&
+           (@atomic :acquire ci.min_world) <= cache.world <= (@atomic :acquire ci.max_world) &&
+           seeded_source_available(ci)
+            return ci
+        end
+        isdefined(ci, :next) || return default
+        ci = @atomic :acquire ci.next
+    end
+end
+Base.haskey(cache::CacheView{SeededOwner}, mi::Core.MethodInstance) =
+    get(cache, mi, nothing) !== nothing
+Base.getindex(cache::CacheView{SeededOwner}, mi::Core.MethodInstance) = get(cache, mi)
+
+seeded_source_available(ci::Core.CodeInstance) =
+    has_source(@atomic :monotonic ci.inferred) ||
+    # `get_source` synthesizes the source of a const-return CodeInstance
+    (@static VERSION >= v"1.12-" ? CC.use_const_api(ci) : false)
 
 #==============================================================================#
 # Cache access
@@ -816,12 +715,16 @@ function with_fresh_inference_cache(f, interp::CC.AbstractInterpreter)
 end
 
 function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
-    mi = CC.get_ci_mi(ci)
+    mi = ci_mi(ci)
 
     # Source stored in a CI is shared with everything that uses its cache, so it has to
     # come from that cache's own interpreter. Code inferred by `interp` can call CIs of
     # other owners, e.g. native ones for code it lets run natively.
-    if ci.owner !== CC.cache_owner(interp)
+    if ci.owner isa SeededOwner
+        # inferring the seeds again could give code with other dependencies than `ci`
+        # tracks (see `seeded`)
+        return nothing
+    elseif ci.owner !== CC.cache_owner(interp)
         ci.owner === nothing || return nothing
         interp = CC.NativeInterpreter(CC.get_inference_world(interp))
     end
@@ -871,6 +774,16 @@ function store_source!(ci::Core.CodeInstance, src::Core.CodeInfo)
         success && break
     end
     return
+end
+
+ci_mi(ci::Core.CodeInstance) =
+    @static VERSION >= v"1.12-" ? CC.get_ci_mi(ci) : ci.def::Core.MethodInstance
+
+# The optimized source of a finished inference result, if it has one.
+function inferred_source(result::CC.InferenceResult)
+    src = result.src
+    src isa CC.OptimizationState && (src = CC.ir_to_codeinf!(src))
+    return src isa Core.CodeInfo ? src : nothing
 end
 
 """
@@ -990,128 +903,144 @@ function compile_callees!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
                 end
             end
         end
+    else
+        get_source(ci) === nothing && infer_source!(interp, ci)
     end
     return
 end
 
 """
-    typeinf!(cache::CacheView{K,V}, interp, mi, argtypes) -> Union{SpecializedResult{V}, Nothing}
+    typeinf!(interp, mi, argtypes::Vector{Any}) -> Union{CodeInstance, Nothing}
 
-Run const-seeded type inference on `mi` with enriched `argtypes` and store the result
-as a [`SpecializedResult{V}`](@ref) entry on the generic CI's `CachedResult{V}`.
-Returns that entry (the existing one, if `argtypes` was seeded before), or `nothing`
-if inference could not run.
+Run const-seeded type inference on `mi`. `argtypes` are extended-lattice argument types
+as at a call site, starting with the callable and unpacked for a varargs method, e.g.
+`Any[Core.Const(f), Int, Core.Const(2)]`.
 
-Uses Julia's ephemeral `:local` inference mode (same as internal const-prop) so no
-new CodeInstance is created. The const-specialized source, return type and results
-struct are stored alongside the generic result, for later retrieval via
-[`specialization(cache, ci, argtypes)`](@ref) or [`lookup(cache, mi, argtypes)`](@ref).
+The result is a `CodeInstance` of its own, with the edges and world range of this
+inference, so redefining anything its source depends on invalidates it. It is published
+in [`seeded(cache, argtypes)`](@ref), for the cache of `interp` (its
+`CC.cache_owner` and `CC.get_inference_world`). Callees are cached under that owner, as
+with [`typeinf!(interp, mi)`](@ref).
 
-Unlike the generic `typeinf!(interp, mi)`, this form takes a `CacheView`: const-prop
-entries are stored typed, so the results type `V` must be known up front. The cache
-view must match the interpreter's owner and world.
+Returns the published `CodeInstance`, which has source, or `nothing` if inference failed.
+Calling it again returns the same `CodeInstance`, unless that lost its source (see
+[`seeded`](@ref)). Concurrent calls with equal seeds infer once.
 
-Safe to call concurrently from multiple tasks, each with its own interpreter. Tasks
-seeding the same `(ci, argtypes)` at the same time may both run inference; the first
-to finish publishes its entry and the others discard theirs. The interpreter must not
-be shared between tasks: its inference cache is mutated during the walk over callees.
+On Julia 1.14 and later builds without root inference under a separate owner
+(`CACHE_MODE_ROOT`, added in JuliaLang/julia#65237), the result is valid only in the
+world it was inferred in, so every world age increment causes it to be inferred again.
 """
-function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
-                  mi::Core.MethodInstance, argtypes::Vector{Any}) where {K,V}
-    @assert cache.owner === CC.cache_owner(interp) "CacheView owner does not match interpreter"
-    @assert cache.world == CC.get_inference_world(interp) "CacheView world does not match interpreter"
-
-    # Ensure generic CI exists
+function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance,
+                  argtypes::Vector{Any})
+    cache = seeded(CacheView{Nothing}(CC.cache_owner(interp),
+                                      CC.get_inference_world(interp)), argtypes)
     ci = get(cache, mi, nothing)
-    if ci === nothing
-        typeinf!(interp, mi)
-        ci = get(cache, mi, nothing)
-        ci === nothing && return nothing
+    ci === nothing || return ci
+    ci = with_inference_reservation(cache.owner, mi) do
+        published = get(cache, mi, nothing)
+        published === nothing ? infer_seeded!(interp, mi, cache) : published
     end
+    ci === nothing && return nothing
+    compile_callees!(interp, ci)
+    return ci
+end
 
-    cached = get_results(V, ci)
+# A seeded root is inferred in a frame Julia does not publish, so that it can be
+# published under the seeded owner. Julia 1.14 removed the volatile mode; a local frame
+# leaves its CodeInstance unpublished in the same way.
+const SEEDED_CACHE_MODE = isdefined(CC, :CACHE_MODE_VOLATILE) ? :volatile : :local
 
-    existing = const_entry(cached, argtypes)
-    existing === nothing || return existing
-
-    # Keep the public cache key unpacked and independent of the caller's buffer.
-    cache_argtypes = copy(argtypes)
-
-    # Compute overridden_by_const
+function seeded_inference_result(interp::CC.AbstractInterpreter, mi::Core.MethodInstance,
+                                 argtypes::Vector{Any})
     𝕃 = CC.typeinf_lattice(interp)
     @static if VERSION >= v"1.12-"
-        default_argtypes = CC.matching_cache_argtypes(𝕃, mi)
-        overridden = BitVector(undef, length(argtypes))
+        # as constant propagation does (`const_prop_call`)
+        cache_argtypes = CC.matching_cache_argtypes(𝕃, mi)
+        argtypes = CC.matching_cache_argtypes(𝕃, mi, CC.SimpleArgtypes(argtypes), cache_argtypes)
+        overridden = falses(length(argtypes))
         for i in eachindex(argtypes)
-            overridden[i] = !CC.is_lattice_equal(𝕃, argtypes[i], default_argtypes[i])
+            overridden[i] = argtypes[i] !== CC.argtype_by_index(cache_argtypes, i)
         end
+        return CC.InferenceResult(mi, argtypes, overridden)
     else
-        # Pack varargs: on 1.11 matching_cache_argtypes packs trailing
-        # args into a Tuple (returning nargs elements), but invoke stmts
-        # list them individually, so we must pack argtypes to match.
-        argtypes = CC.va_process_argtypes(𝕃, argtypes, mi)
-        default_argtypes, _ = CC.matching_cache_argtypes(𝕃, mi)
-        overridden = CC.BitVector(undef, length(argtypes))
-        for i in eachindex(argtypes)
-            CC.setindex!(overridden, !CC.is_lattice_equal(𝕃, argtypes[i], default_argtypes[i]), i)
+        return CC.InferenceResult(mi, CC.SimpleArgtypes(argtypes), 𝕃)
+    end
+end
+
+# Infer and publish a seeded root. The caller holds the reservation for `cache.owner`.
+function infer_seeded!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance,
+                       cache::CacheView)
+    owner = cache.owner
+    result = seeded_inference_result(interp, mi, collect(Any, owner.argtypes))
+    @static if isdefined(Core.Compiler, :CACHE_MODE_ROOT)
+        # Julia infers, publishes and extends the root under its own owner. Requiring
+        # source, it only returns a published CI if that has source, maybe only in the
+        # codegen cache of `interp`.
+        ci = CC.typeinf_ext(interp, result, owner, CC.SOURCE_MODE_GET_SOURCE)
+        ci === nothing && return nothing
+        if get_source(ci) === nothing
+            codegen = CC.codegen_cache(interp)
+            src = @something(inferred_source(result),
+                             codegen === nothing ? nothing : get(codegen, ci, nothing),
+                             Some(nothing))
+            src isa Core.CodeInfo && store_source!(ci, src)
         end
-    end
-
-    # Run ephemeral inference (:local mode, no result.ci)
-    inf_result = CC.InferenceResult(mi, argtypes, overridden)
-    frame = CC.InferenceState(inf_result, #=cache_mode=# :local, interp)
-    if frame === nothing
-        return nothing
-    end
-    CC.typeinf(interp, frame)
-
-    # Convert OptimizationState → CodeInfo (preserves :invoke stmts)
-    src = inf_result.src
-    if src isa CC.OptimizationState
-        src = CC.ir_to_codeinf!(src)
-    end
-
-    v = V()
-
-    # Compute rettype_const
-    rettype = inf_result.result
-    rettype_const = rettype isa CC.Const ? rettype.val : nothing
-
-    # Publish the entry unless another task got there first. Copy on write, since
-    # readers may hold the old vector. This precedes the recursive walk so the
-    # entry check above terminates cycles.
-    entry = SpecializedResult{V}(cache_argtypes, v, src, rettype, rettype_const)
-    Base.@lock const_entries_lock begin
-        published = find_const_entry(cached, cache_argtypes)
-        if published === nothing
-            cached.const_entries = push!(copy(cached.const_entries), entry)
-        else
-            entry = published
+        return ci
+    elseif isdefined(Core.Compiler, :engine_reserve)
+        # Julia fills in the CodeInstance of a frame that has one, stores its backedges,
+        # and (before 1.14) extends it to later worlds.
+        ci = CC.engine_reserve(mi, owner)
+        result.ci = ci
+        try
+            frame = CC.InferenceState(result, SEEDED_CACHE_MODE, interp)
+            frame === nothing && return nothing
+            CC.typeinf(interp, frame)
+        finally
+            # finished inference has released the reservation already
+            CC.engine_reject(interp, ci)
         end
+        result.tombstone && return nothing
+    else
+        frame = CC.InferenceState(result, :volatile, interp)
+        frame === nothing && return nothing
+        CC.typeinf(interp, frame)
+        # a limited result has no source
+        result.src === nothing && return nothing
+        ci = seeded_code_instance(interp, result, owner)
     end
-
-    # Recursively const-seed callees with propagated const argtypes.
-    # Walk the *generic* source (which has :invoke stmts pointing to callee CIs)
-    # to discover callees — the const-optimized source has :invoke stmts too, but
-    # the generic source gives us stable callee CIs for cache lookups.
-    generic_src = get_source(ci)
-    if generic_src isa Core.CodeInfo
-        sptypes = CC.sptypes_from_meth_instance(mi)
-        for stmt in generic_src.code
-            if stmt isa Expr && stmt.head === :(=)
-                stmt = stmt.args[2]
-            end
-            if stmt isa Expr && (stmt.head === :invoke ||
-                    (VERSION >= v"1.12-" && stmt.head === :invoke_modify))
-                callee_mi = get_invoke_mi(stmt)
-                callee_mi === nothing && continue
-                callee_argtypes = extract_invoke_argtypes(stmt, generic_src, sptypes, argtypes)
-                typeinf!(cache, interp, callee_mi, callee_argtypes)
-            end
-        end
+    # The interpreter may have discarded the source, which the seeds cannot be
+    # recovered from cheaply.
+    if get_source(ci) === nothing
+        src = inferred_source(result)
+        src === nothing || store_source!(ci, src)
     end
+    cache[mi] = ci
+    @static if !isdefined(Core.Compiler, :engine_reserve)
+        CC.track_newly_inferred.x && ccall(:jl_push_newly_inferred, Cvoid, (Any,), ci)
+    end
+    return ci
+end
 
-    return entry
+@static if !isdefined(Core.Compiler, :engine_reserve)
+# Julia 1.11 constructs a CodeInstance with the interpreter's owner, and publishes it in
+# `cache_result!`; neither takes another owner. Rebuild Julia's CodeInstance under the
+# seeded owner, extending it to later worlds as `cache_result!` does: `finish!` has
+# stored the backedges if the result is valid in the current world. Like there, a method
+# definition between that check and the insertion into the cache goes unnoticed.
+function seeded_code_instance(interp::CC.AbstractInterpreter, result::CC.InferenceResult,
+                              owner::SeededOwner)
+    valid_worlds = result.valid_worlds
+    if valid_worlds.max_world == Base.get_world_counter()
+        valid_worlds = CC.WorldRange(valid_worlds.min_world, typemax(UInt))
+    end
+    ci = CC.CodeInstance(interp, result, valid_worlds)
+    has_const = isdefined(ci, :rettype_const)
+    const_flags = Int32((has_const ? 0x2 : 0x0) | (CC.use_const_api(ci) ? 0x1 : 0x0))
+    return Core.CodeInstance(ci.def, owner, ci.rettype, ci.exctype,
+                             has_const ? ci.rettype_const : nothing, ci.inferred,
+                             const_flags, ci.min_world, ci.max_world, ci.ipo_purity_bits,
+                             ci.purity_bits, ci.analysis_results, ci.relocatability)
+end
 end
 
 const CompilationDependency = Union{Core.MethodInstance,Core.CodeInstance}
@@ -1272,17 +1201,6 @@ function get_source(ci::Core.CodeInstance)
 end
 
 """
-    get_source(entry::SpecializedResult) -> Union{CodeInfo, Nothing}
-
-Retrieve the const-optimized CodeInfo of a const-specialized entry (see
-[`specialization`](@ref)). Returns `nothing` if inference produced no source.
-"""
-function get_source(entry::SpecializedResult)
-    src = entry.src
-    return src isa Core.CodeInfo ? src : nothing
-end
-
-"""
     get_codeinfos(interp::AbstractInterpreter, ci::CodeInstance) ->
         Vector{Pair{CodeInstance, CodeInfo}}
 
@@ -1315,8 +1233,7 @@ interpreter previously passed to [`typeinf!`](@ref)).
 On Julia 1.11, code generation resolves callees through a lookup callback instead, so
 only the root entry is returned.
 """
-get_codeinfos(interp::CC.AbstractInterpreter, ci::Core.CodeInstance) =
-    collect_codeinfos(interp, ci, nothing)
+function get_codeinfos end
 
 @public resolve_dynamic_invokes
 
@@ -1355,8 +1272,7 @@ code through the runtime (`jl_invoke`).
 """
 collect_foreign_callees(::CC.AbstractInterpreter) = true
 
-function collect_codeinfos(interp::CC.AbstractInterpreter,
-                           root::Core.CodeInstance, root_src::Union{Core.CodeInfo, Nothing})
+function get_codeinfos(interp::CC.AbstractInterpreter, root::Core.CodeInstance)
     codeinfos = Pair{Core.CodeInstance, Core.CodeInfo}[]
     @static if VERSION >= v"1.12-"
         resolve = resolve_dynamic_invokes(interp)
@@ -1370,8 +1286,7 @@ function collect_codeinfos(interp::CC.AbstractInterpreter,
             foreign || callee_ci === root ||
                 callee_ci.owner === CC.cache_owner(interp) || continue
 
-            src = callee_ci === root && root_src !== nothing ? root_src :
-                                                               get_source(callee_ci)
+            src = get_source(callee_ci)
             if src === nothing
                 # a referenced CI may lack stored source (e.g. it was cached by an
                 # earlier session whose sources were dropped); re-establish it
@@ -1401,7 +1316,7 @@ function collect_codeinfos(interp::CC.AbstractInterpreter,
             end
         end
     else
-        src = root_src === nothing ? get_source(root) : root_src
+        src = @something get_source(root) infer_source!(interp, root) Some(nothing)
         src !== nothing && push!(codeinfos, root => src)
     end
     return codeinfos
@@ -1469,28 +1384,6 @@ function resolve_invoke_targets(interp::CC.AbstractInterpreter, src::Core.CodeIn
     end
     return resolved
 end
-end
-
-"""
-    get_codeinfos(interp::AbstractInterpreter, ci::CodeInstance, entry::SpecializedResult) ->
-        Vector{Pair{CodeInstance, CodeInfo}}
-
-Const-specialized variant of [`get_codeinfos(interp, ci)`](@ref): the callee walk is
-seeded with the const-optimized source of `entry`, a const-specialized entry of `ci`
-(see [`specialization`](@ref)), so callees reachable only from the const-optimized
-code are included as well. The root pair carries that source in place of `ci`'s
-generic one.
-
-Falls back to the generic source if `entry` has no source.
-"""
-function get_codeinfos(interp::CC.AbstractInterpreter, ci::Core.CodeInstance,
-                       entry::SpecializedResult{V}) where V
-    cached = find_results(V, ci)
-    belongs_to_ci = cached !== nothing && Base.@lock const_entries_lock begin
-        any(candidate -> candidate === entry, cached.const_entries)
-    end
-    belongs_to_ci || throw(ArgumentError("SpecializedResult does not belong to CodeInstance"))
-    return collect_codeinfos(interp, ci, get_source(entry))
 end
 
 end # @static if VERSION >= v"1.11"

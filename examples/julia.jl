@@ -27,9 +27,13 @@ function with_llvm_context(f)
     end
 end
 
-# Callback function for codegen to look in the cache
+# Callback function for codegen to look in the cache. The root may be a const-seeded
+# CodeInstance, which is in a cache of its own.
 const _codegen_cache = Ref{Any}(nothing)
+const _codegen_root = Ref{Any}(nothing)
 function _codegen_lookup_cb(mi, min_world, max_world)
+    root = _codegen_root[]
+    root !== nothing && root.def === mi && return root
     # Create a cache at the min_world for lookup
     cache = _codegen_cache[]
     lookup_cache = CacheView{typeof(cache).parameters[1], typeof(cache).parameters[2]}(cache.owner, min_world)
@@ -59,7 +63,7 @@ function getglobal_jit()
 end
 
 """
-    julia_codegen(cache, interp, mi, ci; entry=nothing, dump_llvm=false,
+    julia_codegen(cache, interp, mi, ci; dump_llvm=false,
                   dump_module=false) -> (ir_bytes, entry_name, llvm_ir)
 
 Generate LLVM IR and return serializable intermediate result.
@@ -70,19 +74,17 @@ When `dump_module` is true, returns the IR of the entire module.
 
 Uses `get_codeinfos(interp, ci)` to collect CodeInfos by walking :invoke statements
 (1.12+, re-inferring through `interp` where cache history left gaps) or the cache
-lookup callback (1.11). When a const-specialized `entry` of `ci` is provided (see
-`specialization`), uses its const-optimized source for the root CI via
-`get_codeinfos(interp, ci, entry)`.
+lookup callback (1.11). `ci` may be a const-seeded CodeInstance of `mi`.
 
 This function handles codegen but does not JIT compile - use `julia_jit` for that.
 """
 function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
                        mi::Core.MethodInstance, ci::Core.CodeInstance;
-                       entry::Union{SpecializedResult,Nothing}=nothing,
                        dump_llvm::Bool=false,
                        dump_module::Bool=false)
     # Set up globals for the lookup callback
     _codegen_cache[] = cache
+    _codegen_root[] = ci
     lookup_cfunction = @cfunction(_codegen_lookup_cb, Any, (Any, UInt, UInt))
 
     # Set up codegen parameters
@@ -109,10 +111,8 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
         # Generate native code
         @static if VERSION >= v"1.12.0-DEV.1823"
             cis_vec = Any[]
-            codeinfos = entry !== nothing ? get_codeinfos(interp, ci, entry) :
-                                            get_codeinfos(interp, ci)
-            for (ci, src) in codeinfos
-                push!(cis_vec, ci)
+            for (callee, src) in get_codeinfos(interp, ci)
+                push!(cis_vec, callee)
                 push!(cis_vec, src)
             end
             native_code = @ccall jl_emit_native(
@@ -130,29 +130,13 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
                 lookup_cfunction::Ptr{Cvoid}
             )::Ptr{Cvoid}
         else
-            # On 1.11, jl_create_native reads ci.inferred via the lookup callback.
-            # Temporarily swap with the const-seeded source if available.
-            saved_inferred = nothing
-            if entry !== nothing
-                const_src = get_source(entry)
-                if const_src !== nothing
-                    saved_inferred = @atomic :monotonic ci.inferred
-                    @atomic :monotonic ci.inferred = const_src
-                end
-            end
-            native_code = C_NULL
-            try
-                native_code = @ccall jl_create_native(
-                    [mi]::Vector{Core.MethodInstance},
-                    ts_mod::LLVM.API.LLVMOrcThreadSafeModuleRef,
-                    Ref(params)::Ptr{CodegenParams},
-                    1::Cint, 0::Cint, 0::Cint, cache.world::Csize_t
-                )::Ptr{Cvoid}
-            finally
-                if saved_inferred !== nothing
-                    @atomic :monotonic ci.inferred = saved_inferred
-                end
-            end
+            # On 1.11, jl_create_native finds code through the lookup callback
+            native_code = @ccall jl_create_native(
+                [mi]::Vector{Core.MethodInstance},
+                ts_mod::LLVM.API.LLVMOrcThreadSafeModuleRef,
+                Ref(params)::Ptr{CodegenParams},
+                1::Cint, 0::Cint, 0::Cint, cache.world::Csize_t
+            )::Ptr{Cvoid}
         end
 
         @assert native_code != C_NULL "Code generation failed"
@@ -166,9 +150,6 @@ function julia_codegen(cache::CacheView, interp::CC.AbstractInterpreter,
         llvm_ts_mod = ThreadSafeModule(llvm_mod_ref)
 
         # Get function name from CodeInstance
-        ci = get(cache, mi, nothing)
-        @assert ci !== nothing "CodeInstance not found after codegen"
-
         func_idx = Ref{Int32}(-1)
         specfunc_idx = Ref{Int32}(-1)
         @ccall jl_get_function_id(native_code::Ptr{Cvoid}, ci::Any,
