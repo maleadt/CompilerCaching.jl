@@ -122,37 +122,36 @@ end
     call(f, args...) -> result
 
 Compile (if needed) and call function `f` with the given arguments.
+
+The signature of the compiled code is only known once it has been compiled: the return type
+is the one our interpreter inferred, which can differ from what Julia infers natively (e.g.
+because of an overlay method), and the argument types are those of the method instance,
+which can be wider than the types of `args` (e.g. with `@nospecialize`). Both are thus
+looked up on every call, making the actual invocation a dynamic dispatch that boxes its
+arguments. Avoiding that requires a call with statically-known types that still observes
+method redefinitions, as proposed in JuliaLang/julia#59774.
 """
-@inline function call(f, args...)
+function call(f, args...)
     argtypes = Tuple{map(Core.Typeof, args)...}
-    rettyp = Base.infer_return_type(f, argtypes)
-    _call_impl(rettyp, f, args...)
+    world = get_world_counter()
+    mi = @something(method_instance(f, argtypes; world, method_table=CUSTOM_MT),
+                    method_instance(f, argtypes; world),
+                    throw(MethodError(f, args, world)))
+
+    cache = CacheView{NativeResults}(:NativeExample, world)
+    ptr = compile!(cache, mi)
+    ci = get(cache, mi)
+    invoke_pointer(ptr, ci.rettype, mi.specTypes, args...)
 end
-@generated function _call_impl(::Type{R}, f, args::Vararg{Any,N}) where {R,N}
-    argtypes = Tuple{args...}
 
-    # Build tuple expression for ccall: (T1, T2, ...)
-    ccall_types = Expr(:tuple)
-    for i in 1:N
-        push!(ccall_types.args, args[i])
-    end
-
-    # Build argument expressions
-    argexprs = Expr[]
-    for i in 1:N
-        push!(argexprs, :(args[$i]))
-    end
-
-    quote
-        world = get_world_counter()
-        mi = @something(method_instance(f, $argtypes; world, method_table=CUSTOM_MT),
-                        method_instance(f, $argtypes; world),
-                        throw(MethodError(f, $argtypes)))
-
-        cache = CacheView{NativeResults}(:NativeExample, world)
-        ptr = compile!(cache, mi)
-        ccall(ptr, R, $ccall_types, $(argexprs...))
-    end
+# Only suitable for simple signatures: the pointer is called using the C calling convention,
+# which matches how Julia passes and returns boxed values and primitive types.
+@generated function invoke_pointer(ptr::Ptr{Cvoid}, ::Type{R}, ::Type{Sig},
+                                   args::Vararg{Any,N}) where {R,Sig,N}
+    # skip the function, which is the first parameter of the signature
+    ccall_types = Expr(:tuple, Sig.parameters[2:end]...)
+    argexprs = [:(args[$i]) for i in 1:N]
+    :(ccall(ptr, R, $ccall_types, $(argexprs...)))
 end
 
 @static if VERSION >= v"1.14.0-DEV.1794"
@@ -197,6 +196,19 @@ child(x) = op(x, 3)
 @assert parent(10) == 10 + 3 + 3
 @assert call(parent, 10) == 10 ^ 3 + 3
 @assert compilations[] == 4
+
+
+## demo of signatures that differ from what the caller sees
+
+# An overlay can change the return type
+scale(x) = x * 2
+@overlay CUSTOM_MT scale(x) = x * 2.5
+@assert scale(10) === 20
+@assert call(scale, 10) === 25.0
+
+# Arguments that the method doesn't specialize on are passed boxed
+passthrough(@nospecialize(x)) = x
+@assert call(passthrough, 42) === 42
 
 
 ## demo of const-seeded codegen
