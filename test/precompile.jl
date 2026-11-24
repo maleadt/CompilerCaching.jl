@@ -61,6 +61,8 @@ precompile_test_harness("Inference caching") do load_path
         CC.lock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
         CC.unlock_mi_inference(::ExampleInterpreter, ::Core.MethodInstance) = nothing
         CC.cache_owner(interp::ExampleInterpreter) = interp.cache.owner
+        # keep source, also of const-return functions, which a package image discards
+        CC.may_discard_trees(::ExampleInterpreter) = false
 
         emit_code_count = Ref(0)
 
@@ -121,6 +123,12 @@ precompile_test_harness("Inference caching") do load_path
 
         ExampleCompiler.precompile(square, (Float64,))
 
+        # const-return, so its source is discarded from the package image. Under
+        # `--code-coverage`, the counter on its line would make it effectful and
+        # thus not const-return (once lowering attaches that line, as JuliaLowering does).
+        Base.@assume_effects :effect_free answer() = 42
+        ExampleCompiler.precompile(answer, ())
+
         # identity is foreign
         @setup_workload begin
             @compile_workload begin
@@ -153,6 +161,15 @@ precompile_test_harness("Inference caching") do load_path
         @test haskey(cache, square_mi)
         ExampleCompiler.precompile(ExampleUser.square, (Float64,))
         @test ExampleCompiler.emit_code_count[] == 0
+
+        # source of a const-return CI can be recovered after its tree was discarded
+        answer_ci = get(cache, method_instance(ExampleUser.answer, ()), nothing)
+        @test answer_ci isa Core.CodeInstance
+        @test Core.Compiler.use_const_api(answer_ci)
+        if VERSION >= v"1.12-"
+            @test get_source(answer_ci) isa Core.CodeInfo
+            @test !isempty(get_codeinfos(ExampleCompiler.ExampleInterpreter(cache), answer_ci))
+        end
 
         # check that identity survived
         # NOTE: on 1.13, external CIs from the workload survive only flakily (the
