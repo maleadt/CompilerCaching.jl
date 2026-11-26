@@ -116,19 +116,17 @@ When argument values are known at compile time, pass extended-lattice argument t
 
 ```julia
 argtypes = Any[Core.Const(f), Int, Core.Const(2)]
-entry = @something typeinf!(cache, interp, mi, argtypes)
-res = results(entry)
-src = get_source(entry)
-rettype = Core.Compiler.widenconst(entry.rettype)
+ci = @something typeinf!(interp, mi, argtypes)
+src = get_source(ci)
 ```
 
-The returned `SpecializedResult{V}` holds the specialized source, return value, and
-compilation results. It is stored on the generic `CodeInstance`, scoped by the cache
-view's results type `V`, so independent consumers cannot shadow each other's entries.
-`specialization(cache, ci, argtypes)` retrieves an existing entry;
-`lookup(cache, mi, argtypes)` returns `(ci, entry)`. Both return `nothing` on a miss.
-For native code generation, `get_codeinfos(interp, ci, entry)` collects the specialized
-root source and its callees. See [examples/native.jl](examples/native.jl).
+The result is a `CodeInstance` of its own, carrying the edges of the seeded inference, so
+it is invalidated by redefining anything its source depends on, even a callee that
+generic inference of `mi` would not reach. It lives in the cache view
+`seeded(cache, argtypes)`, where `get(view, mi, nothing)` finds it and
+`results(view, ci)` returns its results struct. No generic `CodeInstance` is inferred
+for it. For native code generation, `get_codeinfos(interp, ci)` collects the seeded
+root and its callees. See [examples/native.jl](examples/native.jl).
 
 
 ## Cache sharding

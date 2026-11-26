@@ -109,6 +109,25 @@ precompile_test_harness("Inference caching") do load_path
             return res.executable
         end
 
+        # const-seeded: the seeded CodeInstance carries the results
+        function precompile_seeded(f, tt, seeds)
+            world = Base.get_world_counter()
+            mi = method_instance(f, tt; world)
+            cache = CacheView{CompileResults}(:ExampleCompiler, world)
+            argtypes = Any[CC.Const(f), seeds...]
+            view = seeded(cache, argtypes)
+            ci = get(view, mi, nothing)
+            if ci !== nothing
+                res = results(view, ci)
+                res.executable === nothing || return res.executable
+            end
+            ci = typeinf!(ExampleInterpreter(cache), mi, argtypes)
+            res = results(view, ci)
+            res.code = emit_code(cache, mi, ci)
+            res.executable = (:seeded, ci.rettype)
+            return res.executable
+        end
+
         end # module
     ) |> string)
     Base.compilecache(Base.PkgId("ExampleCompiler"), stderr, stdout)
@@ -128,6 +147,14 @@ precompile_test_harness("Inference caching") do load_path
         # thus not const-return (once lowering attaches that line, as JuliaLowering does).
         Base.@assume_effects :effect_free answer() = 42
         ExampleCompiler.precompile(answer, ())
+
+        # const-seeded, with integer and type-valued seeds
+        scaled(x, n) = x * n
+        convert_to(T, x) = T(x)
+        const CC = Core.Compiler
+        ExampleCompiler.precompile_seeded(scaled, (Float64, Int), Any[Float64, CC.Const(3)])
+        ExampleCompiler.precompile_seeded(convert_to, (Type{Float32}, Int),
+                                          Any[CC.Const(Float32), Int])
 
         # identity is foreign
         @setup_workload begin
@@ -169,6 +196,31 @@ precompile_test_harness("Inference caching") do load_path
         if VERSION >= v"1.12-"
             @test get_source(answer_ci) isa Core.CodeInfo
             @test !isempty(get_codeinfos(ExampleCompiler.ExampleInterpreter(cache), answer_ci))
+        end
+
+        # seeded results survive, found with freshly constructed seeds (unless they
+        # are not extended to later worlds, see `typeinf!`)
+        CC = Core.Compiler
+        seeds_extended = isdefined(CC, :CACHE_MODE_VOLATILE) || isdefined(CC, :CACHE_MODE_ROOT)
+        for (f, tt, seeds, rt) in ((ExampleUser.scaled, (Float64, Int),
+                                    Any[Float64, CC.Const(3)], Float64),
+                                   (ExampleUser.convert_to, (Type{Float32}, Int),
+                                    Any[CC.Const(Float32), Int], Float32))
+            argtypes = Any[CC.Const(f), seeds...]
+            mi = method_instance(f, tt)
+            ci = get(seeded(cache, argtypes), mi, nothing)
+            @test ci isa Core.CodeInstance broken=!seeds_extended
+            ci isa Core.CodeInstance || continue
+            @test ExampleCompiler.precompile_seeded(f, tt, seeds) === (:seeded, rt)
+            @test ExampleCompiler.emit_code_count[] == 0
+            @test get(cache, mi, nothing) === nothing
+
+            # with the source dropped, the seeds are inferred again
+            @atomic ci.inferred = nothing
+            new_ci = typeinf!(ExampleCompiler.ExampleInterpreter(cache), mi, argtypes)
+            @test new_ci !== ci
+            @test get_source(new_ci) isa Core.CodeInfo
+            @test get(seeded(cache, argtypes), mi, nothing) === new_ci
         end
 
         # check that identity survived

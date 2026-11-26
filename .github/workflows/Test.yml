@@ -27,6 +27,7 @@ jobs:
           - '1.11'
           - '1.12'
           - '1.13-nightly'
+          - '1.14-nightly'
           - 'nightly'
         os:
           - Linux
